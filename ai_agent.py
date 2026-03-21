@@ -391,6 +391,7 @@ class ExplorationAgent:
         self._last_combat_start_time = None  # persists after combat ends — used by death attribution
         self._combat_start_hp = None     # our HP when combat started
         self._recent_departures = set()  # mob names seen leaving this room (cleared on room entry)
+        self._dead_end_retried = set()   # (room_hash, direction) pairs retried this session
         self._dead = False
         self._last_shop_list_request = 0.0   # monotonic time of last 'list' command
         self._otto_pending_service = None    # service to request from Otto after summon
@@ -746,6 +747,56 @@ class ExplorationAgent:
                     if path:
                         return path[0]
 
+        # 5. Retry dead-end directions — some may have been false blocks (e.g. from
+        #    combat-blocked movement).  Try each once per session; if blocked again,
+        #    _handle_blocked_move will re-add it.  Prefer current room, then BFS.
+        retry = self._pick_dead_end_for_retry(current, room_links, rooms)
+        if retry:
+            target_room, direction = retry
+            # Unblock so _execute_move can proceed and room_links accepts the move
+            room_hash_de = target_room
+            room_de = self.state.dead_ends.get(room_hash_de, set())
+            room_de.discard(direction)
+            if not room_de:
+                self.state.dead_ends.pop(room_hash_de, None)
+            room_links.setdefault(room_hash_de, {}).pop(direction, None)
+            self._dead_end_retried.add((room_hash_de, direction))
+            name = rooms.get(room_hash_de, {}).get('name', room_hash_de[:8])
+            self.client.append_text(
+                f"[AI] Retrying dead-end '{direction}' in '{name}' "
+                f"(may have been a false block).\n", "system")
+            if target_room == current:
+                return direction
+            path = self.pathfinder.bfs_path(room_links, current, target_room)
+            if path:
+                return path[0]
+
+        return None
+
+    def _pick_dead_end_for_retry(self, current, room_links, rooms):
+        """
+        Find a (room_hash, direction) dead-end eligible for a one-shot retry.
+        Checks the current room first, then BFS-reachable rooms.
+        Returns None if everything has already been retried this session.
+        """
+        # Build candidate list: current room first, then others in dead_ends
+        candidates = []
+        if current in self.state.dead_ends:
+            candidates.append(current)
+        for rhash in self.state.dead_ends:
+            if rhash != current:
+                candidates.append(rhash)
+
+        for rhash in candidates:
+            dirs = self.state.dead_ends.get(rhash, set())
+            exits_str = rooms.get(rhash, {}).get('exits', '')
+            real_exits = self.pathfinder.parse_exits_text(exits_str)
+            for d in sorted(dirs):  # sorted for determinism
+                if d not in real_exits:
+                    continue  # phantom block — skip
+                if (rhash, d) in self._dead_end_retried:
+                    continue  # already retried this session
+                return (rhash, d)
         return None
 
     def _choose_collision_direction(self, reported_exits, dead_ends, dark_dirs):
@@ -1294,9 +1345,8 @@ class ExplorationAgent:
             current = self.client.current_room_hash
             if current in self.state.water_sources:
                 self.client.append_text(
-                    "[AI] Drink failed here — blacklisting water source.\n", "system")
+                    "[AI] Drink failed here — removing water source (will re-detect on next visit).\n", "system")
                 del self.state.water_sources[current]
-                self.state.water_sources_failed.add(current)
 
         # --- "Sorry, you cannot do that here" — MUD rejected a shop command ---
         # This fires when we sent 'list' or 'buy' in a non-shop room.  Clear the
@@ -1313,9 +1363,8 @@ class ExplorationAgent:
                 self.state.food_price = None
             if current in self.state.water_sources:
                 self.client.append_text(
-                    "[AI] Drink rejected here — blacklisting water source.\n", "system")
+                    "[AI] Drink rejected here — removing water source (will re-detect on next visit).\n", "system")
                 del self.state.water_sources[current]
-                self.state.water_sources_failed.add(current)
 
         # --- Kill target not found — wrong keyword or mob left the room ---
         # "They don't seem to be here" fires either because the keyword doesn't
