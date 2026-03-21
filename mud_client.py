@@ -1128,10 +1128,11 @@ class MUDClient:
         # Extract room name (first line with room color)
         room_name = ""
         description_parts = []
+        object_parts = []
         exits = ""
         in_description = False
         exits_found = False
-        
+
         for text, color in segments:
             text_stripped = text.strip()
 
@@ -1147,22 +1148,27 @@ class MUDClient:
                     in_description = True
 
             else:
-                # Description text (non-room-color, before exits)
-                if in_description and not exits_found and text_stripped:
-                    description_parts.append(text_stripped)
-        
+                if in_description and text_stripped:
+                    if not exits_found:
+                        # Before exits line: room description
+                        description_parts.append(text_stripped)
+                    else:
+                        # After exits line: objects / mobs on the ground
+                        object_parts.append(text_stripped)
+
         description = ' '.join(description_parts)
-        
+
         if room_name:
             # Normalize description for stable hashing
             # Remove extra whitespace, normalize line breaks
             normalized_description = ' '.join(description.split())
-            
+
             return {
                 'name': room_name,
                 'description': description,  # Keep original for display
                 'normalized_description': normalized_description,  # Use for hashing
-                'exits': exits
+                'exits': exits,
+                'objects': object_parts,
             }
         
         return None
