@@ -390,6 +390,8 @@ class ExplorationAgent:
         self._combat_start_time = None   # time.monotonic() when combat started
         self._last_combat_start_time = None  # persists after combat ends — used by death attribution
         self._combat_start_hp = None     # our HP when combat started
+        self._last_combat_message_time = None  # monotonic time of last combat pattern detection
+        self._combat_emergency_summon_sent = False  # True if emergency summon sent this combat
         self._recent_departures = set()  # mob names seen leaving this room (cleared on room entry)
         self._dead_end_retried = set()   # (room_hash, direction) pairs retried this session
         self._dead = False
@@ -408,6 +410,7 @@ class ExplorationAgent:
         self._who_interval = 120.0           # refresh who list every 2 minutes
         self._last_autosave = 0.0            # monotonic time of last periodic save
         self._autosave_interval = 60.0       # save state every 60 seconds
+        self.COMBAT_EMERGENCY_HP_PCT = 0.30  # HP threshold for emergency Otto summon during combat
         self._mud_time_obs = []              # [(monotonic, mud_hour), ...] for calibration
         self._last_inv_request = 0.0         # monotonic time of last inventory check
         self._inv_interval = 60.0            # check inventory every 60 seconds
@@ -1055,6 +1058,8 @@ class ExplorationAgent:
                         self._combat_start_time = time.monotonic()
                         self._last_combat_start_time = self._combat_start_time
                         self._combat_start_hp = self.state.current_hp
+                        self._last_combat_message_time = time.monotonic()
+                        self._combat_emergency_summon_sent = False
                         self._schedule_tick(self.COMMAND_DELAY_MS * 2)
                         return
 
@@ -1297,6 +1302,8 @@ class ExplorationAgent:
                 self._combat_active = False
                 self._combat_seen_active = False
                 self._last_combat_npc = npc if npc else self._last_combat_npc
+                self._last_combat_message_time = None
+                self._combat_emergency_summon_sent = False
                 self.client.append_text("[AI] Opponent defeated — resuming exploration.\n", "system")
 
         # --- XP gain ---
@@ -1379,6 +1386,8 @@ class ExplorationAgent:
             self._combat_npc = None
             self._combat_start_time = None
             self._combat_start_hp = None
+            self._last_combat_message_time = None
+            self._combat_emergency_summon_sent = False
             if failed_name:
                 # Check if this mob was seen leaving the room recently
                 mob_departed = any(
@@ -1414,6 +1423,8 @@ class ExplorationAgent:
                         self._combat_start_time = time.monotonic()
                         self._last_combat_start_time = self._combat_start_time
                         self._combat_start_hp = self.state.current_hp
+                        self._last_combat_message_time = time.monotonic()
+                        self._combat_emergency_summon_sent = False
                     else:
                         self.client.append_text(
                             f"[AI] Kill '{failed_name}' failed — no usable keyword, skipping.\n",
@@ -1498,6 +1509,8 @@ class ExplorationAgent:
                 self._combat_start_time = None
                 self._last_combat_start_time = None
                 self._combat_start_hp = None
+                self._last_combat_message_time = None
+                self._combat_emergency_summon_sent = False
                 self.client.append_text(
                     f"[AI] Death detected (#{self.state.total_deaths}) — waiting for respawn.\n", "system")
                 self.save_state()
@@ -1533,6 +1546,8 @@ class ExplorationAgent:
                 self._combat_start_time = time.monotonic()
                 self._last_combat_start_time = self._combat_start_time
                 self._combat_start_hp = self.state.current_hp
+                self._last_combat_message_time = time.monotonic()
+                self._combat_emergency_summon_sent = False
                 attacker = self.parser.detect_combat_attacker(clean_text)
                 self._combat_npc = attacker.lower() if attacker else None
                 if self._combat_npc:
@@ -1544,23 +1559,48 @@ class ExplorationAgent:
             # Also mark active if we see any combat pattern in this chunk
             if any(p in lower for p in COMBAT_ACTIVE_PATTERNS):
                 self._combat_seen_active = True
+                self._last_combat_message_time = time.monotonic()
             # Opponent HP going above 0 also confirms real combat
             if self.state.current_opp_pct is not None and self.state.current_opp_pct > 0:
                 self._combat_seen_active = True
             round_data = self.parser.detect_combat_round(clean_text)
             if round_data and round_data.get('damage'):
                 self._combat_seen_active = True
+                self._last_combat_message_time = time.monotonic()
                 self.client.append_text(
                     f"[AI] Combat: {round_data['attacker']} {round_data['verb']} "
                     f"{round_data['target']} for {round_data['damage']} damage.\n", "system")
+            
+            # Emergency extraction when HP critically low during combat
+            if (not self._combat_emergency_summon_sent 
+                and self.state.current_hp is not None 
+                and self.state.max_hp is not None
+                and self.state.max_hp > 0):
+                hp_pct = self.state.current_hp / self.state.max_hp
+                if hp_pct < self.COMBAT_EMERGENCY_HP_PCT and self._otto_can('summon'):
+                    self.client.append_text(
+                        f"[AI] EMERGENCY: HP at {hp_pct*100:.0f}% — summoning Otto to escape!\n", 
+                        "error")
+                    self._tell_otto('summon')
+                    self._combat_emergency_summon_sent = True
+                    self._schedule_tick(self.COMMAND_DELAY_MS * 3)
+            
             fled = self.parser.detect_flee(clean_text)
+            if fled:
+                # Fleeing moves us to a different room — clear Otto presence flag
+                # so we don't spam heal requests when he's not there anymore.
+                self._otto_in_current_room = False
             opp_pct = self.state.current_opp_pct
             # Non-zero opp_pct means the opponent is still alive (positive = healthy,
             # negative = mortally wounded) — patterns alone cannot declare combat over.
             opp_alive = opp_pct is not None and opp_pct != 0
-            combat_over = fled or (
-                not any(p in lower for p in COMBAT_ACTIVE_PATTERNS) and not opp_alive
-            )
+            
+            # Only end combat if fled OR 10 seconds have passed since last combat message
+            combat_over = fled
+            if not fled and self._last_combat_message_time is not None:
+                time_since_last_message = time.monotonic() - self._last_combat_message_time
+                if time_since_last_message >= 10.0 and not opp_alive:
+                    combat_over = True
             if combat_over:
                 npc = self._combat_npc
                 if npc:
@@ -1592,6 +1632,8 @@ class ExplorationAgent:
                 # or the next combat begins — do NOT clear it here.
                 self._combat_start_time = None
                 self._combat_start_hp = None
+                self._last_combat_message_time = None
+                self._combat_emergency_summon_sent = False
                 if fled:
                     self.client.append_text("[AI] Fled combat — resuming exploration.\n", "system")
                 else:
@@ -1792,6 +1834,8 @@ class ExplorationAgent:
                 self._combat_start_time = time.monotonic()
                 self._last_combat_start_time = self._combat_start_time
                 self._combat_start_hp = self.state.current_hp
+                self._last_combat_message_time = time.monotonic()
+                self._combat_emergency_summon_sent = False
                 self._schedule_tick(self.COMMAND_DELAY_MS * 2)
             else:
                 self.client.append_text(

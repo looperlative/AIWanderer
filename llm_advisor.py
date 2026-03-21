@@ -426,7 +426,8 @@ class LLMAdvisor:
         elif goal == 'earn_gold':
             parts.append("\nTASK: Find and kill a beatable monster to earn gold.")
 
-        parts.append("\nWhat single command should I enter next?")
+        # parts.append("\nWhat single command should I enter next?")
+        parts.append("\nRecommend a plan of action and finish with a single command as the last line.")
         return "\n".join(parts)
 
     # ------------------------------------------------------------------
@@ -489,8 +490,10 @@ class LLMAdvisor:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": self._build_user_message(context)},
             ],
-            "temperature": 0.3,
-            "max_tokens": 60,
+            # "temperature": 0.3,
+            "temperature": 0.5,
+            # "max_tokens": 60,
+            "max_tokens": 2048,
             "stream": False,
             "options": {"num_ctx": 8192},
         }
@@ -517,6 +520,7 @@ class LLMAdvisor:
             raise RuntimeError(f"Ollama returned HTTP {resp.status}: {raw[:200]}")
 
         data = json.loads(raw)
+        # Return the full content - let _sanitize() handle extraction
         return data['choices'][0]['message']['content']
 
     # ------------------------------------------------------------------
@@ -569,11 +573,46 @@ class LLMAdvisor:
         """
         Strip the LLM response down to a single clean command.
         LLMs sometimes wrap their answer in quotes, explanation, or markdown.
+        The prompt asks them to "finish with a single command as the last line",
+        often preceded by "Command:" label.
         """
         if not text:
             return None
-        # Take only the first line
-        line = text.strip().splitlines()[0].strip()
+        
+        lines = text.strip().splitlines()
+        if not lines:
+            return None
+        
+        # Look for "Command:" label (case-insensitive)
+        line = None
+        for i, l in enumerate(lines):
+            l_stripped = l.strip()
+            # Check if this line contains "Command:" (possibly with the command on the same line)
+            if re.match(r'^command\s*:\s*', l_stripped, re.IGNORECASE):
+                # Check if command is on the same line after the colon
+                remainder = re.sub(r'^command\s*:\s*', '', l_stripped, flags=re.IGNORECASE).strip()
+                if remainder:
+                    line = remainder
+                    break
+                # Otherwise, take the next non-empty line
+                for j in range(i + 1, len(lines)):
+                    next_line = lines[j].strip()
+                    if next_line:
+                        line = next_line
+                        break
+                break
+        
+        # If no "Command:" label found, use the last non-empty line
+        if line is None:
+            for l in reversed(lines):
+                l_stripped = l.strip()
+                if l_stripped:
+                    line = l_stripped
+                    break
+        
+        if not line:
+            return None
+        
         # Remove surrounding quotes
         line = line.strip('"\'`')
         # Remove common prefixes the model might add
