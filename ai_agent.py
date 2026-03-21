@@ -390,6 +390,7 @@ class ExplorationAgent:
         self._combat_start_time = None   # time.monotonic() when combat started
         self._last_combat_start_time = None  # persists after combat ends — used by death attribution
         self._combat_start_hp = None     # our HP when combat started
+        self._recent_departures = set()  # mob names seen leaving this room (cleared on room entry)
         self._dead = False
         self._last_shop_list_request = 0.0   # monotonic time of last 'list' command
         self._otto_pending_service = None    # service to request from Otto after summon
@@ -812,6 +813,7 @@ class ExplorationAgent:
 
         move_dir = self._last_direction   # capture before clearing
         self._waiting_for_room = False
+        self._recent_departures.clear()   # fresh room — departure history resets
         self._last_direction = None
         self._dead = False  # if we were dead, we've respawned
         self._otto_summon_sent_at = 0.0   # room entry confirms teleport complete
@@ -979,15 +981,26 @@ class ExplorationAgent:
                         # avoid false positives from room description text.
                         if not color_calibrated and rec.get("sightings", 0) < 2:
                             continue
+                        # Use the shortest untried keyword for this mob
+                        bad_kws = rec.get("bad_kill_keywords", [])
+                        words = mob_lower.split()
+                        kill_kw = None
+                        for i in range(len(words)):
+                            candidate = " ".join(words[i:])
+                            if candidate not in bad_kws:
+                                kill_kw = candidate
+                                break
+                        if kill_kw is None:
+                            continue  # all keywords exhausted — skip this mob
                         reason = "need gold —" if self._needs_gold() else "attacking for XP —"
                         self.client.append_text(
-                            f"[AI] {reason} attacking {mob}.\n", "system")
-                        self.client.send_ai_command(f"kill {mob_lower}")
+                            f"[AI] {reason} attacking {mob} (keyword: '{kill_kw}').\n", "system")
+                        self.client.send_ai_command(f"kill {kill_kw}")
                         self._combat_active = True
                         self._combat_seen_active = False
                         self._combat_win_counted = False
-                        self._combat_npc = mob_lower
-                        self._last_combat_npc = mob_lower
+                        self._combat_npc = kill_kw
+                        self._last_combat_npc = kill_kw
                         self._combat_start_time = time.monotonic()
                         self._last_combat_start_time = self._combat_start_time
                         self._combat_start_hp = self.state.current_hp
@@ -1267,6 +1280,13 @@ class ExplorationAgent:
             if gold_received and self.state.gold is not None:
                 self.state.gold += gold_received
 
+        # --- Mob departure / arrival tracking ---
+        for name in self.parser.detect_mob_departures(clean_text):
+            self._recent_departures.add(name)
+        # Arrivals cancel a prior departure record for the same mob
+        for name in self.parser.detect_mob_arrivals(clean_text):
+            self._recent_departures.discard(name)
+
         # --- "You can't find it!" — drink/eat target not present here ---
         # Clears a false water-source record so we don't keep navigating back.
         if re.search(r"you can.t find it|you don.t see (?:it|that) here",
@@ -1296,6 +1316,59 @@ class ExplorationAgent:
                     "[AI] Drink rejected here — blacklisting water source.\n", "system")
                 del self.state.water_sources[current]
                 self.state.water_sources_failed.add(current)
+
+        # --- Kill target not found — wrong keyword or mob left the room ---
+        # "They don't seem to be here" fires either because the keyword doesn't
+        # match or because the mob wandered out just before our kill command.
+        # Check recent departures first — if the mob left, the keyword is still
+        # valid and we shouldn't blacklist it.
+        if self._combat_active and self.parser.detect_kill_target_missing(clean_text):
+            failed_name = self._combat_npc
+            # Clear bogus combat state — fight never started
+            self._combat_active = False
+            self._combat_seen_active = False
+            self._combat_npc = None
+            self._combat_start_time = None
+            self._combat_start_hp = None
+            if failed_name:
+                # Check if this mob was seen leaving the room recently
+                mob_departed = any(
+                    failed_name in dep or dep in failed_name
+                    for dep in self._recent_departures
+                )
+                if mob_departed:
+                    self.client.append_text(
+                        f"[AI] Kill '{failed_name}' missed — mob left the room.\n",
+                        "system")
+                else:
+                    # Keyword mismatch — record it and try a shorter form
+                    rec = self.state.npc_danger.setdefault(failed_name, {
+                        "deaths": 0, "fastest_death_secs": None,
+                        "wins": 0, "near_kills": 0, "last_room": None,
+                    })
+                    bad_keywords = rec.setdefault("bad_kill_keywords", [])
+                    if failed_name not in bad_keywords:
+                        bad_keywords.append(failed_name)
+                    # Try dropping the first word: "head postmaster" → "postmaster"
+                    words = failed_name.split()
+                    shorter = " ".join(words[1:]) if len(words) > 1 else None
+                    if shorter and shorter not in bad_keywords:
+                        self.client.append_text(
+                            f"[AI] Kill '{failed_name}' failed — retrying as '{shorter}'.\n",
+                            "system")
+                        self.client.send_ai_command(f"kill {shorter}")
+                        self._combat_active = True
+                        self._combat_seen_active = False
+                        self._combat_win_counted = False
+                        self._combat_npc = shorter
+                        self._last_combat_npc = shorter
+                        self._combat_start_time = time.monotonic()
+                        self._last_combat_start_time = self._combat_start_time
+                        self._combat_start_hp = self.state.current_hp
+                    else:
+                        self.client.append_text(
+                            f"[AI] Kill '{failed_name}' failed — no usable keyword, skipping.\n",
+                            "system")
 
         # --- Shop list: learn food item and price ---
         if self.state.food_room and not self.state.food_item:

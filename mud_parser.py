@@ -446,6 +446,36 @@ class MUDTextParser:
         """Return True if the MUD rejected a movement command."""
         return bool(self.MOVE_FAIL_RE.search(text))
 
+    MOB_DEPARTURE_RE = re.compile(
+        r'^(.+?)\s+(?:leaves?|departs?|walks?|wanders?|runs?|flees?|exits?)\s+'
+        r'(?:north|south|east|west|up|down|in|out|the\s+\w+)',
+        re.IGNORECASE | re.MULTILINE
+    )
+    MOB_ARRIVAL_RE = re.compile(
+        r'^(.+?)\s+has\s+arrived',
+        re.IGNORECASE | re.MULTILINE
+    )
+
+    def detect_mob_departures(self, text):
+        """Return a list of lowercase mob names that left the room in this text."""
+        return [m.group(1).strip().lower() for m in self.MOB_DEPARTURE_RE.finditer(text)]
+
+    def detect_mob_arrivals(self, text):
+        """Return a list of lowercase mob names that arrived in this text."""
+        return [m.group(1).strip().lower() for m in self.MOB_ARRIVAL_RE.finditer(text)]
+
+    KILL_TARGET_MISSING_RE = re.compile(
+        r"they don.t seem to be here|"
+        r"i see no \S+ here|"
+        r"your victim is not here|"
+        r"that person is not here",
+        re.IGNORECASE
+    )
+
+    def detect_kill_target_missing(self, text):
+        """Return True if the MUD couldn't find the kill target by that name."""
+        return bool(self.KILL_TARGET_MISSING_RE.search(text))
+
     # ------------------------------------------------------------------
     # Death detection
     # ------------------------------------------------------------------
