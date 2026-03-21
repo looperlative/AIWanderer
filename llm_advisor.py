@@ -583,14 +583,14 @@ class LLMAdvisor:
         if not lines:
             return None
         
-        # Look for "Command:" label (case-insensitive)
+        # Look for "Command:" label (case-insensitive), with optional markdown formatting
         line = None
         for i, l in enumerate(lines):
             l_stripped = l.strip()
-            # Check if this line contains "Command:" (possibly with the command on the same line)
-            if re.match(r'^command\s*:\s*', l_stripped, re.IGNORECASE):
+            # Check if this line contains "Command:" (possibly with markdown bold ** around it)
+            if re.match(r'^\*{0,2}command\s*:\*{0,2}\s*', l_stripped, re.IGNORECASE):
                 # Check if command is on the same line after the colon
-                remainder = re.sub(r'^command\s*:\s*', '', l_stripped, flags=re.IGNORECASE).strip()
+                remainder = re.sub(r'^\*{0,2}command\s*:\*{0,2}\s*', '', l_stripped, flags=re.IGNORECASE).strip()
                 if remainder:
                     line = remainder
                     break
@@ -613,6 +613,8 @@ class LLMAdvisor:
         if not line:
             return None
         
+        # Remove markdown formatting (bold/italic asterisks)
+        line = re.sub(r'\*+', '', line)
         # Remove surrounding quotes
         line = line.strip('"\'`')
         # Remove common prefixes the model might add

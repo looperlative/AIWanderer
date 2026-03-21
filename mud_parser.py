@@ -149,6 +149,18 @@ class MUDTextParser:
             re.compile(r'\balign(?:ment)?\s*[:\-]?\s*(?P<v>[A-Za-z]+)\b', re.IGNORECASE),
             re.compile(r'\b(?P<v>good|neutral|evil|lawful|chaotic)\b', re.IGNORECASE),
         ],
+        'hunger': [
+            # Detect hunger status in score output
+            re.compile(r'\b(?P<v>starving|famished|dying of hunger)\b', re.IGNORECASE),
+            re.compile(r'\byou are (?P<v>hungry)\b', re.IGNORECASE),
+            re.compile(r'\b(?P<v>hungry)\b', re.IGNORECASE),
+        ],
+        'thirst': [
+            # Detect thirst status in score output
+            re.compile(r'\b(?P<v>parched|dying of thirst)\b', re.IGNORECASE),
+            re.compile(r'\byou are (?P<v>thirsty)\b', re.IGNORECASE),
+            re.compile(r'\b(?P<v>thirsty)\b', re.IGNORECASE),
+        ],
     }
 
     def parse_score(self, text):
@@ -156,7 +168,7 @@ class MUDTextParser:
         Extract character sheet data from a SCORE / STAT command response.
 
         Returns a dict with any fields found (level, class_name, race,
-        max_hp, max_mp, max_mv, xp, xp_next, gold, alignment).
+        max_hp, max_mp, max_mv, xp, xp_next, gold, alignment, hunger, thirst).
         Returns None if nothing at all was matched.
         """
         result = {}
@@ -166,7 +178,7 @@ class MUDTextParser:
                 if m:
                     raw = m.group('v').strip()
                     # Integer fields (alignment may be numeric or string)
-                    if field not in ('class_name', 'race'):
+                    if field not in ('class_name', 'race', 'hunger', 'thirst'):
                         try:
                             result[field] = int(raw.replace(',', ''))
                         except ValueError:
@@ -175,6 +187,22 @@ class MUDTextParser:
                     else:
                         result[field] = raw
                     break  # first matching pattern wins for this field
+        
+        # Normalize hunger/thirst to canonical levels
+        if 'hunger' in result:
+            h = result['hunger'].lower()
+            if 'starv' in h or 'famish' in h or 'dying' in h:
+                result['hunger'] = 'starving'
+            else:
+                result['hunger'] = 'hungry'
+        
+        if 'thirst' in result:
+            t = result['thirst'].lower()
+            if 'parch' in t or 'dying' in t:
+                result['thirst'] = 'parched'
+            else:
+                result['thirst'] = 'thirsty'
+        
         return result if result else None
 
     # ------------------------------------------------------------------
@@ -973,9 +1001,9 @@ class MUDTextParser:
     )
 
     FOOD_ITEM_RE = re.compile(
-        r'(?:bread|ration|meat|jerky|apple|cheese|biscuit|hardtack|'
+        r'\b(?:bread|ration|meat|jerky|apple|cheese|biscuit|hardtack|'
         r'pie|loaf|meal|food|berry|fruit|vegetable|fish|mushroom|soup|'
-        r'waybread|tack|provision|snack|cake|cracker|grain|corn|egg)',
+        r'waybread|tack|provision|snack|cake|cracker|grain|corn|egg)\b',
         re.IGNORECASE
     )
 
@@ -993,6 +1021,43 @@ class MUDTextParser:
         re.compile(r'^(.+?)\s*\(\s*([\d,]+)\s*(?:gold|gp|coins?)?\s*\)', re.MULTILINE | re.IGNORECASE),
         re.compile(r'^(.+?)\s+-+\s*([\d,]+)', re.MULTILINE),
     ]
+
+    def is_food_item(self, item_name):
+        """
+        Return True if the item name appears to be food.
+        Checks against common food keywords (meat, bread, ration, etc.).
+        """
+        if not item_name:
+            return False
+        return bool(self.FOOD_ITEM_RE.search(item_name))
+
+    def get_item_keyword(self, item_name):
+        """
+        Extract the keyword from an item name for use in MUD commands.
+        For food items, extracts the actual food word (e.g., 'meat' from 'a piece of meat').
+        For other items, strips leading articles.
+        
+        Examples:
+            "a piece of meat" -> "meat"
+            "loaf of bread" -> "bread"
+            "an apple" -> "apple"
+            "the broad sword" -> "broad sword"
+        """
+        if not item_name:
+            return item_name
+        
+        # For food items, try to extract the actual food keyword
+        if self.is_food_item(item_name):
+            # Find all food keywords in the item name
+            matches = list(self.FOOD_ITEM_RE.finditer(item_name))
+            if matches:
+                # Return the last matched food keyword (most specific)
+                # e.g., "loaf of bread" has both "loaf" and "bread", prefer "bread"
+                return matches[-1].group(0).lower()
+        
+        # For non-food items, just strip leading articles
+        stripped = re.sub(r'^\s*(?:a|an|the)\s+', '', item_name, flags=re.IGNORECASE)
+        return stripped.strip()
 
     def detect_food_shop(self, text):
         """Return True if the room description suggests a food vendor is present."""

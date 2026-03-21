@@ -444,9 +444,10 @@ class ExplorationAgent:
     def start(self):
         """Load persisted state and begin the tick loop."""
         self.load_state()
-        # If key score values are unknown, request score on first tick
-        if self.state.max_hp is None:
-            self._last_score_request = 0.0
+        # Request score immediately on startup to detect hunger/thirst/buffs from login
+        self._last_score_request = 0.0
+        # Also request inventory early to see what food we have
+        self._last_inv_request = 0.0
         # Seed visited with current room if known
         if self.client.current_room_hash:
             current = self.client.current_room_hash
@@ -1186,6 +1187,15 @@ class ExplorationAgent:
         if hunger and hunger != self.state.hunger_level:
             self.state.hunger_level = hunger
             self.client.append_text(f"[AI] Hunger detected: {hunger}.\n", "system")
+            # Check inventory for food items when hunger is first detected
+            food_in_inventory = None
+            for item in self.state.inventory:
+                if self.parser.is_food_item(item):
+                    food_in_inventory = item
+                    break
+            if food_in_inventory:
+                self.client.append_text(
+                    f"[AI] Found food in inventory: '{food_in_inventory}' — will eat it.\n", "system")
         elif re.search(r'you eat|you consume|you finish eating', clean_text, re.IGNORECASE):
             if self.state.hunger_level:
                 self.state.hunger_level = None
@@ -1224,6 +1234,28 @@ class ExplorationAgent:
             if 'xp_next'   in score: self.state.char_xp_next   = score['xp_next']
             if 'gold'      in score: self.state.gold           = score['gold']
             if 'alignment' in score: self.state.char_alignment = score['alignment']
+            # Detect hunger/thirst from score output
+            if 'hunger' in score:
+                old_hunger = self.state.hunger_level
+                self.state.hunger_level = score['hunger']
+                if old_hunger != self.state.hunger_level:
+                    self.client.append_text(
+                        f"[AI] Hunger detected from score: {self.state.hunger_level}.\n", "system")
+                    # Check inventory for food items when hunger is first detected
+                    food_in_inventory = None
+                    for item in self.state.inventory:
+                        if self.parser.is_food_item(item):
+                            food_in_inventory = item
+                            break
+                    if food_in_inventory:
+                        self.client.append_text(
+                            f"[AI] Found food in inventory: '{food_in_inventory}' — will eat it.\n", "system")
+            if 'thirst' in score:
+                old_thirst = self.state.thirst_level
+                self.state.thirst_level = score['thirst']
+                if old_thirst != self.state.thirst_level:
+                    self.client.append_text(
+                        f"[AI] Thirst detected from score: {self.state.thirst_level}.\n", "system")
             self.save_state()
 
         # --- WHO list parsing ---
@@ -1675,6 +1707,11 @@ class ExplorationAgent:
         if self.state.thirst_level in ('parched', 'thirsty'):
             return {'need': 'water'}
         if self.state.hunger_level in ('starving', 'hungry'):
+            # Check inventory for food items first
+            for item in self.state.inventory:
+                if self.parser.is_food_item(item):
+                    return {'need': 'eat_inventory_food', 'item': item}
+            # No food in inventory — seek shops or earn gold
             if self._needs_gold():
                 return {'need': 'gold'}
             return {'need': 'food'}
@@ -1864,6 +1901,20 @@ class ExplorationAgent:
                 # No Otto heal available — just rest/wait
                 self.client.append_text("[AI] Survival: low HP, resting.\n", "system")
                 self._schedule_tick(5000)
+            return
+
+        # --- Eat food from inventory ---
+        if need == 'eat_inventory_food':
+            item = action.get('item')
+            if item:
+                # Strip articles (a, an, the) from item name for MUD command
+                item_keyword = self.parser.get_item_keyword(item)
+                self.client.append_text(
+                    f"[AI] Survival: eating '{item}' from inventory.\n", "system")
+                self.client.send_ai_command(f"eat {item_keyword}")
+                self.state.hunger_level = None
+                self.state.current_goal = 'explore'
+                self._schedule_tick(self.COMMAND_DELAY_MS)
             return
 
         if need == 'water':
