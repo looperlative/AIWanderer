@@ -46,6 +46,13 @@ COMBAT_ACTIVE_PATTERNS = [
     "attacks you",
     "hits you",
     "misses you",
+    # Miss/dodge phrases that name the opponent but don't use the above forms
+    "avoid the blow",
+    "duck under",
+    "punch at the air",
+    "tries to hit you",
+    "ducks under your",
+    "missing the",
 ]
 
 BLOCKED_PATTERNS = [
@@ -1205,8 +1212,9 @@ class ExplorationAgent:
             prev_opp = self.state.current_opp_pct
             self.state.current_tank_pct = stats.get('tank', self.state.current_tank_pct)
             self.state.current_opp_pct = stats.get('opp', self.state.current_opp_pct)
-            # Opponent just hit 0% — kill confirmed via prompt opp% transition
-            if (self._combat_active and prev_opp and prev_opp > 0
+            # Opponent just hit 0% — kill confirmed via prompt opp% transition.
+            # prev_opp != 0 covers both healthy (>0) and mortally wounded (<0) states.
+            if (self._combat_active and prev_opp is not None and prev_opp != 0
                     and self.state.current_opp_pct == 0):
                 npc = self._combat_npc
                 if npc and self._combat_seen_active:
@@ -1424,9 +1432,14 @@ class ExplorationAgent:
                     f"[AI] Combat: {round_data['attacker']} {round_data['verb']} "
                     f"{round_data['target']} for {round_data['damage']} damage.\n", "system")
             fled = self.parser.detect_flee(clean_text)
-            combat_over = fled or not any(p in lower for p in COMBAT_ACTIVE_PATTERNS)
+            opp_pct = self.state.current_opp_pct
+            # Non-zero opp_pct means the opponent is still alive (positive = healthy,
+            # negative = mortally wounded) — patterns alone cannot declare combat over.
+            opp_alive = opp_pct is not None and opp_pct != 0
+            combat_over = fled or (
+                not any(p in lower for p in COMBAT_ACTIVE_PATTERNS) and not opp_alive
+            )
             if combat_over:
-                opp_pct = self.state.current_opp_pct
                 npc = self._combat_npc
                 if npc:
                     rec = self.state.npc_danger.setdefault(npc, {

@@ -144,7 +144,7 @@ The autonomous MUD AI agent can't reliably navigate ("still not able to minimall
 
   **For hunt targeting:** query `mob_db` (not per-room), sorted by `last_room` BFS distance. Wanderers use `last_room` as the best guess for where to find them.
 
-- [ ] **1F: Fix premature `combat_over` detection** (`ai_agent.py`)
+- [x] **1F: Fix premature `combat_over` detection** (`ai_agent.py`)
   `combat_over` fires when a chunk contains no `COMBAT_ACTIVE_PATTERNS`, but combat miss messages like "missing the janitor" or "wildly punch at the air" don't match any pattern. This sets `_combat_active = False` mid-fight, causing the LLM to receive no combat context and win counts to be missed.
 
   Extend `COMBAT_ACTIVE_PATTERNS` to cover miss/dodge phrasing that names the opponent (e.g. "missing the", "punch at the air"), OR require a positive kill signal ("is dead! R.I.P.", XP gain) before declaring combat over — don't rely solely on the absence of patterns in a single chunk.
