@@ -104,7 +104,7 @@ You can test with these public MUD servers (if they support SSL):
 
 ## License
 
-This is free and unencumbered software released into the public domain.
+This is free and unencumbered software released via an MIT License.  See the file LICENSE.
 
 ## Contributing
 
