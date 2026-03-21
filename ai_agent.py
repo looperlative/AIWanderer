@@ -86,10 +86,12 @@ OTTO_KNOWN_CAPABILITIES = ['summon', 'heal', 'sanctuary', 'bless', 'armor']
 
 # Lines to suppress from the recent-MUD-text buffer sent to the LLM.
 # Stat prompts and command echoes are machine-readable noise, not narrative.
+#
+# We used to filter command echo, but not anymore: it's useful for the LLM
+# to see what commands we're sending.
 _MUD_NOISE_RE = re.compile(
     r'^(?:'
     r'\d+[Hh]\w*\s+\d+[Mm]\w*.*[>$]'   # stat prompt: "24H 100M 85V 0%T 0%O >"
-    r'|>\s*\S'                            # command echo: "> north"
     r'|\[AI'                              # agent status: "[AI] ..."
     r')',
     re.IGNORECASE
@@ -399,6 +401,7 @@ class ExplorationAgent:
         self._otto_pending_service = None    # service to request from Otto after summon
         self._otto_in_current_room = False   # True when Otto was detected in this room's live text
         self._otto_summon_sent_at = 0.0      # monotonic time of last 'tell otto summon' — guards spam
+        self._last_otto_heal_request = 0.0   # monotonic time of last 'tell otto heal' — prevents spam
         self._buff_sequence_pending = []     # protection buff tells still to send this cycle
         self._waiting_for_otto_help = False  # True after 'tell otto help' sent
         self._auto_pickup_pending = []       # get/drink commands queued from room entry
@@ -1065,17 +1068,27 @@ class ExplorationAgent:
                         return
 
                 # Check for known-dangerous NPCs and flee if we somehow entered anyway
-                for mob in mobs:
-                    rec = self.state.npc_danger.get(mob.lower())
-                    if rec and rec.get("deaths", 0) > 0:
-                        fast = rec.get("fastest_death_secs")
-                        self.client.append_text(
-                            f"[AI] DANGER: {mob} has killed us {rec['deaths']} time(s)"
-                            f"{f' (fastest: {fast}s)' if fast else ''} — fleeing!\n",
-                            "system")
-                        self.client.send_ai_command("flee")
-                        self._schedule_tick(self.COMMAND_DELAY_MS * 2)
-                        return
+                # UNLESS we need urgent Otto heal - healing takes priority
+                if self._needs_urgent_otto_heal():
+                    for mob in mobs:
+                        rec = self.state.npc_danger.get(mob.lower())
+                        if rec and rec.get("deaths", 0) > 0:
+                            self.client.append_text(
+                                f"[AI] DANGER: {mob} detected but skipping flee - need urgent heal.\n",
+                                "system")
+                    # Don't flee - let survival system handle healing first
+                else:
+                    for mob in mobs:
+                        rec = self.state.npc_danger.get(mob.lower())
+                        if rec and rec.get("deaths", 0) > 0:
+                            fast = rec.get("fastest_death_secs")
+                            self.client.append_text(
+                                f"[AI] DANGER: {mob} has killed us {rec['deaths']} time(s)"
+                                f"{f' (fastest: {fast}s)' if fast else ''} — fleeing!\n",
+                                "system")
+                            self.client.send_ai_command("flee")
+                            self._schedule_tick(self.COMMAND_DELAY_MS * 2)
+                            return
             # Update entity_db even when no mobs — records the empty snapshot (1E)
             if not mobs:
                 self._update_entity_db(room_hash, [])
@@ -1121,6 +1134,20 @@ class ExplorationAgent:
         if not self.is_running:
             return
 
+        # --- Otto summon success ---
+        # When incapacitated (HP <= 0), we can't see the room or Otto, so we need to
+        # detect the summon success message and directly request the pending service
+        if self.parser.detect_otto_summon_success(clean_text):
+            if self._otto_pending_service:
+                svc = self._otto_pending_service
+                self._otto_pending_service = None
+                self.client.append_text(
+                    f"[AI] Otto summoned us — requesting '{svc}'.\n", "system")
+                # Use after() to delay the tell slightly so it doesn't get lost
+                self.client.master.after(
+                    self.COMMAND_DELAY_MS * 2,
+                    lambda s=svc: self._tell_otto(s) if self.is_running else None)
+        
         # --- Otto tell responses ---
         otto_msg = self.parser.parse_otto_tell(clean_text)
         if otto_msg:
@@ -1617,6 +1644,21 @@ class ExplorationAgent:
                     self._combat_emergency_summon_sent = True
                     self._schedule_tick(self.COMMAND_DELAY_MS * 3)
             
+            # Check if opponent fled (before checking if we fled)
+            fled_mob = self.parser.detect_opponent_flee(clean_text)
+            if fled_mob and self._combat_active:
+                self.client.append_text(
+                    f"[AI] {fled_mob} fled from combat — not counting as victory.\n", "system")
+                self._combat_active = False
+                self._combat_seen_active = False
+                self._combat_npc = None
+                self._combat_start_time = None
+                self._combat_start_hp = None
+                self._last_combat_message_time = None
+                self._combat_emergency_summon_sent = False
+                # Don't increment win counter for fled opponents
+                return
+            
             fled = self.parser.detect_flee(clean_text)
             if fled:
                 # Fleeing moves us to a different room — clear Otto presence flag
@@ -1635,7 +1677,23 @@ class ExplorationAgent:
                     combat_over = True
             if combat_over:
                 npc = self._combat_npc
-                if npc:
+                # Check if we were defeated (HP <= 0 or incapacitated)
+                player_defeated = (self.state.current_hp is not None and self.state.current_hp <= 0) or \
+                                  self.parser.detect_incapacitated(clean_text)
+                
+                if player_defeated:
+                    # We lost the fight - don't count as victory
+                    self.client.append_text(
+                        f"[AI] Defeated by {npc or 'opponent'} — requesting emergency heal.\n", "error")
+                    self._combat_active = False
+                    self._combat_seen_active = False
+                    self._combat_npc = None
+                    self._combat_start_time = None
+                    self._combat_start_hp = None
+                    self._last_combat_message_time = None
+                    self._combat_emergency_summon_sent = False
+                    # Emergency heal will be handled by survival system
+                elif npc:
                     rec = self.state.npc_danger.setdefault(npc, {
                         "deaths": 0, "fastest_death_secs": None,
                         "wins": 0, "near_kills": 0, "last_room": None,
@@ -1657,15 +1715,24 @@ class ExplorationAgent:
                         self.client.append_text(
                             f"[AI] Near-kill on {npc} at {opp_pct}% HP "
                             f"(near_kills: {rec['near_kills']}).\n", "system")
-                self._combat_active = False
-                self._combat_seen_active = False
-                self._combat_npc = None
-                # Keep _last_combat_npc set until either death attribution clears it
-                # or the next combat begins — do NOT clear it here.
-                self._combat_start_time = None
-                self._combat_start_hp = None
-                self._last_combat_message_time = None
-                self._combat_emergency_summon_sent = False
+                    self._combat_active = False
+                    self._combat_seen_active = False
+                    self._combat_npc = None
+                    # Keep _last_combat_npc set until either death attribution clears it
+                    # or the next combat begins — do NOT clear it here.
+                    self._combat_start_time = None
+                    self._combat_start_hp = None
+                    self._last_combat_message_time = None
+                    self._combat_emergency_summon_sent = False
+                else:
+                    # Combat ended but no NPC tracked
+                    self._combat_active = False
+                    self._combat_seen_active = False
+                    self._combat_npc = None
+                    self._combat_start_time = None
+                    self._combat_start_hp = None
+                    self._last_combat_message_time = None
+                    self._combat_emergency_summon_sent = False
                 if fled:
                     self.client.append_text("[AI] Fled combat — resuming exploration.\n", "system")
                 else:
@@ -1708,9 +1775,9 @@ class ExplorationAgent:
             return {'need': 'water'}
         if self.state.hunger_level in ('starving', 'hungry'):
             # Check inventory for food items first
-            for item in self.state.inventory:
-                if self.parser.is_food_item(item):
-                    return {'need': 'eat_inventory_food', 'item': item}
+            food_items = [item for item in self.state.inventory if self.parser.is_food_item(item)]
+            if food_items:
+                return {'need': 'eat_inventory_food', 'food_items': food_items}
             # No food in inventory — seek shops or earn gold
             if self._needs_gold():
                 return {'need': 'gold'}
@@ -1892,6 +1959,13 @@ class ExplorationAgent:
             self.state.current_goal = 'get_heal'
             if self._otto_can('heal'):
                 if self._otto_present():
+                    # Throttle heal requests to avoid spam
+                    now = time.monotonic()
+                    if now - self._last_otto_heal_request < 5.0:
+                        # Don't spam Otto - wait at least 5 seconds between heal requests
+                        self._schedule_tick(self.COMMAND_DELAY_MS * 3)
+                        return
+                    self._last_otto_heal_request = now
                     self.client.append_text("[AI] Survival: asking Otto to heal us.\n", "system")
                     self._tell_otto('heal')
                     self._schedule_tick(self.COMMAND_DELAY_MS * 2)
@@ -1905,16 +1979,46 @@ class ExplorationAgent:
 
         # --- Eat food from inventory ---
         if need == 'eat_inventory_food':
-            item = action.get('item')
-            if item:
-                # Strip articles (a, an, the) from item name for MUD command
-                item_keyword = self.parser.get_item_keyword(item)
+            food_items = action.get('food_items', [])
+            if not food_items:
+                self.client.append_text("[AI] No food in inventory — seeking food shop.\n", "system")
+                return self._do_survival_action({'need': 'food'})
+            
+            # Filter out dubious/rotten/poisoned food items
+            safe_food = []
+            unsafe_food = []
+            for item in food_items:
+                item_lower = item.lower()
+                if any(word in item_lower for word in ['dubious', 'rotten', 'moldy', 'mouldy', 
+                                                         'spoiled', 'spoilt', 'poisoned', 'tainted', 
+                                                         'contaminated', 'bad']):
+                    unsafe_food.append(item)
+                else:
+                    safe_food.append(item)
+            
+            # Prefer safe food, but eat unsafe as last resort if starving
+            item_to_eat = None
+            if safe_food:
+                item_to_eat = safe_food[0]
+                if unsafe_food:
+                    self.client.append_text(
+                        f"[AI] Skipping unsafe food: {', '.join(unsafe_food)}\n", "system")
+            elif unsafe_food and self.state.hunger_level == 'starving':
+                item_to_eat = unsafe_food[0]
                 self.client.append_text(
-                    f"[AI] Survival: eating '{item}' from inventory.\n", "system")
+                    f"[AI] WARNING: Eating dubious food '{item_to_eat}' - starving with no safe options!\n", "error")
+            
+            if item_to_eat:
+                item_keyword = self.parser.get_item_keyword(item_to_eat)
+                self.client.append_text(
+                    f"[AI] Survival: eating '{item_to_eat}' from inventory.\n", "system")
                 self.client.send_ai_command(f"eat {item_keyword}")
                 self.state.hunger_level = None
                 self.state.current_goal = 'explore'
                 self._schedule_tick(self.COMMAND_DELAY_MS)
+            else:
+                self.client.append_text("[AI] No safe food to eat — seeking food shop.\n", "system")
+                return self._do_survival_action({'need': 'food'})
             return
 
         if need == 'water':
@@ -2031,11 +2135,29 @@ class ExplorationAgent:
         """Return True if Otto advertised this service in his help response."""
         return service in self.state.otto_capabilities
 
+    def _needs_urgent_otto_heal(self):
+        """Return True if we need Otto to heal us urgently (HP critically low)."""
+        if self.state.current_hp is None or self.state.max_hp is None:
+            return False
+        if self.state.max_hp == 0:
+            return False
+        hp_pct = self.state.current_hp / self.state.max_hp
+        # Urgent if HP < 20% or HP < 5
+        return hp_pct < 0.2 or self.state.current_hp < 5
+
     def _otto_summon_and_use(self, service):
         """
         Ask Otto to summon us to him, then request the service once there.
         Works from anywhere since 'tell' is remote.
         """
+        # If Otto is already in the room, request service directly
+        if self._otto_in_current_room:
+            self.client.append_text(
+                f"[AI] Otto is here — requesting '{service}'.\n", "system")
+            self._tell_otto(service)
+            self._schedule_tick(self.COMMAND_DELAY_MS * 2)
+            return
+        
         if self._otto_can('summon'):
             # Guard: only send one summon at a time — wait for room entry to clear flag
             if time.monotonic() - self._otto_summon_sent_at < 30.0:

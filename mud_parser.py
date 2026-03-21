@@ -460,6 +460,23 @@ class MUDTextParser:
         """Return True if the text indicates the character fled combat."""
         return bool(self.FLEE_RE.search(text))
 
+    OPPONENT_FLEE_RE = re.compile(
+        r'(?:the\s+)?(?P<mob>[\w\s]+?)\s+panics,?\s+and\s+attempts\s+to\s+flee',
+        re.IGNORECASE
+    )
+
+    def detect_opponent_flee(self, text):
+        """
+        Detect when an opponent flees from combat.
+        Returns the mob name if detected, None otherwise.
+        
+        Example: "The beastly fido panics, and attempts to flee!" -> "beastly fido"
+        """
+        match = self.OPPONENT_FLEE_RE.search(text)
+        if match:
+            return match.group('mob').strip()
+        return None
+
     MOVE_FAIL_RE = re.compile(
         r'(?:alas,?\s+you cannot go that way|you cannot go that way'
         r'|there is no exit|that direction does not exist'
@@ -862,6 +879,7 @@ class MUDTextParser:
 
         Checks for gold coins and food items.  Does not detect weapons, armour,
         or other items to avoid picking up something dangerous or cursed.
+        Excludes food with negative adjectives (dubious, rotten, poisoned, etc).
         """
         items = []
         if self.GOLD_GROUND_RE.search(text):
@@ -869,6 +887,14 @@ class MUDTextParser:
         seen_food = set()
         for m in self.FOOD_GROUND_RE.finditer(text):
             word = m.group(1).lower()
+            # Get context around the match to check for negative adjectives
+            start = max(0, m.start() - 50)
+            end = min(len(text), m.end() + 10)
+            context = text[start:end]
+            # Skip if dubious/rotten/etc appears before the food word
+            if re.search(r'\b(?:dubious|rotten|moldy|mouldy|spoiled|spoilt|poisoned|tainted|contaminated|bad)\b',
+                        context, re.IGNORECASE):
+                continue
             if word not in seen_food:
                 seen_food.add(word)
                 items.append((f'get {word}', word))
@@ -889,6 +915,24 @@ class MUDTextParser:
     def detect_darkness(self, text):
         """Return True if the text indicates the area is too dark to navigate."""
         return bool(self.DARKNESS_RE.search(text))
+
+    # ------------------------------------------------------------------
+    # Incapacitated / Death detection
+    # ------------------------------------------------------------------
+
+    INCAPACITATED_RE = re.compile(
+        r'(?:you are incapacitated|you are mortally wounded|'
+        r'you lie on the ground suffering|you will slowly die|'
+        r'you will die soon)',
+        re.IGNORECASE
+    )
+
+    def detect_incapacitated(self, text):
+        """
+        Detect if the player is incapacitated (HP <= 0).
+        Returns True if incapacitated messages are found.
+        """
+        return bool(self.INCAPACITATED_RE.search(text))
 
     # ------------------------------------------------------------------
     # Hunger detection
@@ -1242,3 +1286,12 @@ class MUDTextParser:
     def detect_otto_present(self, room_text):
         """Return True if Otto appears to be in the room description."""
         return bool(self._OTTO_PRESENT_RE.search(room_text))
+
+    _OTTO_SUMMON_SUCCESS_RE = re.compile(
+        r'otto\s+has\s+summoned\s+you',
+        re.IGNORECASE
+    )
+
+    def detect_otto_summon_success(self, text):
+        """Return True if Otto successfully summoned the player."""
+        return bool(self._OTTO_SUMMON_SUCCESS_RE.search(text))

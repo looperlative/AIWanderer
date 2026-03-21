@@ -246,6 +246,38 @@ The autonomous MUD AI agent can't reliably navigate ("still not able to minimall
 - [ ] **3C: Active food finding** (`ai_agent.py`)
   Add `find_food_shop` sub-goal at priority 7 when: hunger not None + `food_room` is None + visited > 20 rooms. Boosts BFS toward rooms with `FOOD_VENUE_WORDS` in name (Inn, Market, Tavern, Bakery). Add LLM hint: `"Actively seeking food source. Prefer rooms named Bakery, Inn, Market, Tavern."`
 
+- [ ] **3D: LLM-assisted food safety + dangerous item memory** (`ai_agent.py`, `llm_advisor.py`)
+  Replace the current Python-based food safety heuristics with LLM evaluation. When the agent is about to eat, drink, or quaff an item, query the LLM to assess whether it is safe to consume based on its name, description, and MUD context.
+
+  **LLM safety prompt** (`llm_advisor.py`):
+  ```
+  Is this item safe to consume in a MUD game?
+  Item: {item_name}
+  Context: {item_description_if_known}
+  Reply with one word: safe / dangerous / unknown
+  ```
+
+  **Dangerous item memory** (`ai_agent.py`, profile JSON):
+  If consuming an item results in a negative outcome (HP loss, poisoning, death, illness message), record it in a persistent `dangerous_items` set in the profile:
+  ```json
+  "dangerous_items": {
+    "dubious meat": {"reason": "poisoned", "first_seen": "2026-03-21T10:00:00"},
+    "strange potion": {"reason": "hp_loss", "first_seen": "2026-03-21T11:00:00"}
+  }
+  ```
+  Detection patterns for negative outcomes after consuming:
+  ```python
+  CONSUME_HARM_RE = re.compile(
+      r'(?:you feel (?:sick|ill|poisoned|weak|terrible)|'
+      r'you are (?:poisoned|diseased)|'
+      r'your (?:stomach|body) (?:convulses?|writhes?|burns?)|'
+      r'(?:\d+) (?:damage|hp))',
+      re.IGNORECASE)
+  ```
+  Track `_last_consumed_item` (item name) immediately before sending eat/drink/quaff. On `CONSUME_HARM_RE` match within ~3 seconds of consumption, add item to `dangerous_items`. Items already in `dangerous_items` are never consumed again — skip them even if the LLM rates them `safe`.
+
+  **LLM fallback:** If LLM rates item `unknown`, use existing Python heuristics (weight words, known patterns) as tiebreaker. If rate-limited, default to `unknown` → use Python heuristics.
+
 ---
 
 ## Phase 4 — LLM Utilization Redesign
