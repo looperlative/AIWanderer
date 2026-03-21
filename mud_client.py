@@ -1284,6 +1284,18 @@ class MUDClient:
                 msg_type, msg_data = self.message_queue.get_nowait()
                 
                 if msg_type == "data":
+                    # Detect teleport/summon — set expecting_room_data so the
+                    # incoming room is parsed and on_room_entered fires normally.
+                    if self.room_tracking_enabled and not self.expecting_room_data:
+                        plain = ' '.join(t for t, _ in msg_data)
+                        if re.search(
+                            r'(?:has summoned you|you are (?:transported|teleported|summoned))',
+                            plain, re.IGNORECASE
+                        ):
+                            self.expecting_room_data = True
+                            # No last_movement_direction — parsed as a look/teleport,
+                            # so no room link is recorded but on_room_entered still fires.
+
                     # Cancel room-parse expectation on movement failure messages
                     # ("Alas, you cannot go that way...") before attempting parse.
                     if self.expecting_room_data:

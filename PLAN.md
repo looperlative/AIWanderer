@@ -144,7 +144,12 @@ The autonomous MUD AI agent can't reliably navigate ("still not able to minimall
 
   **For hunt targeting:** query `mob_db` (not per-room), sorted by `last_room` BFS distance. Wanderers use `last_room` as the best guess for where to find them.
 
-- [ ] **1F: Area theme detection via LLM** (one-time per room) (`llm_advisor.py`, `ai_agent.py`)
+- [ ] **1F: Fix premature `combat_over` detection** (`ai_agent.py`)
+  `combat_over` fires when a chunk contains no `COMBAT_ACTIVE_PATTERNS`, but combat miss messages like "missing the janitor" or "wildly punch at the air" don't match any pattern. This sets `_combat_active = False` mid-fight, causing the LLM to receive no combat context and win counts to be missed.
+
+  Extend `COMBAT_ACTIVE_PATTERNS` to cover miss/dodge phrasing that names the opponent (e.g. "missing the", "punch at the air"), OR require a positive kill signal ("is dead! R.I.P.", XP gain) before declaring combat over — don't rely solely on the absence of patterns in a single chunk.
+
+- [ ] **1G: Area theme detection via LLM** (one-time per room) (`llm_advisor.py`, `ai_agent.py`)
   New `request_classification(room_name, description, callback)` in `LLMAdvisor` with 30-second rate limit and `max_tokens=5`. Prompt:
   ```
   Classify this MUD area in one word.
@@ -154,7 +159,7 @@ The autonomous MUD AI agent can't reliably navigate ("still not able to minimall
   ```
   Store in `entity_db[room_hash]["area_theme"]`. When area theme changes between adjacent rooms, log `[AI] Area boundary detected: town -> forest`. Called once per room — cheap, high-signal LLM use.
 
-- [ ] **1G: Suppress spurious room-parse failure at login** (`mud_client.py`)
+- [ ] **1H: Suppress spurious room-parse failure at login** (`mud_client.py`)
   At login, the room tracking flag fires before the character enters the game (e.g. on the password prompt). This produces a harmless `[Room parse failed]` log line once per session. Fix: gate `expecting_room_data = True` on a confirmed in-game state (e.g. after autologin completes and the entry room has been detected at least once), or detect the login menu text and suppress the flag until login is done.
 
 ---

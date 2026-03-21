@@ -377,6 +377,7 @@ class ExplorationAgent:
         self._llm_ignored_count = 0  # consecutive times LLM suggestion was ignored
         self._combat_active = False
         self._combat_seen_active = False # True once we've observed actual combat (not just sent kill)
+        self._combat_win_counted = False # True once a win has been credited for the current combat
         self._combat_npc = None          # lowercase name of NPC we're fighting
         self._last_combat_npc = None     # persists after combat ends — used by death attribution
         self._combat_start_time = None   # time.monotonic() when combat started
@@ -977,6 +978,7 @@ class ExplorationAgent:
                         self.client.send_ai_command(f"kill {mob_lower}")
                         self._combat_active = True
                         self._combat_seen_active = False
+                        self._combat_win_counted = False
                         self._combat_npc = mob_lower
                         self._last_combat_npc = mob_lower
                         self._combat_start_time = time.monotonic()
@@ -1214,6 +1216,7 @@ class ExplorationAgent:
                     })
                     rec["wins"] += 1
                     rec["last_room"] = self.client.current_room_hash
+                    self._combat_win_counted = True
                     self.client.append_text(
                         f"[AI] Defeated {npc} (wins: {rec['wins']}).\n", "system")
                     for cmd in ('get all corpse', 'inventory', 'equipment'):
@@ -1229,6 +1232,23 @@ class ExplorationAgent:
         if xp:
             self.state.total_xp_gained += xp
             self.client.append_text(f"[AI] XP gained: +{xp} (total: {self.state.total_xp_gained})\n", "system")
+            # XP gain is a reliable kill signal — queue looting and credit win if the
+            # opp%-transition paths missed it (e.g. combat_over fired prematurely).
+            for cmd in ('get all corpse', 'inventory', 'equipment'):
+                if cmd not in self._auto_pickup_pending:
+                    self._auto_pickup_pending.append(cmd)
+            if not self._combat_win_counted:
+                npc = self._combat_npc or self._last_combat_npc
+                if npc:
+                    rec = self.state.npc_danger.setdefault(npc, {
+                        "deaths": 0, "fastest_death_secs": None,
+                        "wins": 0, "near_kills": 0, "last_room": None,
+                    })
+                    rec["wins"] += 1
+                    rec["last_room"] = self.client.current_room_hash
+                    self._combat_win_counted = True
+                    self.client.append_text(
+                        f"[AI] Defeated {npc} (wins: {rec['wins']}).\n", "system")
 
         # --- Gold tracking ---
         gold_carried = self.parser.detect_gold_carried(clean_text)
@@ -1378,6 +1398,7 @@ class ExplorationAgent:
             if not self._combat_active:
                 self._combat_active = True
                 self._combat_seen_active = True
+                self._combat_win_counted = False
                 self._reset_exploration_counter()
                 self._combat_start_time = time.monotonic()
                 self._last_combat_start_time = self._combat_start_time
@@ -1417,6 +1438,7 @@ class ExplorationAgent:
                         # Only credit a win when we actually observed combat rounds —
                         # opp_pct is 0 both when not in combat and when mob is dead.
                         rec["wins"] += 1
+                        self._combat_win_counted = True
                         self.client.append_text(
                             f"[AI] Defeated {npc} (wins: {rec['wins']}).\n", "system")
                         # Loot the corpse then check inventory for new items
@@ -1629,6 +1651,7 @@ class ExplorationAgent:
                 self.client.send_ai_command(f"kill {best_name}")
                 self._combat_active = True
                 self._combat_seen_active = False
+                self._combat_win_counted = False
                 self._combat_npc = best_name
                 self._last_combat_npc = best_name
                 self._combat_start_time = time.monotonic()

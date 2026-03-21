@@ -42,6 +42,7 @@ say <text>, kill <mob>, flee, score, inventory, buy <item>, eat <item>, drink <s
 - If a door or container is mentioned, try: open <door/container>
 - If you see an item on the ground that may be useful, try: get <item>
 - If you are low on health, prioritise fleeing or resting.
+- If you are IN COMBAT: movement commands are blocked — use flee, or any non-movement command (eat, drink, tell, say, cast, etc.).
 - Prefer unexplored exits over revisiting known rooms.
 - Do not repeat a command that was just blocked ("You can't go that way").
 - Otto is a helper PC who provides healing and buffs via tell — he does NOT sell food or water."""
@@ -165,6 +166,9 @@ class LLMAdvisor:
         # Recent MUD text from agent's ring buffer
         recent_mud = list(agent._recent_mud_lines) if agent else []
 
+        in_combat = agent._combat_active if agent else False
+        combat_npc = (agent._combat_npc or agent._last_combat_npc) if agent else None
+
         return {
             'room_name':     room.get('name', 'Unknown'),
             'description':   room.get('description', ''),
@@ -200,6 +204,8 @@ class LLMAdvisor:
             'otto_capabilities': otto_caps,
             'otto_present': otto_present,
             'otto_room': otto_room,
+            'in_combat': in_combat,
+            'combat_npc': combat_npc,
         }
 
     def _build_npc_summary(self, current_hash, room_links, rooms, npc_danger):
@@ -333,6 +339,10 @@ class LLMAdvisor:
         if context.get('gold') is not None: char_parts.append(f"Gold {context['gold']}")
         if char_parts:
             parts.append("Character: " + "  ".join(char_parts))
+
+        if context.get('in_combat'):
+            npc = context.get('combat_npc') or 'unknown'
+            parts.append(f"IN COMBAT with: {npc} — movement blocked; use flee or non-movement commands only.")
 
         goal = context.get('current_goal', 'explore')
         if goal != 'explore':
