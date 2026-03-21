@@ -101,14 +101,13 @@ The autonomous MUD AI agent can't reliably navigate ("still not able to minimall
   ```
   On match, mark the buff as confirmed (don't rely solely on the next score parse). If the cast message is absent after sending a buff tell, flag it so the sequence can retry rather than silently setting the provisional expiry.
 
-- [ ] **1C: Fix mob detection false positives** (`ai_agent.py`, `mud_parser.py`)
+- [x] **1C: Fix mob detection false positives** (`ai_agent.py`, `mud_parser.py`)
   Depends on 1A color calibration being complete. Once `mob_color` is known, filter `detect_mobs()` input to only lines arriving in that color. A mob seen once in a `mob_color` line can be trusted immediately — no visit count needed. Wandering mobs qualify on first sight.
 
   Fallback when color config not yet set: require `npc_danger` win OR 2+ sightings across any rooms before attacking.
 
-- [ ] **1D: Who list caching** (`ai_agent.py`, `mud_parser.py`)
-  ~~Issue `who` periodically and parse into `state.pc_names`.~~ Done: `who` issued every 2 minutes, parsed into `state.who_list` (level+class+name), `char_class` and `char_level` updated from self-entry.
-  **Remaining:** Before attacking any entity, confirm its name is NOT in `state.who_list` names.
+- [x] **1D: Who list caching** (`ai_agent.py`, `mud_parser.py`)
+  `who` issued every 2 minutes, parsed into `state.who_list`. PC combat guard implemented in 1C.
 
 - [ ] **1E: `entity_db` in profile JSON** (`ai_agent.py`, `mud_client.py`)
 
