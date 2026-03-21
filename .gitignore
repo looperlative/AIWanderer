@@ -1,1 +1,14 @@
-__pycache__
+__pycache__/
+*.py[cod]
+
+# Profile data — contains passwords, API keys, and character data
+*.json
+*.profiles
+
+# Session logs — contain gameplay data, not source
+mud_sessions/
+
+# Editor and OS artifacts
+.DS_Store
+*.swp
+*~
