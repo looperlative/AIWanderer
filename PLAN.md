@@ -109,7 +109,7 @@ The autonomous MUD AI agent can't reliably navigate ("still not able to minimall
 - [x] **1D: Who list caching** (`ai_agent.py`, `mud_parser.py`)
   `who` issued every 2 minutes, parsed into `state.who_list`. PC combat guard implemented in 1C.
 
-- [ ] **1E: `entity_db` in profile JSON** (`ai_agent.py`, `mud_client.py`)
+- [x] **1E: `entity_db` in profile JSON** (`ai_agent.py`, `mud_client.py`)
 
   **Mobs can wander**, so the data model must separate mob identity from room location. Two structures:
 
@@ -154,12 +154,10 @@ The autonomous MUD AI agent can't reliably navigate ("still not able to minimall
   ```
   Store in `entity_db[room_hash]["area_theme"]`. When area theme changes between adjacent rooms, log `[AI] Area boundary detected: town -> forest`. Called once per room — cheap, high-signal LLM use.
 
----
-
-## Phase 1G — Housekeeping
-
 - [ ] **1G: Suppress spurious room-parse failure at login** (`mud_client.py`)
   At login, the room tracking flag fires before the character enters the game (e.g. on the password prompt). This produces a harmless `[Room parse failed]` log line once per session. Fix: gate `expecting_room_data = True` on a confirmed in-game state (e.g. after autologin completes and the entry room has been detected at least once), or detect the login menu text and suppress the flag until login is done.
+
+---
 
 ## Phase 2 — Corpse Recovery
 
@@ -387,9 +385,9 @@ MUD events tied to the hour boundary — sunrise, sunset, hunger/thirst messages
 
 ## Verification
 
-1. Agent walks multiple rooms without getting stuck in combat or survival loops (Phase 0)
-2. Room with `"A large rat is here."` → `entity_db` populated with confidence >= 0.8 (Phase 1A)
+1. Agent walks multiple rooms without getting stuck in combat or survival loops (Phase 0 ✓)
+2. Room with `"A large rat is here."` → `mob_db` and `entity_db` populated (Phase 1E)
 3. Die, respawn → agent navigates to corpse room and issues `get all corpse` (Phase 2)
-4. `~/.mud_client_profiles.json` shows `entity_db` key after exploration (Phase 1B)
-5. Session log shows `[AI] Area boundary detected:` lines at area transitions (Phase 1C)
-6. Otto responds to `tell otto heal` immediately on session start (Phase 5A)
+4. `~/.mud_client_profiles.json` shows `mob_db` and `entity_db` keys after exploration (Phase 1E)
+5. Session log shows `[AI] Area boundary detected:` lines at area transitions (Phase 1F)
+6. Otto responds to `tell otto heal` immediately on session start (Phase 0D ✓)

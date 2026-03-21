@@ -600,10 +600,41 @@ class MUDTextParser:
         re.IGNORECASE
     )
 
+    # For color-calibrated mob lines — strip article, capture name before is/are verb
+    _MOB_LINE_RE = re.compile(
+        r'^(?:(?:a|an|the)\s+)?(.+?)\s+(?:is|are)\s+'
+        r'(?:here|standing|sitting|lying|lurking|hovering|waiting|guarding|watching)',
+        re.IGNORECASE
+    )
+    # Fallback: anything before "is/are" if no trailing verb matched
+    _MOB_LINE_BARE_RE = re.compile(
+        r'^(?:(?:a|an|the)\s+)?(.+?)\s+(?:is|are)\b',
+        re.IGNORECASE
+    )
+
     def _is_place_name(self, name):
         """Return True if the last word of name is a known place-type suffix."""
         last_word = name.rsplit(None, 1)[-1].lower()
         return last_word in self.MOB_PLACE_SUFFIXES
+
+    def detect_mobs_in_lines(self, mob_lines):
+        """Extract mob names from color-calibrated mob lines.
+
+        Each line is guaranteed to be a mob/PC presence line (color-confirmed).
+        Handles lowercase mob names (e.g. 'A beastly fido is here.') that the
+        general detect_mobs() regex misses because it requires a capital letter.
+        """
+        found = []
+        for line in mob_lines:
+            line = line.strip()
+            if not line:
+                continue
+            m = self._MOB_LINE_RE.match(line) or self._MOB_LINE_BARE_RE.match(line)
+            if m:
+                name = m.group(1).strip()
+                if name.lower() not in self.MOB_STOP_WORDS and len(name) > 2:
+                    found.append(name)
+        return found
 
     def detect_mobs(self, description):
         """

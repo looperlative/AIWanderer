@@ -146,6 +146,7 @@ class ExplorationState:
         self.water_sources = {}        # {room_hash: drink_command} — all known water sources
         self.water_sources_failed = set()  # room hashes where drinking was tried and failed
         self.food_room = None          # room hash of known food shop
+        self.food_rooms_failed = set() # room hashes where 'list' was rejected
         self.food_item = None          # e.g. "loaf of bread" (from shop list)
         self.food_price = None         # cost of food item in gold
         self.seeking_resource = None   # 'water' | 'food' | None
@@ -197,6 +198,7 @@ class ExplorationState:
             "water_sources": self.water_sources,
             "water_sources_failed": list(self.water_sources_failed),
             "food_room": self.food_room,
+            "food_rooms_failed": list(self.food_rooms_failed),
             "food_item": self.food_item,
             "food_price": self.food_price,
             "gold": self.gold,
@@ -247,6 +249,7 @@ class ExplorationState:
         s.water_sources = water_sources
         s.water_sources_failed = set(data.get("water_sources_failed", []))
         s.food_room = data.get("food_room")
+        s.food_rooms_failed = set(data.get("food_rooms_failed", []))
         s.food_item = data.get("food_item")
         s.food_price = data.get("food_price")
         s.seeking_resource = data.get("seeking_resource")
@@ -373,13 +376,17 @@ class ExplorationAgent:
         self._waiting_for_llm = False # LLM call in flight
         self._llm_ignored_count = 0  # consecutive times LLM suggestion was ignored
         self._combat_active = False
+        self._combat_seen_active = False # True once we've observed actual combat (not just sent kill)
         self._combat_npc = None          # lowercase name of NPC we're fighting
+        self._last_combat_npc = None     # persists after combat ends — used by death attribution
         self._combat_start_time = None   # time.monotonic() when combat started
+        self._last_combat_start_time = None  # persists after combat ends — used by death attribution
         self._combat_start_hp = None     # our HP when combat started
         self._dead = False
         self._last_shop_list_request = 0.0   # monotonic time of last 'list' command
         self._otto_pending_service = None    # service to request from Otto after summon
         self._otto_in_current_room = False   # True when Otto was detected in this room's live text
+        self._otto_summon_sent_at = 0.0      # monotonic time of last 'tell otto summon' — guards spam
         self._buff_sequence_pending = []     # protection buff tells still to send this cycle
         self._waiting_for_otto_help = False  # True after 'tell otto help' sent
         self._auto_pickup_pending = []       # get/drink commands queued from room entry
@@ -399,6 +406,7 @@ class ExplorationAgent:
         self._hunt_threshold = 15            # explore this many rooms then seek combat
         self._survival_fail_count = 0        # consecutive ticks where survival made no progress
         self._survival_pause_until = 0.0     # monotonic time — suppress survival until then
+        self._survival_llm_room = None       # room hash where LLM was last asked for survival
         self._look_retry_count = 0           # startup look retries before giving up
         # Rolling buffer of recent MUD text — fed to the LLM as context
         self._recent_mud_lines = deque(maxlen=30)
@@ -798,6 +806,7 @@ class ExplorationAgent:
         self._waiting_for_room = False
         self._last_direction = None
         self._dead = False  # if we were dead, we've respawned
+        self._otto_summon_sent_at = 0.0   # room entry confirms teleport complete
 
         # Update (x, y, z) position and position graph
         if move_dir:
@@ -859,7 +868,8 @@ class ExplorationAgent:
 
             # Food shop discovery — also re-check if we've returned and still don't know the item
             if not self.state.food_room or (room_hash == self.state.food_room and not self.state.food_item):
-                if self.parser.detect_food_shop(full_text) or room_hash == self.state.food_room:
+                if (room_hash not in self.state.food_rooms_failed
+                        and (self.parser.detect_food_shop(full_text) or room_hash == self.state.food_room)):
                     if not self.state.food_room:
                         self.state.food_room = room_hash
                         self.client.append_text("[AI] Food shop found!\n", "system")
@@ -868,8 +878,13 @@ class ExplorationAgent:
                     # Always request the list when in the shop and item is unknown
                     self._request_shop_list()
 
+            # Mob lines — extract early so Otto presence check can use them
+            mob_lines = room_data.get('mob_lines')
+
             # Otto presence — note his room, use pending service if any
-            self._otto_in_current_room = self.parser.detect_otto_present(full_text)
+            mob_text = ' '.join(mob_lines) if mob_lines else ''
+            self._otto_in_current_room = self.parser.detect_otto_present(
+                full_text + ' ' + mob_text)
             if self._otto_in_current_room:
                 self.state.otto_room = room_hash
                 if self._otto_pending_service:
@@ -908,15 +923,25 @@ class ExplorationAgent:
 
             # Mob/item detection — check every visit for danger
             # Prefer color-parsed mob_lines if available (1A), fall back to regex.
-            mob_lines = room_data.get('mob_lines')
+            # (mob_lines already extracted above for Otto presence check)
             color_calibrated = bool(mob_lines is not None)  # mob_lines=[] means calibrated+empty
             if mob_lines:
-                mobs = self.parser.detect_mobs(' '.join(mob_lines))
+                # Color-calibrated: use line-aware extractor that handles lowercase names
+                mobs = self.parser.detect_mobs_in_lines(mob_lines)
             else:
                 mobs = self.parser.detect_mobs(description)
 
-            # PC names from who list — never attack a player character
+            # Filter PCs out of mobs entirely — before recording in npc_danger/entity_db.
+            # Check prefix match so "Otto the Automatic Cleric" is caught by "otto".
             pc_names = {e['name'].lower() for e in self.state.who_list}
+            if pc_names:
+                mobs = [m for m in mobs
+                        if not any(m.lower() == pc or m.lower().startswith(pc + ' ')
+                                   for pc in pc_names)]
+
+            # Filter "your X" mobs — guildmasters and other possessive-prefixed NPCs
+            # are quest-givers / trainers that can't be killed and shouldn't be recorded.
+            mobs = [m for m in mobs if not m.lower().startswith('your ')]
 
             if mobs:
                 if room_hash not in self.state.visited:
@@ -931,13 +956,13 @@ class ExplorationAgent:
                     rec["last_room"] = room_hash
                     rec["sightings"] = rec.get("sightings", 0) + 1
 
+                # Update profile-level mob_db / entity_db (1E)
+                self._update_entity_db(room_hash, mobs)
+
                 # Proactively attack beatable NPCs for XP and loot
                 if self._should_fight():
                     for mob in mobs:
                         mob_lower = mob.lower()
-                        # Never attack player characters
-                        if mob_lower in pc_names:
-                            continue
                         rec = self.state.npc_danger.get(mob_lower)
                         if not rec or rec.get("deaths", 0) > 0:
                             continue
@@ -951,8 +976,11 @@ class ExplorationAgent:
                             f"[AI] {reason} attacking {mob}.\n", "system")
                         self.client.send_ai_command(f"kill {mob_lower}")
                         self._combat_active = True
+                        self._combat_seen_active = False
                         self._combat_npc = mob_lower
+                        self._last_combat_npc = mob_lower
                         self._combat_start_time = time.monotonic()
+                        self._last_combat_start_time = self._combat_start_time
                         self._combat_start_hp = self.state.current_hp
                         self._schedule_tick(self.COMMAND_DELAY_MS * 2)
                         return
@@ -969,6 +997,10 @@ class ExplorationAgent:
                         self.client.send_ai_command("flee")
                         self._schedule_tick(self.COMMAND_DELAY_MS * 2)
                         return
+            # Update entity_db even when no mobs — records the empty snapshot (1E)
+            if not mobs:
+                self._update_entity_db(room_hash, [])
+
             items = self.parser.detect_items(description)
             if items and room_hash not in self.state.visited:
                 self.client.append_text(f"[AI] Items visible: {', '.join(items)}\n", "system")
@@ -1171,10 +1203,25 @@ class ExplorationAgent:
             prev_opp = self.state.current_opp_pct
             self.state.current_tank_pct = stats.get('tank', self.state.current_tank_pct)
             self.state.current_opp_pct = stats.get('opp', self.state.current_opp_pct)
-            # Opponent just hit 0% — kill confirmed
+            # Opponent just hit 0% — kill confirmed via prompt opp% transition
             if (self._combat_active and prev_opp and prev_opp > 0
                     and self.state.current_opp_pct == 0):
+                npc = self._combat_npc
+                if npc and self._combat_seen_active:
+                    rec = self.state.npc_danger.setdefault(npc, {
+                        "deaths": 0, "fastest_death_secs": None,
+                        "wins": 0, "near_kills": 0, "last_room": None,
+                    })
+                    rec["wins"] += 1
+                    rec["last_room"] = self.client.current_room_hash
+                    self.client.append_text(
+                        f"[AI] Defeated {npc} (wins: {rec['wins']}).\n", "system")
+                    for cmd in ('get all corpse', 'inventory', 'equipment'):
+                        if cmd not in self._auto_pickup_pending:
+                            self._auto_pickup_pending.append(cmd)
                 self._combat_active = False
+                self._combat_seen_active = False
+                self._last_combat_npc = npc if npc else self._last_combat_npc
                 self.client.append_text("[AI] Opponent defeated — resuming exploration.\n", "system")
 
         # --- XP gain ---
@@ -1211,7 +1258,8 @@ class ExplorationAgent:
             current = self.client.current_room_hash
             if self.state.food_room == current:
                 self.client.append_text(
-                    "[AI] 'list' rejected here — clearing false food-shop record.\n", "system")
+                    "[AI] 'list' rejected here — blacklisting false food-shop room.\n", "system")
+                self.state.food_rooms_failed.add(current)
                 self.state.food_room = None
                 self.state.food_item = None
                 self.state.food_price = None
@@ -1274,10 +1322,14 @@ class ExplorationAgent:
                         "reason": "died",
                         "time": datetime.now(timezone.utc).isoformat(),
                     }
-                # Record which NPC killed us and how quickly
-                if self._combat_npc and self._combat_start_time is not None:
-                    elapsed = time.monotonic() - self._combat_start_time
-                    rec = self.state.npc_danger.setdefault(self._combat_npc, {
+                # Record which NPC killed us and how quickly.
+                # Use _last_* fallbacks — "combat appears over" may have fired in a
+                # previous chunk before the death message arrived, clearing the live vars.
+                killer = self._combat_npc or self._last_combat_npc
+                start_t = self._combat_start_time or self._last_combat_start_time
+                if killer and start_t is not None:
+                    elapsed = time.monotonic() - start_t
+                    rec = self.state.npc_danger.setdefault(killer, {
                         "deaths": 0, "fastest_death_secs": None,
                         "wins": 0, "near_kills": 0, "last_room": None,
                     })
@@ -1286,12 +1338,15 @@ class ExplorationAgent:
                     if rec["fastest_death_secs"] is None or elapsed < rec["fastest_death_secs"]:
                         rec["fastest_death_secs"] = round(elapsed, 1)
                     self.client.append_text(
-                        f"[AI] Killed by {self._combat_npc} in {elapsed:.1f}s "
+                        f"[AI] Killed by {killer} in {elapsed:.1f}s "
                         f"(deaths: {rec['deaths']}, fastest: {rec['fastest_death_secs']}s).\n",
                         "system")
                 self._combat_active = False
+                self._combat_seen_active = False
                 self._combat_npc = None
+                self._last_combat_npc = None
                 self._combat_start_time = None
+                self._last_combat_start_time = None
                 self._combat_start_hp = None
                 self.client.append_text(
                     f"[AI] Death detected (#{self.state.total_deaths}) — waiting for respawn.\n", "system")
@@ -1319,19 +1374,31 @@ class ExplorationAgent:
 
         # --- Combat detection ---
         if self.parser.detect_combat_start(clean_text):
+            self._combat_seen_active = True   # confirmed real combat
             if not self._combat_active:
                 self._combat_active = True
+                self._combat_seen_active = True
                 self._reset_exploration_counter()
                 self._combat_start_time = time.monotonic()
+                self._last_combat_start_time = self._combat_start_time
                 self._combat_start_hp = self.state.current_hp
                 attacker = self.parser.detect_combat_attacker(clean_text)
                 self._combat_npc = attacker.lower() if attacker else None
+                if self._combat_npc:
+                    self._last_combat_npc = self._combat_npc
                 self.client.append_text(
                     f"[AI] Combat detected vs {attacker or 'unknown'} — pausing exploration.\n",
                     "system")
         elif self._combat_active:
+            # Also mark active if we see any combat pattern in this chunk
+            if any(p in lower for p in COMBAT_ACTIVE_PATTERNS):
+                self._combat_seen_active = True
+            # Opponent HP going above 0 also confirms real combat
+            if self.state.current_opp_pct is not None and self.state.current_opp_pct > 0:
+                self._combat_seen_active = True
             round_data = self.parser.detect_combat_round(clean_text)
             if round_data and round_data.get('damage'):
+                self._combat_seen_active = True
                 self.client.append_text(
                     f"[AI] Combat: {round_data['attacker']} {round_data['verb']} "
                     f"{round_data['target']} for {round_data['damage']} damage.\n", "system")
@@ -1346,7 +1413,9 @@ class ExplorationAgent:
                         "wins": 0, "near_kills": 0, "last_room": None,
                     })
                     rec["last_room"] = self.client.current_room_hash
-                    if opp_pct == 0:
+                    if opp_pct == 0 and self._combat_seen_active:
+                        # Only credit a win when we actually observed combat rounds —
+                        # opp_pct is 0 both when not in combat and when mob is dead.
                         rec["wins"] += 1
                         self.client.append_text(
                             f"[AI] Defeated {npc} (wins: {rec['wins']}).\n", "system")
@@ -1360,7 +1429,10 @@ class ExplorationAgent:
                             f"[AI] Near-kill on {npc} at {opp_pct}% HP "
                             f"(near_kills: {rec['near_kills']}).\n", "system")
                 self._combat_active = False
+                self._combat_seen_active = False
                 self._combat_npc = None
+                # Keep _last_combat_npc set until either death attribution clears it
+                # or the next combat begins — do NOT clear it here.
                 self._combat_start_time = None
                 self._combat_start_hp = None
                 if fled:
@@ -1381,13 +1453,23 @@ class ExplorationAgent:
         Return a survival action descriptor if the character needs attention,
         or None if exploration can continue.
 
-        Priority: critical HP > buffs > thirst > hunger > gold (to buy food).
+        Priority: low HP (< 50% Otto present / < 40% Otto available / < 25% no Otto) > buffs > thirst > hunger > gold.
         """
-        # Critical HP — ask Otto to heal if possible
+        # HP-based healing — threshold depends on Otto availability:
+        #   Otto present in room : 0.50 — proactively heal while he's standing here
+        #   Otto can heal remotely: 0.40 — summon him for healing before doing buffs
+        #   No Otto available    : 0.25 — rest/wait as last resort
         if (self.state.current_hp is not None and self.state.max_hp is not None
-                and self.state.max_hp > 0
-                and self.state.current_hp / self.state.max_hp < 0.25):
-            return {'need': 'heal'}
+                and self.state.max_hp > 0):
+            hp_pct = self.state.current_hp / self.state.max_hp
+            if self._otto_in_current_room and self._otto_can('heal'):
+                heal_threshold = 0.50
+            elif self._otto_can('heal'):
+                heal_threshold = 0.40
+            else:
+                heal_threshold = 0.25
+            if hp_pct < heal_threshold:
+                return {'need': 'heal'}
         # Protection buffs — apply before adventuring, refresh when expired
         if self._needs_buffs():
             return {'need': 'buffs'}
@@ -1465,9 +1547,14 @@ class ExplorationAgent:
           1. Known wins (deaths == 0, wins > 0)
           2. Near-kills (deaths == 0, near_kills > 0)
           3. Unknown NPCs (deaths == 0, no combat history)
+
+        Also includes mobs from mob_db (1E) that aren't already in npc_danger —
+        e.g. after an ai_state reset — as long as they haven't killed us.
         """
         preferred, near, unknown = [], [], []
+        seen_names = set()
         for name, rec in self.state.npc_danger.items():
+            seen_names.add(name)
             if rec.get('deaths', 0) > 0:
                 continue
             room = rec.get('last_room')
@@ -1479,6 +1566,17 @@ class ExplorationAgent:
                 near.append((name, room))
             else:
                 unknown.append((name, room))
+
+        # Also pull from mob_db for mobs not yet in npc_danger (e.g. after reset)
+        profile = self._profile()
+        if profile:
+            for name, entry in profile.get('mob_db', {}).items():
+                if name in seen_names:
+                    continue
+                room = entry.get('last_room')
+                if room:
+                    unknown.append((name, room))
+
         return preferred + near + unknown
 
     def _do_survival_action(self, action):
@@ -1530,8 +1628,11 @@ class ExplorationAgent:
                     f"[AI] Need gold — attacking {best_name} (already here).\n", "system")
                 self.client.send_ai_command(f"kill {best_name}")
                 self._combat_active = True
+                self._combat_seen_active = False
                 self._combat_npc = best_name
+                self._last_combat_npc = best_name
                 self._combat_start_time = time.monotonic()
+                self._last_combat_start_time = self._combat_start_time
                 self._combat_start_hp = self.state.current_hp
                 self._schedule_tick(self.COMMAND_DELAY_MS * 2)
             else:
@@ -1621,15 +1722,18 @@ class ExplorationAgent:
                 f"[AI] Survival: {need} source unknown — "
                 f"asking LLM each room to find one.\n", "system")
 
-        # With a survival need active, ask the LLM every tick it's available.
-        # It can see the room description and knows we're hungry/thirsty, so it
-        # may spot a source that the keyword scanner missed.
-        if self.llm.is_ready() and not self._waiting_for_llm:
+        # Ask the LLM once per room — it won't give a different answer if we stay put.
+        # If the LLM already answered in this room and the attempt failed, BFS to
+        # the next room first so we're somewhere new before asking again.
+        current_for_llm = self.client.current_room_hash
+        if (self.llm.is_ready() and not self._waiting_for_llm
+                and self._survival_llm_room != current_for_llm):
+            self._survival_llm_room = current_for_llm
             self._survival_fail_count = 0
             self._request_llm_action()
             return
 
-        # LLM rate-limited or in flight — fall back to BFS to keep moving.
+        # LLM already asked here, rate-limited, or in-flight — BFS to a new room.
         # Track consecutive no-progress ticks; after 3, pause survival for 60s.
         self._survival_fail_count += 1
         if self._survival_fail_count >= 3:
@@ -1680,6 +1784,11 @@ class ExplorationAgent:
         Works from anywhere since 'tell' is remote.
         """
         if self._otto_can('summon'):
+            # Guard: only send one summon at a time — wait for room entry to clear flag
+            if time.monotonic() - self._otto_summon_sent_at < 30.0:
+                self._schedule_tick(self.COMMAND_DELAY_MS * 3)
+                return
+            self._otto_summon_sent_at = time.monotonic()
             self.client.append_text(
                 f"[AI] Asking Otto to summon us, then requesting '{service}'.\n", "system")
             self._tell_otto('summon')
@@ -1953,6 +2062,52 @@ class ExplorationAgent:
             for rec in self.state.npc_danger.values()
             if rec.get("deaths", 0) > 0 and rec.get("last_room")
         }
+
+    def _update_entity_db(self, room_hash, mobs):
+        """Update mob_db and entity_db in the profile for the current room visit.
+
+        mob_db  — profile-level, keyed by mob name lower; tracks all rooms a mob
+                  has been seen in across sessions.
+        entity_db — profile-level, keyed by room hash; snapshot of what's present.
+        """
+        if not room_hash:
+            return
+        profile = self._profile()
+        if profile is None:
+            return
+
+        mob_db = profile.setdefault('mob_db', {})
+        entity_db = profile.setdefault('entity_db', {})
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        for mob in mobs:
+            mob_lower = mob.lower()
+            if mob_lower not in mob_db:
+                mob_db[mob_lower] = {
+                    "display_name": mob,
+                    "rooms_seen": {},
+                    "total_sightings": 0,
+                    "first_seen": now_iso,
+                    "last_seen": now_iso,
+                    "last_room": room_hash,
+                    "is_wanderer": False,
+                }
+            entry = mob_db[mob_lower]
+            entry["last_seen"] = now_iso
+            entry["last_room"] = room_hash
+            entry["total_sightings"] = entry.get("total_sightings", 0) + 1
+            rooms_seen = entry.setdefault("rooms_seen", {})
+            rooms_seen[room_hash] = rooms_seen.get(room_hash, 0) + 1
+            if len(rooms_seen) >= 2:
+                entry["is_wanderer"] = True
+
+        room_entry = entity_db.setdefault(room_hash, {
+            "mob_names": [],
+            "items_on_ground": [],
+            "features": [],
+            "area_theme": None,
+        })
+        room_entry["mob_names"] = [m.lower() for m in mobs]
 
     def _find_rooms_with_untried_exits(self):
         """

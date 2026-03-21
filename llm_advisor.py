@@ -42,18 +42,9 @@ say <text>, kill <mob>, flee, score, inventory, buy <item>, eat <item>, drink <s
 - If a door or container is mentioned, try: open <door/container>
 - If you see an item on the ground that may be useful, try: get <item>
 - If you are low on health, prioritise fleeing or resting.
-- If you are hungry or thirsty and in a shop, buy food or drink before moving.
 - Prefer unexplored exits over revisiting known rooms.
 - Do not repeat a command that was just blocked ("You can't go that way").
-
-Otto is a helpful player-character who offers services to other players. \
-ALL communication with Otto uses the TELL command: "tell otto <service>".
-- To learn what Otto can do: tell otto help
-- Healing: tell otto heal  (restores HP)
-- Buffs (ask each 2x for extended duration): tell otto sanctuary / tell otto bless / tell otto armor
-- Travel: tell otto summon  (Otto teleports you to his location — use before requesting buffs or heal)
-- Request buffs before adventuring. Re-request when they wear off (~30 min).
-- Use summon to return to safety quickly when in danger or needing services."""
+- Otto is a helper PC who provides healing and buffs via tell — he does NOT sell food or water."""
 
 
 class LLMAdvisor:
@@ -363,14 +354,14 @@ class LLMAdvisor:
         if needs:
             parts.append("Needs: " + ", ".join(needs))
 
-        # Otto helper-player — ALL interaction via "tell otto <service>"
+        # Otto — only show when relevant to current goal
+        goal = context.get('current_goal', 'explore')
+        food_goals = {'get_food', 'earn_gold', 'explore', 'seek_mobs', 'hunt_mob'}
         otto_caps = context.get('otto_capabilities', [])
-        if otto_caps:
+        if goal not in food_goals and otto_caps:
             cap_str = ', '.join(f'tell otto {c}' for c in otto_caps)
-            presence = "is HERE in this room" if context.get('otto_present') else "is nearby"
-            parts.append(f"Otto {presence}. Available commands: {cap_str}.")
-        else:
-            parts.append('Otto is available — type "tell otto help" to learn his services.')
+            presence = "is here" if context.get('otto_present') else "is available remotely"
+            parts.append(f"Otto {presence}. Commands: {cap_str}.")
 
         # NPC knowledge — proximity-tiered, most relevant first
         ns = context.get('npc_summary', {})
@@ -409,6 +400,21 @@ class LLMAdvisor:
             for w in context['loop_warnings']:
                 parts.append(f"  - {w}")
             parts.append("Please choose a different action to break out of this loop.")
+
+        # Goal-specific guidance
+        goal = context.get('current_goal', 'explore')
+        if goal == 'get_food':
+            parts.append(
+                "\nTASK: Find a food shop by exploring. "
+                "Move to an unexplored room — do not interact with Otto, he cannot provide food."
+            )
+        elif goal == 'get_water':
+            parts.append(
+                "\nTASK: Find a fountain or water source by exploring. "
+                "Move to an unexplored room."
+            )
+        elif goal == 'earn_gold':
+            parts.append("\nTASK: Find and kill a beatable monster to earn gold.")
 
         parts.append("\nWhat single command should I enter next?")
         return "\n".join(parts)
