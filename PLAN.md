@@ -159,7 +159,7 @@ The autonomous MUD AI agent can't reliably navigate ("still not able to minimall
   ```
   Store in `entity_db[room_hash]["area_theme"]`. When area theme changes between adjacent rooms, log `[AI] Area boundary detected: town -> forest`. Called once per room — cheap, high-signal LLM use.
 
-- [ ] **1H: Suppress spurious room-parse failure at login** (`mud_client.py`)
+- [x] **1H: Suppress spurious room-parse failure at login** (`mud_client.py`)
   At login, the room tracking flag fires before the character enters the game (e.g. on the password prompt). This produces a harmless `[Room parse failed]` log line once per session. Fix: gate `expecting_room_data = True` on a confirmed in-game state (e.g. after autologin completes and the entry room has been detected at least once), or detect the login menu text and suppress the flag until login is done.
 
 ---

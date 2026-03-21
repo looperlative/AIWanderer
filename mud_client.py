@@ -1179,14 +1179,19 @@ class MUDClient:
         room_data = self.parse_room_data(segments)
 
         if not room_data:
-            # Log why parsing failed so aidebug can show it
-            colors_seen = list(dict.fromkeys(c for _, c in segments if _.strip()))
-            self.append_text(
-                f"[Room parse failed] room_color={self.room_color!r} "
-                f"colors_in_segments={colors_seen}\n", "system")
-            # Clear the flag so subsequent colored text (e.g. guard messages)
-            # doesn't keep re-triggering the parser.
-            self.expecting_room_data = False
+            if self.detect_entry_room:
+                # Still in the login flow — parse failure is expected (MOTD, banners,
+                # etc.).  Stay armed so the actual entry room is caught when it arrives.
+                pass
+            else:
+                # Log why parsing failed so aidebug can show it
+                colors_seen = list(dict.fromkeys(c for _, c in segments if _.strip()))
+                self.append_text(
+                    f"[Room parse failed] room_color={self.room_color!r} "
+                    f"colors_in_segments={colors_seen}\n", "system")
+                # Clear the flag so subsequent colored text (e.g. guard messages)
+                # doesn't keep re-triggering the parser.
+                self.expecting_room_data = False
 
         if room_data:
             # Create hash of room data using normalized description for stability
