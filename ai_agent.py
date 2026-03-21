@@ -907,37 +907,55 @@ class ExplorationAgent:
                     self._auto_pickup_pending.append(drink_cmd)
 
             # Mob/item detection — check every visit for danger
-            # Prefer color-parsed mob_lines if available (Phase 1A), fall back to regex
+            # Prefer color-parsed mob_lines if available (1A), fall back to regex.
             mob_lines = room_data.get('mob_lines')
+            color_calibrated = bool(mob_lines is not None)  # mob_lines=[] means calibrated+empty
             if mob_lines:
                 mobs = self.parser.detect_mobs(' '.join(mob_lines))
             else:
                 mobs = self.parser.detect_mobs(description)
+
+            # PC names from who list — never attack a player character
+            pc_names = {e['name'].lower() for e in self.state.who_list}
+
             if mobs:
                 if room_hash not in self.state.visited:
                     self.client.append_text(f"[AI] Mobs detected: {', '.join(mobs)}\n", "system")
-                # Record every detected mob's location (create entry if new)
+                # Record every detected mob's location and increment sighting count
                 for mob in mobs:
                     rec = self.state.npc_danger.setdefault(mob.lower(), {
                         "deaths": 0, "fastest_death_secs": None,
                         "wins": 0, "near_kills": 0, "last_room": None,
+                        "sightings": 0,
                     })
                     rec["last_room"] = room_hash
+                    rec["sightings"] = rec.get("sightings", 0) + 1
+
                 # Proactively attack beatable NPCs for XP and loot
                 if self._should_fight():
                     for mob in mobs:
-                        rec = self.state.npc_danger.get(mob.lower())
-                        if rec and rec.get("deaths", 0) == 0:
-                            reason = "need gold —" if self._needs_gold() else "attacking for XP —"
-                            self.client.append_text(
-                                f"[AI] {reason} attacking {mob}.\n", "system")
-                            self.client.send_ai_command(f"kill {mob.lower()}")
-                            self._combat_active = True
-                            self._combat_npc = mob.lower()
-                            self._combat_start_time = time.monotonic()
-                            self._combat_start_hp = self.state.current_hp
-                            self._schedule_tick(self.COMMAND_DELAY_MS * 2)
-                            return
+                        mob_lower = mob.lower()
+                        # Never attack player characters
+                        if mob_lower in pc_names:
+                            continue
+                        rec = self.state.npc_danger.get(mob_lower)
+                        if not rec or rec.get("deaths", 0) > 0:
+                            continue
+                        # When color-calibrated, trust mob on first sight.
+                        # When using regex fallback, require 2+ sightings to
+                        # avoid false positives from room description text.
+                        if not color_calibrated and rec.get("sightings", 0) < 2:
+                            continue
+                        reason = "need gold —" if self._needs_gold() else "attacking for XP —"
+                        self.client.append_text(
+                            f"[AI] {reason} attacking {mob}.\n", "system")
+                        self.client.send_ai_command(f"kill {mob_lower}")
+                        self._combat_active = True
+                        self._combat_npc = mob_lower
+                        self._combat_start_time = time.monotonic()
+                        self._combat_start_hp = self.state.current_hp
+                        self._schedule_tick(self.COMMAND_DELAY_MS * 2)
+                        return
 
                 # Check for known-dangerous NPCs and flee if we somehow entered anyway
                 for mob in mobs:
