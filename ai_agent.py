@@ -394,6 +394,8 @@ class ExplorationAgent:
         self._combat_start_hp = None     # our HP when combat started
         self._last_combat_message_time = None  # monotonic time of last combat pattern detection
         self._combat_emergency_summon_sent = False  # True if emergency summon sent this combat
+        self._opp_min_hp_pct = None      # lowest opp HP% seen this combat
+        self._combat_rounds = 0          # combat rounds observed this combat
         self._recent_departures = set()  # mob names seen leaving this room (cleared on room entry)
         self._dead_end_retried = set()   # (room_hash, direction) pairs retried this session
         self._dead = False
@@ -402,6 +404,8 @@ class ExplorationAgent:
         self._otto_in_current_room = False   # True when Otto was detected in this room's live text
         self._otto_summon_sent_at = 0.0      # monotonic time of last 'tell otto summon' — guards spam
         self._last_otto_heal_request = 0.0   # monotonic time of last 'tell otto heal' — prevents spam
+        self._heal_request_failures = 0      # consecutive heals sent with no HP gain
+        self._hp_before_heal = None          # HP at time of last heal tell
         self._buff_sequence_pending = []     # protection buff tells still to send this cycle
         self._waiting_for_otto_help = False  # True after 'tell otto help' sent
         self._auto_pickup_pending = []       # get/drink commands queued from room entry
@@ -914,6 +918,9 @@ class ExplorationAgent:
 
         # Record HP at entry for next comparison
         self.state.hp_at_room_entry = self.state.current_hp
+        # New room — reset heal-failure tracking so we re-evaluate Otto presence fresh
+        self._heal_request_failures = 0
+        self._hp_before_heal = None
 
         # Scan room for resources — run on EVERY visit so we catch shops/water
         # even when returning after a previous session.
@@ -1064,6 +1071,8 @@ class ExplorationAgent:
                         self._combat_start_hp = self.state.current_hp
                         self._last_combat_message_time = time.monotonic()
                         self._combat_emergency_summon_sent = False
+                        self._opp_min_hp_pct = None
+                        self._combat_rounds = 0
                         self._schedule_tick(self.COMMAND_DELAY_MS * 2)
                         return
 
@@ -1141,12 +1150,20 @@ class ExplorationAgent:
             if self._otto_pending_service:
                 svc = self._otto_pending_service
                 self._otto_pending_service = None
-                self.client.append_text(
-                    f"[AI] Otto summoned us — requesting '{svc}'.\n", "system")
-                # Use after() to delay the tell slightly so it doesn't get lost
-                self.client.master.after(
-                    self.COMMAND_DELAY_MS * 2,
-                    lambda s=svc: self._tell_otto(s) if self.is_running else None)
+                if svc == 'buffs':
+                    # 'buffs' is a meta-service — not a real Otto command.
+                    # Reset the sequence; the next survival tick will rebuild and
+                    # send individual buff tells now that Otto is present.
+                    self._buff_sequence_pending = []
+                    self.client.append_text(
+                        "[AI] Otto summoned us — starting buff sequence.\n", "system")
+                else:
+                    self.client.append_text(
+                        f"[AI] Otto summoned us — requesting '{svc}'.\n", "system")
+                    # Use after() to delay the tell slightly so it doesn't get lost
+                    self.client.master.after(
+                        self.COMMAND_DELAY_MS * 2,
+                        lambda s=svc: self._tell_otto(s) if self.is_running else None)
         
         # --- Otto tell responses ---
         otto_msg = self.parser.parse_otto_tell(clean_text)
@@ -1252,7 +1269,16 @@ class ExplorationAgent:
         # --- SCORE / character sheet parsing ---
         score = self.parser.parse_score(clean_text)
         if score:
-            if 'level'     in score: self.state.char_level     = score['level']
+            if 'level' in score:
+                new_level = score['level']
+                if (self.state.char_level is not None
+                        and new_level > self.state.char_level):
+                    self.client.append_text(
+                        f"[AI] Level up! {self.state.char_level} → {new_level} "
+                        f"— clearing unbeatable mob list.\n", "system")
+                    for rec in self.state.npc_danger.values():
+                        rec.pop('timeout_flees', None)
+                self.state.char_level = new_level
             if 'class_name'in score: self.state.char_class     = score['class_name']
             if 'max_hp'    in score: self.state.max_hp         = score['max_hp']
             if 'max_mp'    in score: self.state.max_mp         = score['max_mp']
@@ -1340,6 +1366,12 @@ class ExplorationAgent:
             prev_opp = self.state.current_opp_pct
             self.state.current_tank_pct = stats.get('tank', self.state.current_tank_pct)
             self.state.current_opp_pct = stats.get('opp', self.state.current_opp_pct)
+            # Track lowest opp HP% seen this combat (only while opponent is alive/healthy)
+            if self._combat_active and self.state.current_opp_pct is not None:
+                opp = self.state.current_opp_pct
+                if opp > 0:
+                    if self._opp_min_hp_pct is None or opp < self._opp_min_hp_pct:
+                        self._opp_min_hp_pct = opp
             # Opponent just hit 0% — kill confirmed via prompt opp% transition.
             # prev_opp != 0 covers both healthy (>0) and mortally wounded (<0) states.
             if (self._combat_active and prev_opp is not None and prev_opp != 0
@@ -1457,6 +1489,12 @@ class ExplorationAgent:
                     self.client.append_text(
                         f"[AI] Kill '{failed_name}' missed — mob left the room.\n",
                         "system")
+                    # Stale last_room — clear it so we don't re-target here next tick
+                    if failed_name in self.state.npc_danger:
+                        self.state.npc_danger[failed_name]['last_room'] = None
+                    profile = self._profile()
+                    if profile and failed_name in profile.get('mob_db', {}):
+                        profile['mob_db'][failed_name]['last_room'] = None
                 else:
                     # Keyword mismatch — record it and try a shorter form
                     rec = self.state.npc_danger.setdefault(failed_name, {
@@ -1484,10 +1522,19 @@ class ExplorationAgent:
                         self._combat_start_hp = self.state.current_hp
                         self._last_combat_message_time = time.monotonic()
                         self._combat_emergency_summon_sent = False
+                        self._opp_min_hp_pct = None
+                        self._combat_rounds = 0
                     else:
                         self.client.append_text(
                             f"[AI] Kill '{failed_name}' failed — no usable keyword, skipping.\n",
                             "system")
+                        # Mob not found and no keyword to retry — clear last_room so
+                        # we don't loop back and try the same room again next tick.
+                        if failed_name in self.state.npc_danger:
+                            self.state.npc_danger[failed_name]['last_room'] = None
+                        profile = self._profile()
+                        if profile and failed_name in profile.get('mob_db', {}):
+                            profile['mob_db'][failed_name]['last_room'] = None
 
         # --- Shop list: learn food item and price ---
         if self.state.food_room and not self.state.food_item:
@@ -1607,6 +1654,8 @@ class ExplorationAgent:
                 self._combat_start_hp = self.state.current_hp
                 self._last_combat_message_time = time.monotonic()
                 self._combat_emergency_summon_sent = False
+                self._opp_min_hp_pct = None
+                self._combat_rounds = 0
                 attacker = self.parser.detect_combat_attacker(clean_text)
                 self._combat_npc = attacker.lower() if attacker else None
                 if self._combat_npc:
@@ -1626,23 +1675,61 @@ class ExplorationAgent:
             if round_data and round_data.get('damage'):
                 self._combat_seen_active = True
                 self._last_combat_message_time = time.monotonic()
+                self._combat_rounds += 1
                 self.client.append_text(
                     f"[AI] Combat: {round_data['attacker']} {round_data['verb']} "
                     f"{round_data['target']} for {round_data['damage']} damage.\n", "system")
-            
+
+            # Futile-combat detection — flee and blacklist if we can't make progress
+            if (self._combat_active and self._combat_npc
+                    and self._combat_rounds >= 20
+                    and self.state.current_opp_pct is not None):
+                opp = self.state.current_opp_pct
+                min_seen = self._opp_min_hp_pct if self._opp_min_hp_pct is not None else 100
+                futile = False
+                reason = ""
+                if opp >= 90 and min_seen >= 90:
+                    futile = True
+                    reason = f"can't damage {self._combat_npc} (stuck at {opp}% HP)"
+                elif opp >= 95 and min_seen < 90:
+                    # Opponent regenerated back to near-full after we had damaged them
+                    futile = True
+                    reason = f"{self._combat_npc} regenerated back to {opp}% HP"
+                if futile:
+                    npc = self._combat_npc
+                    self.client.append_text(
+                        f"[AI] Futile combat — {reason}. Fleeing and blacklisting.\n", "error")
+                    rec = self.state.npc_danger.setdefault(npc, {
+                        "deaths": 0, "fastest_death_secs": None,
+                        "wins": 0, "near_kills": 0, "last_room": None, "sightings": 0})
+                    rec['timeout_flees'] = rec.get('timeout_flees', 0) + 1
+                    self.client.send_ai_command('flee')
+                    self._schedule_tick(self.COMMAND_DELAY_MS * 3)
+                    return
+
             # Emergency extraction when HP critically low during combat
             if (not self._combat_emergency_summon_sent 
                 and self.state.current_hp is not None 
                 and self.state.max_hp is not None
                 and self.state.max_hp > 0):
                 hp_pct = self.state.current_hp / self.state.max_hp
-                if hp_pct < self.COMBAT_EMERGENCY_HP_PCT and self._otto_can('summon'):
-                    self.client.append_text(
-                        f"[AI] EMERGENCY: HP at {hp_pct*100:.0f}% — summoning Otto to escape!\n", 
-                        "error")
-                    self._tell_otto('summon')
-                    self._combat_emergency_summon_sent = True
-                    self._schedule_tick(self.COMMAND_DELAY_MS * 3)
+                if hp_pct < self.COMBAT_EMERGENCY_HP_PCT:
+                    # If Otto is already in the room, request heal directly
+                    if self._otto_in_current_room and self._otto_can('heal'):
+                        self.client.append_text(
+                            f"[AI] EMERGENCY: HP at {hp_pct*100:.0f}% — requesting heal from Otto!\n", 
+                            "error")
+                        self._tell_otto('heal')
+                        self._combat_emergency_summon_sent = True
+                        self._schedule_tick(self.COMMAND_DELAY_MS * 3)
+                    # Otherwise summon Otto to escape
+                    elif self._otto_can('summon'):
+                        self.client.append_text(
+                            f"[AI] EMERGENCY: HP at {hp_pct*100:.0f}% — summoning Otto to escape!\n", 
+                            "error")
+                        self._tell_otto('summon')
+                        self._combat_emergency_summon_sent = True
+                        self._schedule_tick(self.COMMAND_DELAY_MS * 3)
             
             # Check if opponent fled (before checking if we fled)
             fled_mob = self.parser.detect_opponent_flee(clean_text)
@@ -1751,17 +1838,17 @@ class ExplorationAgent:
         Return a survival action descriptor if the character needs attention,
         or None if exploration can continue.
 
-        Priority: low HP (< 50% Otto present / < 40% Otto available / < 25% no Otto) > buffs > thirst > hunger > gold.
+        Priority: low HP (< 80% Otto present / < 40% Otto available / < 25% no Otto) > buffs > thirst > hunger > gold.
         """
         # HP-based healing — threshold depends on Otto availability:
-        #   Otto present in room : 0.50 — proactively heal while he's standing here
+        #   Otto present in room : 0.80 — stay with Otto until well recovered
         #   Otto can heal remotely: 0.40 — summon him for healing before doing buffs
         #   No Otto available    : 0.25 — rest/wait as last resort
         if (self.state.current_hp is not None and self.state.max_hp is not None
                 and self.state.max_hp > 0):
             hp_pct = self.state.current_hp / self.state.max_hp
             if self._otto_in_current_room and self._otto_can('heal'):
-                heal_threshold = 0.50
+                heal_threshold = 0.80
             elif self._otto_can('heal'):
                 heal_threshold = 0.40
             else:
@@ -1798,7 +1885,9 @@ class ExplorationAgent:
         Return True when conditions are good enough to proactively attack an NPC.
         Fights for XP, loot, and gold. Suppressed when HP is too low or thirst is critical.
         """
-        # Don't fight when critically low on HP
+        # Don't fight when critically low on HP — absolute floor for low-level chars
+        if self.state.current_hp is not None and self.state.current_hp < 20:
+            return False
         if (self.state.current_hp is not None and self.state.max_hp is not None
                 and self.state.max_hp > 0
                 and self.state.current_hp / self.state.max_hp < 0.40):
@@ -1854,12 +1943,17 @@ class ExplorationAgent:
         Also includes mobs from mob_db (1E) that aren't already in npc_danger —
         e.g. after an ai_state reset — as long as they haven't killed us.
         """
+        pc_names = {e['name'].lower() for e in self.state.who_list}
         preferred, near, unknown = [], [], []
         seen_names = set()
         for name, rec in self.state.npc_danger.items():
             seen_names.add(name)
+            if name in pc_names:
+                continue  # never target player characters
             if rec.get('deaths', 0) > 0:
                 continue
+            if rec.get('timeout_flees', 0) > 0:
+                continue  # previously couldn't beat this mob
             room = rec.get('last_room')
             if not room:
                 continue
@@ -1876,6 +1970,11 @@ class ExplorationAgent:
             for name, entry in profile.get('mob_db', {}).items():
                 if name in seen_names:
                     continue
+                if name in pc_names:
+                    continue  # never target player characters
+                danger = self.state.npc_danger.get(name, {})
+                if danger.get('timeout_flees', 0) > 0:
+                    continue  # previously couldn't beat this mob
                 room = entry.get('last_room')
                 if room:
                     unknown.append((name, room))
@@ -1940,6 +2039,8 @@ class ExplorationAgent:
                 self._combat_start_hp = self.state.current_hp
                 self._last_combat_message_time = time.monotonic()
                 self._combat_emergency_summon_sent = False
+                self._opp_min_hp_pct = None
+                self._combat_rounds = 0
                 self._schedule_tick(self.COMMAND_DELAY_MS * 2)
             else:
                 self.client.append_text(
@@ -1965,6 +2066,23 @@ class ExplorationAgent:
                         # Don't spam Otto - wait at least 5 seconds between heal requests
                         self._schedule_tick(self.COMMAND_DELAY_MS * 3)
                         return
+                    # Track whether HP improved since last heal (heal succeeded)
+                    if (self._hp_before_heal is not None
+                            and self.state.current_hp is not None):
+                        if self.state.current_hp > self._hp_before_heal:
+                            self._heal_request_failures = 0  # heal worked
+                        else:
+                            self._heal_request_failures += 1
+                    if self._heal_request_failures >= 2:
+                        self.client.append_text(
+                            "[AI] Heal not working after 2 attempts — "
+                            "clearing Otto presence, switching to summon.\n", "system")
+                        self._otto_in_current_room = False
+                        self._heal_request_failures = 0
+                        self._hp_before_heal = None
+                        self._schedule_tick(self.COMMAND_DELAY_MS)
+                        return
+                    self._hp_before_heal = self.state.current_hp
                     self._last_otto_heal_request = now
                     self.client.append_text("[AI] Survival: asking Otto to heal us.\n", "system")
                     self._tell_otto('heal')
