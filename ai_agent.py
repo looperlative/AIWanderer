@@ -84,6 +84,14 @@ BLOCKED_PATTERNS = [
 # the help response will extend or correct this list at runtime.
 OTTO_KNOWN_CAPABILITIES = ['summon', 'heal', 'sanctuary', 'bless', 'armor']
 
+# Town-guard mobs that intervene in fights but won't pursue after combat ends.
+# Never flee from these on sight; never attack them; don't start fights in their rooms.
+GUARDIAN_MOBS = frozenset({'peacekeeper', 'knight templar', 'cityguard'})
+
+# If sanctuary expires within this many seconds, don't start new fights and
+# navigate to Otto to wait for the buff to expire before re-requesting.
+SANCTUARY_LOW_SECS = 120   # ~2 MUD hours at default tick rate
+
 # Lines to suppress from the recent-MUD-text buffer sent to the LLM.
 # Stat prompts and command echoes are machine-readable noise, not narrative.
 #
@@ -184,6 +192,10 @@ class ExplorationState:
         self.char_alignment = None
         # Who list cache — list of {"level": int, "class": str, "name": str}
         self.who_list = []
+        # Player characters (never attack with kill — use murder instead, which we don't do)
+        self.known_players = set()
+        # Unrecognized MUD messages — collected for later analysis
+        self.unrecognized_messages = {}  # normalized_text -> count
 
     def to_dict(self):
         return {
@@ -226,6 +238,8 @@ class ExplorationState:
             "char_xp": self.char_xp,
             "char_xp_next": self.char_xp_next,
             "char_alignment": self.char_alignment,
+            "known_players": list(self.known_players),
+            "unrecognized_messages": self.unrecognized_messages,
         }
 
     @classmethod
@@ -277,6 +291,8 @@ class ExplorationState:
         s.char_xp = data.get("char_xp")
         s.char_xp_next = data.get("char_xp_next")
         s.char_alignment = data.get("char_alignment")
+        s.known_players = set(data.get("known_players", []))
+        s.unrecognized_messages = data.get("unrecognized_messages", {})
         return s
 
 
@@ -387,7 +403,8 @@ class ExplorationAgent:
         self._combat_active = False
         self._combat_seen_active = False # True once we've observed actual combat (not just sent kill)
         self._combat_win_counted = False # True once a win has been credited for the current combat
-        self._combat_npc = None          # lowercase name of NPC we're fighting
+        self._combat_npc = None          # lowercase name of NPC we're fighting (current keyword)
+        self._combat_root_npc = None     # original mob name when combat started (unchanged through retries)
         self._last_combat_npc = None     # persists after combat ends — used by death attribution
         self._combat_start_time = None   # time.monotonic() when combat started
         self._last_combat_start_time = None  # persists after combat ends — used by death attribution
@@ -399,6 +416,7 @@ class ExplorationAgent:
         self._recent_departures = set()  # mob names seen leaving this room (cleared on room entry)
         self._dead_end_retried = set()   # (room_hash, direction) pairs retried this session
         self._dead = False
+        self._guardians_in_room = set()  # guardian mob names present in the current room
         self._last_shop_list_request = 0.0   # monotonic time of last 'list' command
         self._otto_pending_service = None    # service to request from Otto after summon
         self._otto_in_current_room = False   # True when Otto was detected in this room's live text
@@ -876,6 +894,7 @@ class ExplorationAgent:
         move_dir = self._last_direction   # capture before clearing
         self._waiting_for_room = False
         self._recent_departures.clear()   # fresh room — departure history resets
+        self._guardians_in_room.clear()   # guardian presence is per-room
         self._last_direction = None
         self._dead = False  # if we were dead, we've respawned
         self._otto_summon_sent_at = 0.0   # room entry confirms teleport complete
@@ -1014,6 +1033,26 @@ class ExplorationAgent:
                         if not any(m.lower() == pc or m.lower().startswith(pc + ' ')
                                    for pc in pc_names)]
 
+            # Filter linkdead players — "(linkless)" suffix means disconnected PC, not NPC.
+            linkless = [m for m in mobs if '(linkless)' in m.lower()]
+            if linkless:
+                for m in linkless:
+                    self.state.known_players.add(m.lower())
+                    self.client.append_text(
+                        f"[AI] '{m}' is linkless — treating as player, will not attack.\n",
+                        "system")
+                mobs = [m for m in mobs if '(linkless)' not in m.lower()]
+
+            # Filter known players detected in room
+            mobs = [m for m in mobs if m.lower() not in self.state.known_players]
+
+            # Separate guardian mobs — track presence but never attack or flee from them
+            self._guardians_in_room = {
+                m.lower() for m in mobs
+                if any(g in m.lower() for g in GUARDIAN_MOBS)
+            }
+            mobs = [m for m in mobs if not any(g in m.lower() for g in GUARDIAN_MOBS)]
+
             # Filter "your X" mobs — guildmasters and other possessive-prefixed NPCs
             # are quest-givers / trainers that can't be killed and shouldn't be recorded.
             mobs = [m for m in mobs if not m.lower().startswith('your ')]
@@ -1038,6 +1077,8 @@ class ExplorationAgent:
                 if self._should_fight():
                     for mob in mobs:
                         mob_lower = mob.lower()
+                        if mob_lower in self.state.known_players:
+                            continue
                         rec = self.state.npc_danger.get(mob_lower)
                         if not rec or rec.get("deaths", 0) > 0:
                             continue
@@ -1052,6 +1093,9 @@ class ExplorationAgent:
                         kill_kw = None
                         for i in range(len(words)):
                             candidate = " ".join(words[i:])
+                            # Never issue "kill me ..." — first word "me" hits self
+                            if candidate.split()[0] == "me":
+                                continue
                             if candidate not in bad_kws:
                                 kill_kw = candidate
                                 break
@@ -1065,6 +1109,7 @@ class ExplorationAgent:
                         self._combat_seen_active = False
                         self._combat_win_counted = False
                         self._combat_npc = kill_kw
+                        self._combat_root_npc = mob_lower
                         self._last_combat_npc = kill_kw
                         self._combat_start_time = time.monotonic()
                         self._last_combat_start_time = self._combat_start_time
@@ -1507,6 +1552,9 @@ class ExplorationAgent:
                     # Try dropping the first word: "head postmaster" → "postmaster"
                     words = failed_name.split()
                     shorter = " ".join(words[1:]) if len(words) > 1 else None
+                    # Never issue "kill me ..." (first word "me" hits self) or attack known players
+                    if shorter and (shorter.split()[0] == "me" or shorter in self.state.known_players):
+                        shorter = None
                     if shorter and shorter not in bad_keywords:
                         self.client.append_text(
                             f"[AI] Kill '{failed_name}' failed — retrying as '{shorter}'.\n",
@@ -1528,13 +1576,36 @@ class ExplorationAgent:
                         self.client.append_text(
                             f"[AI] Kill '{failed_name}' failed — no usable keyword, skipping.\n",
                             "system")
-                        # Mob not found and no keyword to retry — clear last_room so
-                        # we don't loop back and try the same room again next tick.
-                        if failed_name in self.state.npc_danger:
-                            self.state.npc_danger[failed_name]['last_room'] = None
+                        # Clear last_room for both the final tried keyword and the
+                        # original mob name (root) so we don't loop back next tick.
+                        to_clear = {failed_name}
+                        if self._combat_root_npc:
+                            to_clear.add(self._combat_root_npc)
                         profile = self._profile()
-                        if profile and failed_name in profile.get('mob_db', {}):
-                            profile['mob_db'][failed_name]['last_room'] = None
+                        for name in to_clear:
+                            if name in self.state.npc_danger:
+                                self.state.npc_danger[name]['last_room'] = None
+                            if profile and name in profile.get('mob_db', {}):
+                                profile['mob_db'][name]['last_room'] = None
+
+        # --- Player detected — "Use 'murder' to hit another player" ---
+        if self.parser.detect_murder_needed(clean_text):
+            # Use root name if available — it's the full original name before keyword stripping
+            player_name = self._combat_root_npc or self._combat_npc
+            self._combat_active = False
+            self._combat_seen_active = False
+            self._combat_npc = None
+            self._combat_root_npc = None
+            self._combat_start_time = None
+            self._combat_start_hp = None
+            self._last_combat_message_time = None
+            self._combat_emergency_summon_sent = False
+            if player_name:
+                self.state.known_players.add(player_name)
+                self.client.append_text(
+                    f"[AI] '{player_name}' is a player — added to known_players, will not attack.\n",
+                    "system")
+                self.save_state()
 
         # --- Shop list: learn food item and price ---
         if self.state.food_room and not self.state.food_item:
@@ -1658,6 +1729,7 @@ class ExplorationAgent:
                 self._combat_rounds = 0
                 attacker = self.parser.detect_combat_attacker(clean_text)
                 self._combat_npc = attacker.lower() if attacker else None
+                self._combat_root_npc = self._combat_npc
                 if self._combat_npc:
                     self._last_combat_npc = self._combat_npc
                 self.client.append_text(
@@ -1825,6 +1897,14 @@ class ExplorationAgent:
                 else:
                     self.client.append_text("[AI] Combat appears over — resuming exploration.\n", "system")
 
+        # --- Unrecognized message tracking ---
+        for line in clean_text.splitlines():
+            if self.parser.looks_unrecognized(line):
+                key = line.strip()
+                self.state.unrecognized_messages[key] = (
+                    self.state.unrecognized_messages.get(key, 0) + 1
+                )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -1858,6 +1938,14 @@ class ExplorationAgent:
         # Protection buffs — apply before adventuring, refresh when expired
         if self._needs_buffs():
             return {'need': 'buffs'}
+        # Sanctuary running low — navigate to Otto and wait for it to expire
+        # so we can request a fresh one immediately when it does.
+        sanctuary_expires = self.state.buff_expires.get('sanctuary', 0)
+        now = time.monotonic()
+        if (0 < sanctuary_expires - now < SANCTUARY_LOW_SECS
+                and self._otto_can('sanctuary')
+                and self.state.otto_room):
+            return {'need': 'wait_for_sanctuary'}
         if self.state.thirst_level in ('parched', 'thirsty'):
             return {'need': 'water'}
         if self.state.hunger_level in ('starving', 'hungry'):
@@ -1894,6 +1982,15 @@ class ExplorationAgent:
             return False
         # Don't fight when parched — water is more urgent
         if self.state.thirst_level == 'parched':
+            return False
+        # Don't fight in rooms with guardian mobs (they intervene in fights)
+        if self._guardians_in_room:
+            return False
+        # Don't start new fights when sanctuary is running low — go to Otto instead.
+        # Only applies when sanctuary is active but expiring soon (> 0 means active).
+        sanctuary_expires = self.state.buff_expires.get('sanctuary', 0)
+        now = time.monotonic()
+        if 0 < sanctuary_expires - now < SANCTUARY_LOW_SECS:
             return False
         return True
 
@@ -1948,7 +2045,7 @@ class ExplorationAgent:
         seen_names = set()
         for name, rec in self.state.npc_danger.items():
             seen_names.add(name)
-            if name in pc_names:
+            if name in pc_names or name in self.state.known_players:
                 continue  # never target player characters
             if rec.get('deaths', 0) > 0:
                 continue
@@ -1970,7 +2067,7 @@ class ExplorationAgent:
             for name, entry in profile.get('mob_db', {}).items():
                 if name in seen_names:
                     continue
-                if name in pc_names:
+                if name in pc_names or name in self.state.known_players:
                     continue  # never target player characters
                 danger = self.state.npc_danger.get(name, {})
                 if danger.get('timeout_flees', 0) > 0:
@@ -1985,6 +2082,32 @@ class ExplorationAgent:
         """Execute a survival action — navigate to a known source or seek one."""
         need = action['need']
         current = self.client.current_room_hash
+
+        # --- Wait at Otto for sanctuary to expire before re-requesting ---
+        if need == 'wait_for_sanctuary':
+            self.state.current_goal = 'wait_for_sanctuary'
+            otto_room = self.state.otto_room
+            if otto_room and current != otto_room:
+                profile = self.client.profiles.get(self.client.current_profile, {})
+                room_links = profile.get('room_links', {})
+                path = self.pathfinder.bfs_path(room_links, current, otto_room)
+                if path:
+                    self.client.append_text(
+                        "[AI] Sanctuary running low — navigating to Otto to wait for expiry.\n",
+                        "system")
+                    self._execute_move(path[0])
+                    self._schedule_tick(self.COMMAND_DELAY_MS)
+                    return
+            # Already at Otto — just wait; log only once per minute to avoid spam
+            now = time.monotonic()
+            secs_left = max(0, self.state.buff_expires.get('sanctuary', 0) - now)
+            if not hasattr(self, '_last_sanctuary_wait_log') or now - self._last_sanctuary_wait_log > 30:
+                self._last_sanctuary_wait_log = now
+                self.client.append_text(
+                    f"[AI] Waiting at Otto for sanctuary to expire ({secs_left:.0f}s left).\n",
+                    "system")
+            self._schedule_tick(5000)
+            return
 
         # --- Earn gold by fighting beatable NPCs ---
         if need == 'gold':
@@ -2033,6 +2156,7 @@ class ExplorationAgent:
                 self._combat_seen_active = False
                 self._combat_win_counted = False
                 self._combat_npc = best_name
+                self._combat_root_npc = best_name
                 self._last_combat_npc = best_name
                 self._combat_start_time = time.monotonic()
                 self._last_combat_start_time = self._combat_start_time

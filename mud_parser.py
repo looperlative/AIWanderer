@@ -230,22 +230,41 @@ class MUDTextParser:
         re.IGNORECASE
     )
 
+    # CircleMUD score SPL line: "SPL: (  3hr) sanctuary             sets SANCT"
+    # Hours here are MUD hours; 1 MUD hour ≈ 1 tick for spell duration purposes.
+    _SPL_LINE_RE = re.compile(
+        r'SPL:\s*\(\s*(?P<hours>\d+)\s*hr\)\s*(?P<spell>\S+)',
+        re.IGNORECASE
+    )
+
     def parse_spell_affects(self, text):
         """
         Extract active buff durations from score output.
 
+        Handles two formats:
+          - Legacy "N ticks" format
+          - CircleMUD SPL line: "SPL: ( Xhr) spell_name ..."
+
         Returns a dict of {canonical_buff_name: ticks_remaining} for any
         protection buffs found.  Empty dict if none detected.
+        In both cases the value is in ticks (1 tick ≈ 1 MUD hour).
         """
         result = {}
-        for m in self._SPELL_AFFECT_RE.finditer(text):
+        # SPL lines take priority — most accurate source
+        for m in self._SPL_LINE_RE.finditer(text):
             spell_raw = m.group('spell').lower()
             canonical = self._BUFF_NAMES.get(spell_raw)
             if canonical:
+                hours = int(m.group('hours'))
+                if canonical not in result or hours > result[canonical]:
+                    result[canonical] = hours
+        # Fall back to old "N ticks" format if SPL lines didn't cover everything
+        for m in self._SPELL_AFFECT_RE.finditer(text):
+            spell_raw = m.group('spell').lower()
+            canonical = self._BUFF_NAMES.get(spell_raw)
+            if canonical and canonical not in result:
                 ticks = int(m.group('ticks'))
-                # Keep the highest tick count if the same buff appears twice
-                if canonical not in result or ticks > result[canonical]:
-                    result[canonical] = ticks
+                result[canonical] = ticks
         return result
 
     # ------------------------------------------------------------------
@@ -520,6 +539,15 @@ class MUDTextParser:
     def detect_kill_target_missing(self, text):
         """Return True if the MUD couldn't find the kill target by that name."""
         return bool(self.KILL_TARGET_MISSING_RE.search(text))
+
+    MURDER_NEEDED_RE = re.compile(
+        r"use 'murder' to hit another player",
+        re.IGNORECASE
+    )
+
+    def detect_murder_needed(self, text):
+        """Return True if the target is a player (MUD rejected kill with 'use murder')."""
+        return bool(self.MURDER_NEEDED_RE.search(text))
 
     # ------------------------------------------------------------------
     # Death detection
@@ -1295,3 +1323,83 @@ class MUDTextParser:
     def detect_otto_summon_success(self, text):
         """Return True if Otto successfully summoned the player."""
         return bool(self._OTTO_SUMMON_SUCCESS_RE.search(text))
+
+    # ------------------------------------------------------------------
+    # Unrecognized message tracking
+    # ------------------------------------------------------------------
+
+    # Lines matching this are considered "known" and won't be tracked as
+    # unrecognized.  The pattern is intentionally broad — false negatives
+    # (recognized messages accidentally flagged) are fine; false positives
+    # (truly unknown messages silently dropped) are what we want to avoid.
+    _RECOGNIZED_RE = re.compile(
+        r"""
+        # MUD prompt (HP/MP/MV line)
+        \d+\s*[Hh]\w*\s+\d+\s*[Mm]\w*
+        # Room exit line
+        | \[\s*Exits?:
+        # Common movement / positioning
+        | \b(?:you (?:flee|leave|enter|arrive|go|move|walk|run|stand|sit|rest|sleep|wake)
+             |you (?:are (?:already|standing|sitting|resting|sleeping|riding))
+             |there is no (?:exit|way)|alas|you cannot go that way
+             |you bump into|you are too|you can't go)
+        # Combat messages
+        | \b(?:you (?:miss|hit|dodge|parry|block|attack|kick|bash|stab|slice|pierce|crush|pound)
+             |you flee head over heels
+             |you are (?:stunned|paralyzed|blinded|poisoned|cursed)
+             |you feel (?:better|worse|stronger|weaker|lighter|heavier)
+             |your (?:wounds|injuries|body)
+             |\w+ misses you|\w+ (?:hits?|slices?|pierces?|crushes?|bashes?|kicks?) you)
+        # Death / resurrection
+        | \b(?:you (?:die|are dead|have died|wake up|fall unconscious|lose consciousness)
+             |you have been (?:killed|slain))
+        # Hunger / thirst
+        | \byou (?:are (?:hungry|starving|thirsty|parched)|feel (?:hungry|thirsty))
+        | \byou (?:eat|drink|consume|finish eating|quench)
+        # Gold / shop
+        | \b(?:you (?:buy|sell|get|drop|give|receive|pick up|put|remove|wear|wield|hold|grab)
+             |\w+ gives? you|\w+ (?:pays?|sells?|buys?)
+             |you now have|balance:)
+        # Tells / communication
+        | \b(?:you tell|\w+ tells? you|\w+ says?|\w+ shouts?|\w+ yells?
+             |\w+ whispers?|someone (?:tells?|says?))
+        # Score / who / time output
+        | \b(?:you are \d+ years old|you have scored|you need \d+ exp
+             |this ranks you|you have been playing
+             |players\s*$|-------\s*$|\[\s*\d+\s+[A-Z][a-z]\])
+        # Shop interaction
+        | \b(?:the shopkeeper|a small sign|you can't afford|you don't have enough
+             |item not available|out of stock)
+        # Buff / spell messages
+        | \b(?:you feel (?:protected|blessed|armored|sanctified|holy|invincible)
+             |a white aura|a (?:blue|red|green|yellow|white|black) glow
+             |you (?:glow|shimmer|radiate))
+        # Welcome / login / system
+        | \b(?:welcome to|goodbye|press return|make your choice|by what name
+             |password:|enter the game)
+        # Otto
+        | \botto\b
+        # Common game messages
+        | \b(?:you (?:are summonable|are (?:not )?(?:affected|immune|resistant))
+             |your armor class|your alignment
+             |it is \d+ o'clock|the \d+(?:st|nd|rd|th) day)
+        # Exits / dark / light
+        | \b(?:it is pitch black|you see nothing|a (?:torch|lantern|light))
+        # Empty or whitespace-only
+        | ^\s*$
+        """,
+        re.IGNORECASE | re.VERBOSE
+    )
+
+    def looks_unrecognized(self, line):
+        """
+        Return True if *line* is a single non-trivial MUD line that doesn't
+        match any pattern we already handle.  Call once per stripped line.
+        """
+        line = line.strip()
+        if not line or len(line) < 8:
+            return False
+        # Skip room-description indented lines and title-case room names
+        if line.startswith('   '):
+            return False
+        return not bool(self._RECOGNIZED_RE.search(line))
