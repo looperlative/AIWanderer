@@ -18,6 +18,7 @@ Types:
     ERROR   — errors
     LLM_OUT — full prompt sent to the LLM
     LLM_IN  — raw response received from the LLM
+    ADVISOR — free-text advice from the LLM advisor
 """
 
 import os
@@ -109,6 +110,14 @@ class SessionLogger:
     def log_llm_response(self, text):
         """Log the raw response received from the LLM."""
         self._write("LLM_IN", text)
+
+    def log_advisor(self, text):
+        """Log LLM advisor response."""
+        self._write("ADVISOR", text)
+
+    def log_session_summary(self, text):
+        """Log the end-of-session summary generated for cross-session persistence."""
+        self._write("SUMMARY", text)
 
     def log_append(self, text, msg_type):
         """

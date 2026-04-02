@@ -81,6 +81,14 @@ class MUDClient:
         # AI agent state
         self.ai_agent = None
 
+        # LLM advisor state
+        self.llm_advisor = None
+        self._pending_command = None   # last human command sent (awaiting MUD response)
+        self._response_buffer = []     # MUD lines received since last command
+        self._advisor_active = True    # LLM advisor on/off
+        self._advisor_busy = False     # True while an LLM call is in flight
+        self._advisor_queue = []       # events queued while LLM is busy: list of {'command','mud_lines'}
+
         # Session logging
         from session_logger import SessionLogger
         self.session_logger = SessionLogger()
@@ -370,153 +378,124 @@ class MUDClient:
     
     def setup_ui(self):
         """Setup the user interface"""
-        # Connection frame
-        connection_frame = ttk.LabelFrame(self.master, text="Connection", padding=10)
-        connection_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        # Profile selection (row 0)
-        ttk.Label(connection_frame, text="Profile:").grid(row=0, column=0, sticky=tk.W, padx=5)
-        self.profile_var = tk.StringVar()
-        self.profile_combo = ttk.Combobox(connection_frame, textvariable=self.profile_var, width=20, state="readonly")
-        self.profile_combo.grid(row=0, column=1, padx=5)
-        self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_selected)
-        
-        ttk.Button(connection_frame, text="New", command=self.new_profile, width=8).grid(row=0, column=2, padx=2)
-        ttk.Button(connection_frame, text="Edit", command=self.edit_profile, width=8).grid(row=0, column=3, padx=2)
-        ttk.Button(connection_frame, text="Delete", command=self.delete_profile, width=8).grid(row=0, column=4, padx=2)
-        
-        # Host input (row 1)
-        ttk.Label(connection_frame, text="Host:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.host_entry = ttk.Entry(connection_frame, width=30)
-        self.host_entry.grid(row=1, column=1, padx=5, pady=5)
-        self.host_entry.insert(0, "mud.example.com")
-        
-        # Port input
-        ttk.Label(connection_frame, text="Port:").grid(row=1, column=2, sticky=tk.W, padx=5)
-        self.port_entry = ttk.Entry(connection_frame, width=10)
-        self.port_entry.grid(row=1, column=3, padx=5)
-        self.port_entry.insert(0, "4000")
-        
-        # Connect button
-        self.connect_btn = ttk.Button(connection_frame, text="Connect", command=self.toggle_connection)
-        self.connect_btn.grid(row=1, column=4, padx=5)
-        
-        # Status label
-        self.status_label = ttk.Label(connection_frame, text="Disconnected", foreground="red")
-        self.status_label.grid(row=1, column=5, padx=5)
-        
-        # Room tracking checkbox (row 2)
+        # ── Menu bar ──────────────────────────────────────────────────
+        menubar = tk.Menu(self.master)
+        self.master.config(menu=menubar)
+
+        # Connection menu
+        self._conn_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Connection", menu=self._conn_menu)
+
+        # Profile sub-menu
+        self._profile_menu = tk.Menu(self._conn_menu, tearoff=0)
+        self._conn_menu.add_cascade(label="Profile", menu=self._profile_menu)
+        self._conn_menu.add_separator()
+        self._conn_menu.add_command(label="Connect", command=self.toggle_connection,
+                                    state=tk.NORMAL)
+        self._conn_menu.add_separator()
+        self._conn_menu.add_command(label="Send Character Name",
+                                    command=self.send_character_name, state=tk.DISABLED)
+        self._conn_menu.add_command(label="Send Password",
+                                    command=self.send_password, state=tk.DISABLED)
+        self._conn_menu.add_command(label="Send & Remember",
+                                    command=self.send_and_remember, state=tk.DISABLED)
+        self._conn_menu.add_command(label="Quit MUD",
+                                    command=self.start_quit_sequence, state=tk.DISABLED)
+        self._conn_menu.add_separator()
+        self._conn_menu.add_command(label="Exit", command=self.master.quit)
+
+        # Settings menu
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
         self.room_tracking_var = tk.BooleanVar(value=False)
-        self.room_tracking_check = ttk.Checkbutton(
-            connection_frame, 
-            text="Enable Room Tracking", 
-            variable=self.room_tracking_var,
-            command=self.toggle_room_tracking
-        )
-        self.room_tracking_check.grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
-        
-        # Room tracking status label
-        self.room_tracking_status = ttk.Label(connection_frame, text="", foreground="gray")
-        self.room_tracking_status.grid(row=2, column=2, columnspan=3, sticky=tk.W, padx=5)
+        self._advisor_var = tk.BooleanVar(value=True)
+        settings_menu.add_checkbutton(label="Room Tracking",
+                                      variable=self.room_tracking_var,
+                                      command=self.toggle_room_tracking)
+        settings_menu.add_checkbutton(label="LLM Advisor",
+                                      variable=self._advisor_var,
+                                      command=self.toggle_advisor)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="AI Config...", command=self.open_ai_config)
+        settings_menu.add_command(label="Room Colors...", command=self.open_color_calibration)
 
-        # AI speed control (row 3)
-        ttk.Label(connection_frame, text="AI Speed:").grid(
-            row=3, column=0, sticky=tk.W, padx=5, pady=3)
-        self._ai_speed_var = tk.IntVar(value=1500)
-        self._ai_speed_label = ttk.Label(connection_frame, text="1.5s", width=4)
-        self._ai_speed_label.grid(row=3, column=2, sticky=tk.W, padx=2)
-        ai_speed_slider = ttk.Scale(
-            connection_frame,
-            from_=500, to=6000,
-            orient=tk.HORIZONTAL,
-            variable=self._ai_speed_var,
-            command=self._on_speed_change,
-            length=200,
-        )
-        ai_speed_slider.grid(row=3, column=1, sticky=tk.W, padx=5)
+        # View menu
+        view_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="View", menu=view_menu)
+        view_menu.add_command(label="Clear MUD Output", command=self.clear_output)
+        view_menu.add_command(label="Clear Advisor", command=self.clear_advisor)
 
-        # Session log indicator
-        self._log_label = ttk.Label(connection_frame, text="Log: off", foreground="gray")
-        self._log_label.grid(row=3, column=3, columnspan=3, sticky=tk.W, padx=5)
+        # Profile vars (profile combo is now in a menu)
+        self.profile_var = tk.StringVar()
 
-        # Text display area
-        display_frame = ttk.LabelFrame(self.master, text="MUD Output", padding=10)
-        display_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        
+        # ── PanedWindow: MUD output (top) + Advisor (bottom) ──────────
+        paned = tk.PanedWindow(self.master, orient=tk.VERTICAL, sashrelief=tk.RAISED,
+                               sashwidth=6, bg="#3c3c3c")
+        paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 0))
+
         self.text_area = scrolledtext.ScrolledText(
-            display_frame,
+            paned,
             wrap=tk.WORD,
-            width=80,
-            height=20,
             font=("Courier", 10),
             bg="#1e1e1e",
             fg="#d4d4d4",
             insertbackground="white"
         )
-        self.text_area.pack(fill=tk.BOTH, expand=True)
         self.text_area.config(state=tk.DISABLED)
-        
-        # Input frame
-        input_frame = ttk.Frame(self.master, padding=10)
-        input_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Label(input_frame, text="Send:").pack(side=tk.LEFT, padx=5)
-        
-        self.input_entry = ttk.Entry(input_frame)
-        self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        paned.add(self.text_area, stretch="always", minsize=80)
+
+        self.advisor_area = scrolledtext.ScrolledText(
+            paned,
+            wrap=tk.WORD,
+            font=("Courier", 10),
+            bg="#1a1a2e",
+            fg="#d4d4d4",
+            insertbackground="white"
+        )
+        self.advisor_area.config(state=tk.DISABLED)
+        paned.add(self.advisor_area, stretch="always", minsize=60)
+
+        # Set initial sash position after window draws
+        self.master.after(100, lambda: paned.sash_place(0, 0,
+            int(self.master.winfo_height() * 0.70)))
+
+        # ── Status bar ────────────────────────────────────────────────
+        status_bar = ttk.Frame(self.master, relief=tk.SUNKEN)
+        status_bar.pack(fill=tk.X, padx=4, pady=(0, 2))
+        self._status_conn_label = ttk.Label(status_bar, text="Disconnected",
+                                            foreground="red", width=14)
+        self._status_conn_label.pack(side=tk.LEFT, padx=6)
+        ttk.Separator(status_bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, pady=2)
+        self._status_rooms_label = ttk.Label(status_bar, text="", foreground="gray")
+        self._status_rooms_label.pack(side=tk.LEFT, padx=6)
+        ttk.Separator(status_bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, pady=2)
+        self._status_log_label = ttk.Label(status_bar, text="Log: off", foreground="gray")
+        self._status_log_label.pack(side=tk.LEFT, padx=6)
+        self._status_profile_label = ttk.Label(status_bar, text="", foreground="#4ec9b0")
+        self._status_profile_label.pack(side=tk.RIGHT, padx=6)
+
+        # ── Input frame ───────────────────────────────────────────────
+        input_frame = ttk.Frame(self.master)
+        input_frame.pack(fill=tk.X, padx=4, pady=(0, 4))
+
+        self.input_entry = ttk.Entry(input_frame, font=("Courier", 10))
+        self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         self.input_entry.bind('<Return>', self.send_message)
-        
-        self.send_btn = ttk.Button(input_frame, text="Send", command=self.send_message)
-        self.send_btn.pack(side=tk.LEFT, padx=5)
+
+        self.send_btn = ttk.Button(input_frame, text="Send", command=self.send_message,
+                                   width=8)
+        self.send_btn.pack(side=tk.LEFT)
         self.send_btn.config(state=tk.DISABLED)
-        
-        # Send Character Name button
-        self.send_char_btn = ttk.Button(input_frame, text="Send Char Name", command=self.send_character_name)
-        self.send_char_btn.pack(side=tk.LEFT, padx=5)
-        self.send_char_btn.config(state=tk.DISABLED)
-        
-        # Send Password button
-        self.send_pass_btn = ttk.Button(input_frame, text="Send Password", command=self.send_password)
-        self.send_pass_btn.pack(side=tk.LEFT, padx=5)
-        self.send_pass_btn.config(state=tk.DISABLED)
-        
-        # Send & Remember button
-        self.send_remember_btn = ttk.Button(input_frame, text="Send & Remember", command=self.send_and_remember)
-        self.send_remember_btn.pack(side=tk.LEFT, padx=5)
-        self.send_remember_btn.config(state=tk.DISABLED)
-        
-        # Quit button
-        self.quit_btn = ttk.Button(input_frame, text="Quit", command=self.start_quit_sequence)
-        self.quit_btn.pack(side=tk.LEFT, padx=5)
-        self.quit_btn.config(state=tk.DISABLED)
 
-        # AI Mode button
-        self.ai_mode_btn = ttk.Button(input_frame, text="AI Mode: OFF", command=self.toggle_ai_mode)
-        self.ai_mode_btn.pack(side=tk.LEFT, padx=5)
-        self.ai_mode_btn.config(state=tk.DISABLED)
-
-        # AI Config button
-        self.ai_config_btn = ttk.Button(input_frame, text="AI Config", command=self.open_ai_config)
-        self.ai_config_btn.pack(side=tk.LEFT, padx=5)
-
-        # Room Colors calibration button
-        self.room_colors_btn = ttk.Button(input_frame, text="Room Colors",
-                                          command=self.open_color_calibration)
-        self.room_colors_btn.pack(side=tk.LEFT, padx=5)
-
-        # Clear button
-        clear_btn = ttk.Button(input_frame, text="Clear", command=self.clear_output)
-        clear_btn.pack(side=tk.LEFT, padx=5)
-        
         # Initialize profile list after all UI elements are created
         self.update_profile_list()
+        self._rebuild_profile_menu()
     
     def update_profile_list(self):
-        """Update the profile dropdown list"""
+        """Update the profile list and rebuild the profile menu"""
         # Filter out the _settings key from profile names
         profile_names = [name for name in self.profiles.keys() if not name.startswith('_')]
-        self.profile_combo['values'] = profile_names
-        
+
         if profile_names and not self.profile_var.get():
             # Try to load the last connected profile
             last_profile = self.get_last_profile()
@@ -524,35 +503,47 @@ class MUDClient:
                 self.profile_var.set(last_profile)
                 self.on_profile_selected(None)
             else:
-                # Default to the first profile if no last profile
-                self.profile_combo.current(0)
+                self.profile_var.set(profile_names[0])
                 self.on_profile_selected(None)
-    
+
+        self._rebuild_profile_menu()
+
+    def _rebuild_profile_menu(self):
+        """Rebuild the Profile sub-menu from the current profile list."""
+        self._profile_menu.delete(0, tk.END)
+        profile_names = [n for n in self.profiles if not n.startswith('_')]
+        for name in profile_names:
+            self._profile_menu.add_radiobutton(
+                label=name,
+                variable=self.profile_var,
+                value=name,
+                command=lambda n=name: self._select_profile(n)
+            )
+        self._profile_menu.add_separator()
+        self._profile_menu.add_command(label="New Profile...", command=self.new_profile)
+        self._profile_menu.add_command(label="Edit Profile...", command=self.edit_profile)
+        self._profile_menu.add_command(label="Delete Profile...", command=self.delete_profile)
+
+    def _select_profile(self, name):
+        """Select a profile by name (called from menu radiobutton)."""
+        self.profile_var.set(name)
+        self.on_profile_selected(None)
+
     def on_profile_selected(self, event):
         """Handle profile selection"""
         profile_name = self.profile_var.get()
         if profile_name and profile_name in self.profiles:
             profile = self.profiles[profile_name]
-            self.host_entry.delete(0, tk.END)
-            self.host_entry.insert(0, profile.get('host', ''))
-            self.port_entry.delete(0, tk.END)
-            self.port_entry.insert(0, profile.get('port', '4000'))
             self.current_profile = profile_name
-            
+
             # Load room tracking settings from profile
             self.room_color = profile.get('room_color', None)
             tracking_enabled = profile.get('room_tracking_enabled', False)
             self.room_tracking_var.set(tracking_enabled)
             self.room_tracking_enabled = tracking_enabled
-            
-            if tracking_enabled:
-                room_count = len(profile.get('rooms', {}))
-                self.room_tracking_status.config(
-                    text=f"Tracking enabled ({room_count} rooms mapped)",
-                    foreground="green"
-                )
-            else:
-                self.room_tracking_status.config(text="", foreground="gray")
+
+            self._update_status_bar()
+            self._status_profile_label.config(text=profile_name)
     
     def new_profile(self):
         """Create a new profile"""
@@ -571,9 +562,8 @@ class MUDClient:
             }
             self.save_profiles()
             self.update_profile_list()
-            self.profile_var.set(name)
-            self.on_profile_selected(None)
-    
+            self._select_profile(name)
+
     def edit_profile(self):
         """Edit the selected profile"""
         profile_name = self.profile_var.get()
@@ -606,9 +596,8 @@ class MUDClient:
             }
             self.save_profiles()
             self.update_profile_list()
-            self.profile_var.set(name)
-            self.on_profile_selected(None)
-    
+            self._select_profile(name)
+
     def delete_profile(self):
         """Delete the selected profile"""
         profile_name = self.profile_var.get()
@@ -620,7 +609,9 @@ class MUDClient:
             del self.profiles[profile_name]
             self.save_profiles()
             self.profile_var.set('')
+            self.current_profile = None
             self.update_profile_list()
+            self._status_profile_label.config(text="")
         
     def toggle_connection(self):
         """Toggle connection state"""
@@ -631,15 +622,19 @@ class MUDClient:
     
     def connect(self):
         """Establish SSL connection to MUD server"""
-        host = self.host_entry.get().strip()
-        try:
-            port = int(self.port_entry.get().strip())
-        except ValueError:
-            messagebox.showerror("Error", "Invalid port number")
+        if not self.current_profile or self.current_profile not in self.profiles:
+            messagebox.showerror("Error", "Please select a profile before connecting.")
             return
-        
+        profile = self.profiles[self.current_profile]
+        host = profile.get('host', '').strip()
+        try:
+            port = int(profile.get('port', '4000'))
+        except ValueError:
+            messagebox.showerror("Error", "Invalid port number in profile")
+            return
+
         if not host:
-            messagebox.showerror("Error", "Please enter a host address")
+            messagebox.showerror("Error", "No host configured in profile")
             return
         
         try:
@@ -659,34 +654,39 @@ class MUDClient:
             self.ssl_socket.connect((host, port))
             
             self.connected = True
-            self.status_label.config(text="Connected", foreground="green")
-            self.connect_btn.config(text="Disconnect")
+            self._status_conn_label.config(text="Connected", foreground="green")
+            self._conn_menu.entryconfig("Connect", label="Disconnect")
             self.send_btn.config(state=tk.NORMAL)
-            self.send_char_btn.config(state=tk.NORMAL)
-            self.send_pass_btn.config(state=tk.NORMAL)
-            self.send_remember_btn.config(state=tk.NORMAL)
-            self.quit_btn.config(state=tk.NORMAL)
-            self.ai_mode_btn.config(state=tk.NORMAL)
-            self.host_entry.config(state=tk.DISABLED)
-            self.port_entry.config(state=tk.DISABLED)
-            
+            self._conn_menu.entryconfig("Send Character Name", state=tk.NORMAL)
+            self._conn_menu.entryconfig("Send Password", state=tk.NORMAL)
+            self._conn_menu.entryconfig("Send & Remember", state=tk.NORMAL)
+            self._conn_menu.entryconfig("Quit MUD", state=tk.NORMAL)
+
             self.append_text(f"Connected successfully!\n", "system")
             self.session_logger.open()
-            self._log_label.config(
+            self._status_log_label.config(
                 text=f"Log: {os.path.basename(self.session_logger.path)}",
                 foreground="green")
-            
+
+            # Initialize AI agent (for room collection) and LLM advisor
+            from ai_agent import ExplorationAgent
+            from llm_advisor import LLMAdvisor
+            if not self.ai_agent:
+                self.ai_agent = ExplorationAgent(self)
+            self.ai_agent.start()
+            if not self.llm_advisor:
+                self.llm_advisor = LLMAdvisor(self)
+            self.llm_advisor.reset_history()
+
             # Save this as the last connected profile
             if self.current_profile:
                 self.save_last_profile(self.current_profile)
-            
+
             # Check if autologin should be performed
-            if self.current_profile and self.current_profile in self.profiles:
-                profile = self.profiles[self.current_profile]
-                if profile.get('character') and profile.get('password'):
-                    self.autologin_pending = True
-                    self.autologin_stage = 0
-                    self.append_text("Autologin enabled for this profile\n", "system")
+            if profile.get('character') and profile.get('password'):
+                self.autologin_pending = True
+                self.autologin_stage = 0
+                self.append_text("Autologin enabled for this profile\n", "system")
             
             # Start receiving thread
             self.receive_thread = threading.Thread(target=self.receive_data, daemon=True)
@@ -709,23 +709,26 @@ class MUDClient:
         """Disconnect from MUD server"""
         self.connected = False
         self.cleanup_connection()
-        self.status_label.config(text="Disconnected", foreground="red")
-        self.connect_btn.config(text="Connect")
+        self._status_conn_label.config(text="Disconnected", foreground="red")
+        self._conn_menu.entryconfig("Disconnect", label="Connect")
         self.send_btn.config(state=tk.DISABLED)
-        self.send_char_btn.config(state=tk.DISABLED)
-        self.send_pass_btn.config(state=tk.DISABLED)
-        self.send_remember_btn.config(state=tk.DISABLED)
-        self.quit_btn.config(state=tk.DISABLED)
-        self.ai_mode_btn.config(state=tk.DISABLED)
+        self._conn_menu.entryconfig("Send Character Name", state=tk.DISABLED)
+        self._conn_menu.entryconfig("Send Password", state=tk.DISABLED)
+        self._conn_menu.entryconfig("Send & Remember", state=tk.DISABLED)
+        self._conn_menu.entryconfig("Quit MUD", state=tk.DISABLED)
         if self.ai_agent and self.ai_agent.is_running:
             self.ai_agent.stop()
+        if self.llm_advisor and self.llm_advisor.is_available():
+            self.llm_advisor.generate_session_summary(self._on_session_summary)
         self.session_logger.close()
-        self._log_label.config(text="Log: off", foreground="gray")
+        self._status_log_label.config(text="Log: off", foreground="gray")
         self.quit_pending = False
         self.quit_stage = 0
         self.quit_prompts_seen = []
-        self.host_entry.config(state=tk.NORMAL)
-        self.port_entry.config(state=tk.NORMAL)
+        self._pending_command = None
+        self._response_buffer = []
+        self._advisor_busy = False
+        self._advisor_queue.clear()
         self.triggered_once_responses.clear()  # Reset run-once tracking
         self.append_text("Disconnected from server\n", "system")
     
@@ -763,6 +766,7 @@ class MUDClient:
                 except UnicodeDecodeError:
                     # Try latin-1 as fallback
                     text = data.decode('latin-1', errors='replace')
+                text = text.replace('\r', '')  # strip CR from CRLF line endings
                 
                 # Parse ANSI color codes
                 parsed_segments = self.parse_ansi_text(text)
@@ -780,13 +784,23 @@ class MUDClient:
                 clean_text = self.strip_ansi_codes(text)
                 self.session_logger.log_received(clean_text)
                 
-                # Track last non-empty line for prompt learning
+                # Track last non-empty line for prompt learning and advisor trigger
                 lines = clean_text.strip().split('\n')
                 for line in reversed(lines):
                     if line.strip():
                         self.last_line = line.strip()
                         break
-                
+
+                # Accumulate MUD response for LLM advisor
+                if self._pending_command is not None:
+                    for ln in clean_text.splitlines():
+                        if ln.strip():
+                            self._response_buffer.append(ln.rstrip())
+                    # Detect MUD command prompt — trigger advisor when prompt arrives
+                    if self.last_line.rstrip().endswith('>') and self._advisor_active \
+                            and self.llm_advisor:
+                        self.master.after(0, self._trigger_advisor)
+
                 # Handle autologin (use clean text without ANSI codes)
                 if self.autologin_pending and self.current_profile:
                     self.handle_autologin(clean_text)
@@ -1035,7 +1049,7 @@ class MUDClient:
     def toggle_room_tracking(self):
         """Toggle room tracking feature"""
         self.room_tracking_enabled = self.room_tracking_var.get()
-        
+
         if self.room_tracking_enabled:
             # Initialize room data in profile if it doesn't exist
             if self.current_profile and self.current_profile in self.profiles:
@@ -1043,33 +1057,44 @@ class MUDClient:
                     self.profiles[self.current_profile]['rooms'] = {}
                 if 'room_links' not in self.profiles[self.current_profile]:
                     self.profiles[self.current_profile]['room_links'] = {}
-                
+
                 # Save tracking enabled state to profile
                 self.profiles[self.current_profile]['room_tracking_enabled'] = True
                 self.save_profiles()
-                
-                room_count = len(self.profiles[self.current_profile].get('rooms', {}))
-                self.room_tracking_status.config(
-                    text=f"Tracking enabled ({room_count} rooms mapped)",
-                    foreground="green"
-                )
+                self._update_status_bar()
                 self.append_text("[Room tracking enabled - will detect and map rooms]\n", "system")
-                
+
                 if self.room_color:
                     self.append_text(f"[Room color detected: {self.room_color}]\n", "system")
                 else:
                     self.append_text("[Room color not yet detected - will identify on first movement]\n", "system")
             else:
-                self.room_tracking_status.config(text="No profile selected", foreground="red")
                 self.room_tracking_var.set(False)
                 self.room_tracking_enabled = False
+                self.append_text("[Room tracking: no profile selected]\n", "system")
         else:
-            self.room_tracking_status.config(text="", foreground="gray")
+            self._update_status_bar()
             if self.current_profile and self.current_profile in self.profiles:
                 self.profiles[self.current_profile]['room_tracking_enabled'] = False
                 self.save_profiles()
             self.append_text("[Room tracking disabled]\n", "system")
-    
+
+    def _update_status_bar(self):
+        """Refresh all status bar labels from current state."""
+        if self.room_tracking_enabled and self.current_profile and \
+                self.current_profile in self.profiles:
+            room_count = len(self.profiles[self.current_profile].get('rooms', {}))
+            self._status_rooms_label.config(
+                text=f"Rooms: {room_count}", foreground="green")
+        else:
+            self._status_rooms_label.config(text="", foreground="gray")
+
+    def toggle_advisor(self):
+        """Toggle the LLM advisor on/off from the Settings menu."""
+        self._advisor_active = self._advisor_var.get()
+        state = "enabled" if self._advisor_active else "disabled"
+        self.append_text(f"[LLM Advisor {state}]\n", "system")
+
     def detect_room_color(self, segments):
         """Detect the color used for room names by looking for bluish colors"""
         # Look for bluish colors in the segments (blues and cyans)
@@ -1116,11 +1141,7 @@ class MUDClient:
                     self.save_profiles()
                 
                 if self.room_tracking_enabled:
-                    room_count = len(self.profiles[self.current_profile].get('rooms', {}))
-                    self.room_tracking_status.config(
-                        text=f"Tracking enabled ({room_count} rooms mapped)",
-                        foreground="green"
-                    )
+                    self._update_status_bar()
         
         if not self.room_color:
             return None
@@ -1239,6 +1260,8 @@ class MUDClient:
                 self.append_text(f"[Entry room detected: {room_data['name']}]\n", "system")
                 self.detect_entry_room = False
                 self.current_room_hash = room_hash
+                if self.llm_advisor:
+                    self.llm_advisor.send_initial_context()
             
             # Handle directional links (if we moved from another room)
             elif self.previous_room_hash and self.last_movement_direction:
@@ -1258,30 +1281,22 @@ class MUDClient:
                 
                 if is_new_room:
                     self.save_profiles()
-                    room_count = len(rooms)
-                    self.room_tracking_status.config(
-                        text=f"Tracking enabled ({room_count} rooms mapped)",
-                        foreground="green"
-                    )
-                    self.append_text(f"[New room mapped: {room_data['name']} (Total: {room_count})]\n", "system")
+                    self._update_status_bar()
+                    self.append_text(f"[New room mapped: {room_data['name']} (Total: {len(rooms)})]\n", "system")
                 else:
                     self.save_profiles()
                     self.append_text(f"[Moved {direction} to: {room_data['name']}]\n", "system")
-                
+
                 # Reset movement tracking
                 self.last_movement_direction = None
-            
+
             else:
                 # Just looking at current room
                 self.current_room_hash = room_hash
                 if is_new_room:
                     self.save_profiles()
-                    room_count = len(rooms)
-                    self.room_tracking_status.config(
-                        text=f"Tracking enabled ({room_count} rooms mapped)",
-                        foreground="green"
-                    )
-                    self.append_text(f"[New room mapped: {room_data['name']} (Total: {room_count})]\n", "system")
+                    self._update_status_bar()
+                    self.append_text(f"[New room mapped: {room_data['name']} (Total: {len(rooms)})]\n", "system")
             
             self.expecting_room_data = False
 
@@ -1359,6 +1374,12 @@ class MUDClient:
             self._dump_ai_debug()
             return
 
+        # Direct LLM prompt — starts with \
+        if message.startswith('\\'):
+            self.input_entry.delete(0, tk.END)
+            self._send_direct_llm_prompt(message[1:].strip())
+            return
+
         try:
             # If in quit sequence and user manually sends something, learn it
             if self.quit_pending and self.last_line:
@@ -1381,6 +1402,9 @@ class MUDClient:
             # Send message with newline
             self.ssl_socket.sendall((message + "\n").encode('utf-8'))
             self.append_text(f"> {message}\n", "user")
+            # Record for LLM advisor trigger on next MUD prompt
+            self._pending_command = message
+            self._response_buffer = []
             self.input_entry.delete(0, tk.END)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to send message: {str(e)}")
@@ -1410,29 +1434,123 @@ class MUDClient:
             self.append_text(f"[AI] Send failed: {str(e)}\n", "error")
             return False
 
+    # ------------------------------------------------------------------
+    # LLM Advisor
+    # ------------------------------------------------------------------
+
+    def _trigger_advisor(self):
+        """Called on the main thread when a MUD prompt is detected after a command."""
+        if not self._pending_command or not self.llm_advisor:
+            return
+        command = self._pending_command
+        lines = list(self._response_buffer)
+        self._pending_command = None
+        self._response_buffer = []
+
+        event = {'command': command, 'mud_lines': lines}
+
+        if self._advisor_busy:
+            # LLM still processing — queue this event for the next call
+            self._advisor_queue.append(event)
+            return
+
+        self._advisor_busy = True
+        self._fire_advisor([event])
+
+    def _fire_advisor(self, events):
+        """Start an LLM advisor call for the given list of events."""
+        room_data = None
+        if self.current_room_hash and self.current_profile:
+            rooms = self.profiles.get(self.current_profile, {}).get('rooms', {})
+            room_data = rooms.get(self.current_room_hash)
+        self.llm_advisor.request_advice(events, room_data, self._on_advisor_result)
+
+    def _on_advisor_result(self, advice):
+        """Called on the main thread when the LLM advisor responds."""
+        if advice:
+            self.append_advisor_text(advice)
+            self.session_logger.log_advisor(advice)
+
+        if self._advisor_queue:
+            queued = list(self._advisor_queue)
+            self._advisor_queue.clear()
+            # Split into leading MUD events and everything else.
+            # Process the first contiguous run of MUD events as one batch,
+            # then re-queue the remainder (which may start with a direct prompt).
+            mud_events = []
+            remainder = []
+            hit_direct = False
+            for item in queued:
+                if not hit_direct and item.get('direct_prompt') is None:
+                    mud_events.append(item)
+                else:
+                    hit_direct = True
+                    remainder.append(item)
+            self._advisor_queue.extend(remainder)
+            if mud_events:
+                self._fire_advisor(mud_events)
+            else:
+                # First item is a direct prompt
+                direct = self._advisor_queue.pop(0)
+                self.llm_advisor.request_direct(
+                    direct['direct_prompt'], self._on_advisor_result)
+        else:
+            # Nothing queued — go idle; next prompt will re-arm naturally
+            self._advisor_busy = False
+
+    def _send_direct_llm_prompt(self, prompt):
+        """Send a freeform prompt directly to the LLM advisor."""
+        if not prompt:
+            return
+        if not self.llm_advisor or not self.llm_advisor.is_available():
+            self.append_advisor_text("[No LLM configured]")
+            return
+        self.append_text(f"\\ {prompt}\n", "user")
+        self.session_logger.log_command(f"\\ {prompt}")
+        if self._advisor_busy:
+            self._advisor_queue.append({'direct_prompt': prompt})
+            return
+        self._advisor_busy = True
+        self.llm_advisor.request_direct(prompt, self._on_advisor_result)
+
+    def _on_session_summary(self, summary):
+        """Called on the main thread when the end-of-session summary is ready."""
+        if not summary or not self.current_profile:
+            return
+        from datetime import datetime
+        profile = self.profiles.get(self.current_profile, {})
+        ctx = profile.setdefault('advisor_context', {})
+        ctx['session_summary'] = summary
+        ctx['session_summary_ts'] = datetime.now().isoformat()
+        ctx['total_sessions'] = ctx.get('total_sessions', 0) + 1
+        self.save_profiles()
+        self.session_logger.log_session_summary(summary)
+
+    def append_advisor_text(self, text):
+        """Display advisor text in the advisor pane."""
+        self.advisor_area.config(state=tk.NORMAL)
+        self.advisor_area.insert(tk.END, "[Advisor] ", "advisor_prefix")
+        self.advisor_area.insert(tk.END, text.strip() + "\n\n", "advisor_body")
+        self.advisor_area.tag_config("advisor_prefix", foreground="#89d185",
+                                     font=("Courier", 10, "bold"))
+        self.advisor_area.tag_config("advisor_body", foreground="#c8c8c8")
+        self.advisor_area.see(tk.END)
+        self.advisor_area.config(state=tk.DISABLED)
+
+    def clear_advisor(self):
+        """Clear the advisor output pane."""
+        self.advisor_area.config(state=tk.NORMAL)
+        self.advisor_area.delete(1.0, tk.END)
+        self.advisor_area.config(state=tk.DISABLED)
+
     def _on_speed_change(self, value):
-        """Update AI agent command delay from the speed slider."""
-        ms = int(float(value))
-        self._ai_speed_label.config(text=f"{ms/1000:.1f}s")
+        """Update AI agent command delay from the speed slider (legacy)."""
         if self.ai_agent:
-            self.ai_agent.COMMAND_DELAY_MS = ms
+            self.ai_agent.COMMAND_DELAY_MS = int(float(value))
 
     def toggle_ai_mode(self):
-        """Toggle the autonomous AI exploration agent on or off."""
-        if self.ai_agent and self.ai_agent.is_running:
-            self.ai_agent.stop()
-            self.ai_mode_btn.config(text="AI Mode: OFF")
-            self.append_text("[AI mode disabled]\n", "system")
-        else:
-            if not self.room_tracking_enabled:
-                messagebox.showwarning("AI Mode", "Please enable Room Tracking before starting AI Mode.")
-                return
-            from ai_agent import ExplorationAgent
-            if not self.ai_agent:
-                self.ai_agent = ExplorationAgent(self)
-            self.ai_agent.start()
-            self.ai_mode_btn.config(text="AI Mode: ON")
-            self.append_text("[AI mode enabled — autonomous exploration started]\n", "system")
+        """Toggle the autonomous AI exploration agent on or off (legacy — autonomous disabled)."""
+        pass
 
     def open_ai_config(self):
         """Open the AI configuration dialog for the current profile."""
@@ -1979,7 +2097,7 @@ class ProfileDialog:
         self.password_entry.insert(0, password)
         
         # Note about prompts
-        note = ttk.Label(self.dialog, text="Note: Use 'Send Char Name' and 'Send Password' buttons\nto automatically learn login prompts", 
+        note = ttk.Label(self.dialog, text="Note: Use Connection > 'Send Character Name' and 'Send Password'\nto automatically learn login prompts",
                         foreground="gray", font=("TkDefaultFont", 8))
         note.grid(row=5, column=0, columnspan=2, pady=8)
         

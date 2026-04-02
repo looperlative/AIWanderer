@@ -3,9 +3,11 @@
 """
 LLM Advisor for AIWanderer.
 
-Calls a local Ollama instance (or the Claude API) to decide what to do
-in situations the rule-based explorer can't handle — unexplored areas
-that require non-movement commands, NPC interaction, puzzle text, etc.
+In human-play mode the LLM acts as a real-time advisor: it observes
+every command the human types and the MUD's response, then offers brief
+free-text tactical commentary.  It also retains a legacy request_action()
+interface (gated behind AUTONOMOUS_DISABLED in ai_agent.py) for possible
+future restoration of automated play.
 
 Uses only Python stdlib (http.client, json, threading) — no external deps.
 
@@ -24,11 +26,25 @@ import http.client
 import json
 import re
 import threading
-import time
 import urllib.parse
 
 
-SYSTEM_PROMPT = """You are an AI player in a MUD (Multi-User Dungeon), a text-based \
+ADVISOR_SYSTEM_PROMPT = """You are a knowledgeable advisor watching a human play a \
+text-based MUD (Multi-User Dungeon) fantasy RPG. The player types commands and you \
+see what the MUD responds.
+
+Your role:
+- Provide brief, helpful tactical commentary after each command and response.
+- Describe what just happened in plain language if it is not obvious.
+- Point out anything the player should watch for (danger, opportunities, status effects).
+- Suggest what the player might consider doing next — but do not issue commands yourself.
+- Be concise: 2–4 sentences is ideal. Avoid restating what the MUD already said clearly.
+- If nothing noteworthy happened (e.g. routine movement with no threats), keep it very brief.
+- Flag low health, hunger, thirst, or nearby danger prominently.
+- If the player seems stuck or is repeating commands without progress, say so and suggest alternatives."""
+
+# Legacy prompt kept for potential restoration of autonomous play mode.
+ACTION_SYSTEM_PROMPT = """You are an AI player in a MUD (Multi-User Dungeon), a text-based \
 fantasy RPG. Your goal is to explore the world, gain experience, and survive.
 
 Rules:
@@ -50,20 +66,21 @@ say <text>, kill <mob>, flee, score, inventory, buy <item>, eat <item>, drink <s
 
 class LLMAdvisor:
     """
-    Calls an LLM to suggest a MUD command given the current game state.
+    Calls an LLM to advise a human MUD player in real time.
 
     All network I/O runs in a background thread so the tkinter main loop
     is never blocked.  Results are delivered via a callback scheduled on
     the main thread with master.after(0, ...).
     """
 
-    MIN_CALL_INTERVAL = 8.0   # seconds between LLM calls (rate limit)
-
     def __init__(self, client):
         self.client = client          # MUDClient instance
-        self._last_call_time = 0.0
-        self._call_in_flight = False
         self._call_count = 0
+        self._messages = []           # in-session conversation history
+        self._history_limit = 100     # max user+assistant pairs to keep
+        self._is_first_message = True # send full state on first turn only
+        self._last_inventory = None   # track inventory for change detection
+        self._last_equipment = None   # track equipment for change detection
 
     # ------------------------------------------------------------------
     # Public API
@@ -74,31 +91,90 @@ class LLMAdvisor:
         cfg = self._config()
         return cfg is not None and bool(cfg.get('llm_backend'))
 
-    def is_ready(self):
-        """Return True if enough time has passed since the last call."""
-        return (not self._call_in_flight and
-                time.monotonic() - self._last_call_time >= self.MIN_CALL_INTERVAL)
+    def reset_history(self):
+        """Clear in-session conversation history. Called at each new connection."""
+        self._messages = []
+        self._is_first_message = True
+        self._last_inventory = None
+        self._last_equipment = None
+
+    def request_advice(self, events, room_data, on_result):
+        """
+        Asynchronously request advisor commentary from the LLM.
+
+        events    — list of dicts with keys 'command' (str) and 'mud_lines' (list[str]).
+                    Typically one entry, but may contain several when events were
+                    batched while a previous LLM call was in flight.
+        room_data — dict with name, description, exits from the room DB (or None)
+        on_result — callable(advice: str | None) called on the main thread
+        """
+        context = {
+            'events': events,
+            'room_name': room_data.get('name', '') if room_data else '',
+            'room_description': room_data.get('description', '') if room_data else '',
+            'room_exits': room_data.get('exits', '') if room_data else '',
+        }
+        self._call_count += 1
+        thread = threading.Thread(
+            target=self._advice_worker,
+            args=(context, on_result),
+            daemon=True,
+            name=f"llm-advisor-{self._call_count}"
+        )
+        thread.start()
 
     def request_action(self, context, on_result):
         """
-        Asynchronously request an action from the LLM.
+        Asynchronously request an action from the LLM (legacy autonomous-play API).
 
         context   — dict produced by build_context()
         on_result — callable(command: str | None) called on the main thread
         """
-        if not self.is_ready():
-            on_result(None)
-            return
-
-        self._call_in_flight = True
-        self._last_call_time = time.monotonic()
         self._call_count += 1
 
         thread = threading.Thread(
             target=self._worker,
             args=(context, on_result),
             daemon=True,
-            name=f"llm-advisor-{self._call_count}"
+            name=f"llm-action-{self._call_count}"
+        )
+        thread.start()
+
+    def request_direct(self, prompt, on_result):
+        """
+        Asynchronously send a freeform user prompt into the advisor conversation.
+
+        The prompt is injected as a user turn so the LLM replies in its advisor
+        persona with full conversation history available.
+        on_result — callable(reply: str | None) called on the main thread
+        """
+        self._call_count += 1
+        thread = threading.Thread(
+            target=self._direct_worker,
+            args=(prompt, on_result),
+            daemon=True,
+            name=f"llm-direct-{self._call_count}"
+        )
+        thread.start()
+
+    def generate_session_summary(self, on_result):
+        """
+        Asynchronously generate a session summary for cross-session persistence.
+
+        Fires a one-shot LLM call summarising the advisor's own output from this
+        session.  on_result(summary: str | None) is called on the main thread.
+        """
+        assistant_turns = [m['content'] for m in self._messages
+                           if m['role'] == 'assistant']
+        if not assistant_turns:
+            self.client.master.after(0, lambda: on_result(None))
+            return
+        self._call_count += 1
+        thread = threading.Thread(
+            target=self._summary_worker,
+            args=(assistant_turns, on_result),
+            daemon=True,
+            name=f"llm-summary-{self._call_count}"
         )
         thread.start()
 
@@ -195,7 +271,7 @@ class LLMAdvisor:
                 for e in recent
             ],
             'danger_rooms':  list(ai_state.get('danger_rooms', {}).keys()),
-            'recent_mud_text': recent_mud[-20:],  # last 20 lines the MUD sent
+            'recent_mud_text': recent_mud[-60:],  # last 60 lines the MUD sent
             'loop_warnings': loop_warnings,
             'npc_summary': npc_summary,
             'current_goal': ai_state.get('current_goal', 'explore'),
@@ -269,12 +345,350 @@ class LLMAdvisor:
     # Internal — runs in background thread
     # ------------------------------------------------------------------
 
-    def _worker(self, context, on_result):
+    def _advice_worker(self, context, on_result):
+        """Background worker for request_advice()."""
         logger = self.client.session_logger
-        prompt = self._build_user_message(context)
-        logger.log_llm_prompt(f"[system]\n{SYSTEM_PROMPT}\n[user]\n{prompt}")
+        self._trim_history()
+        system_prompt = self._build_system_prompt()
+        user_msg = self._build_advisor_message(context)
+        self._messages.append({"role": "user", "content": user_msg})
+        self._is_first_message = False
+        logger.log_llm_prompt(f"[system]\n{system_prompt}\n[user]\n{user_msg}")
+        advice = None
         try:
-            raw_response = self._call_llm(context)
+            advice = self._call_backend(system_prompt, list(self._messages), max_tokens=1024)
+            logger.log_llm_response(advice)
+            if advice:
+                self._messages.append({"role": "assistant", "content": advice})
+        except Exception as e:
+            # Remove the user turn we just appended so history stays consistent
+            if self._messages and self._messages[-1]['role'] == 'user':
+                self._messages.pop()
+                self._is_first_message = True
+            msg = str(e)
+            self.client.master.after(
+                0, lambda m=msg: self.client.append_advisor_text(
+                    f"[Advisor error: {m}]"))
+        self.client.master.after(0, lambda: on_result(advice))
+
+    def _direct_worker(self, prompt, on_result):
+        """Background worker for request_direct()."""
+        logger = self.client.session_logger
+        self._trim_history()
+        system_prompt = self._build_system_prompt()
+        self._messages.append({"role": "user", "content": prompt})
+        self._is_first_message = False
+        logger.log_llm_prompt(f"[direct]\n{prompt}")
+        reply = None
+        try:
+            reply = self._call_backend(system_prompt, list(self._messages), max_tokens=1024)
+            logger.log_llm_response(reply)
+            if reply:
+                self._messages.append({"role": "assistant", "content": reply})
+        except Exception as e:
+            if self._messages and self._messages[-1]['role'] == 'user':
+                self._messages.pop()
+                self._is_first_message = True
+            msg = str(e)
+            self.client.master.after(
+                0, lambda m=msg: self.client.append_advisor_text(f"[Advisor error: {m}]"))
+        self.client.master.after(0, lambda: on_result(reply))
+
+    def _summary_worker(self, assistant_turns, on_result):
+        """Background worker for generate_session_summary()."""
+        recent = assistant_turns[-30:]
+        advice_block = "\n---\n".join(recent)
+        system = (
+            "You are a session summarizer for a MUD (text RPG) advisor. "
+            "Write a detailed briefing (500 words max) for yourself to read at "
+            "the START of the next session. Cover: where the player is or was, "
+            "every danger or NPC noted (including names and threat level), "
+            "active goals and their progress, character state (level, class, stats "
+            "if known), any tactical patterns you observed, and anything else that "
+            "would help you pick up where you left off without losing context. "
+            "Write in third person about the player. Be specific and factual — "
+            "this replaces your memory of the session."
+        )
+        user = (
+            "Here is your advisory output from the session that just ended:\n\n"
+            + advice_block
+            + "\n\nWrite the session summary now."
+        )
+        summary = None
+        try:
+            summary = self._call_backend(
+                system, [{"role": "user", "content": user}], max_tokens=1000)
+            if summary:
+                summary = summary.strip()[:8000]
+        except Exception:
+            pass
+        self.client.master.after(0, lambda: on_result(summary))
+
+    def _build_system_prompt(self):
+        """Build the system prompt, appending any saved cross-session summary."""
+        prompt = ADVISOR_SYSTEM_PROMPT
+        if not self.client.current_profile:
+            return prompt
+        profile = self.client.profiles.get(self.client.current_profile, {})
+        ctx = profile.get('advisor_context', {})
+        summary = ctx.get('session_summary', '')
+        if not summary:
+            return prompt
+        ts = ctx.get('session_summary_ts', '')[:10]
+        n = ctx.get('total_sessions', '')
+        label = f"session #{n}, {ts}" if ts else f"session #{n}"
+        prompt += (
+            f"\n\nContext from your last session ({label}):\n{summary}"
+        )
+        return prompt
+
+    def _trim_history(self):
+        """Drop the oldest turns so the history stays within _history_limit pairs."""
+        cap = self._history_limit * 2
+        if len(self._messages) > cap:
+            self._messages = self._messages[-cap:]
+
+    def _build_game_state_block(self):
+        """
+        Build a concise structured game-state block from the current profile and
+        agent state.  Mirrors the context that the autonomous agent already uses.
+        """
+        if not self.client.current_profile:
+            return ""
+        profile = self.client.profiles.get(self.client.current_profile, {})
+        ai_state = profile.get('ai_state', {})
+        agent = self.client.ai_agent
+        parts = []
+
+        # --- Always include: volatile state that changes turn-to-turn ---
+
+        hp  = ai_state.get('current_hp')
+        mp  = ai_state.get('current_mp')
+        mv  = ai_state.get('current_mv')
+        max_hp = ai_state.get('max_hp')
+        max_mp = ai_state.get('max_mp')
+        max_mv = ai_state.get('max_mv')
+        if hp is not None:
+            hp_str = f"{hp}/{max_hp}" if max_hp else str(hp)
+            mp_str = f"{mp}/{max_mp}" if max_mp else str(mp)
+            mv_str = f"{mv}/{max_mv}" if max_mv else str(mv)
+            parts.append(f"Stats: {hp_str}HP  {mp_str}MP  {mv_str}MV")
+
+        needs = []
+        if ai_state.get('hunger_level'): needs.append(f"hunger:{ai_state['hunger_level']}")
+        if ai_state.get('thirst_level'): needs.append(f"thirst:{ai_state['thirst_level']}")
+        if needs:
+            parts.append("Needs: " + ", ".join(needs))
+
+        in_combat = agent._combat_active if agent else False
+        if in_combat:
+            npc = (agent._combat_npc or agent._last_combat_npc) if agent else None
+            parts.append(f"IN COMBAT with: {npc or 'unknown'}")
+
+        # --- Include when changed since last message ---
+
+        inventory = ai_state.get('inventory', [])
+        if inventory != self._last_inventory:
+            if inventory:
+                parts.append("Carrying: " + ", ".join(inventory))
+            elif self._last_inventory:
+                parts.append("Carrying: (nothing)")
+            self._last_inventory = list(inventory)
+
+        equipment = ai_state.get('equipment', {})
+        if equipment != self._last_equipment:
+            if equipment:
+                parts.append("Equipped: " + "; ".join(f"{s}: {i}" for s, i in equipment.items()))
+            self._last_equipment = dict(equipment)
+
+        # --- First message only: static / slowly-changing state ---
+
+        if self._is_first_message:
+            char_parts = []
+            if ai_state.get('char_level'):  char_parts.append(f"Level {ai_state['char_level']}")
+            if ai_state.get('char_class'):  char_parts.append(ai_state['char_class'])
+            xp = ai_state.get('char_xp')
+            if xp is not None:
+                xp_str = f"{xp}/{ai_state['char_xp_next']}" if ai_state.get('char_xp_next') else str(xp)
+                char_parts.append(f"XP {xp_str}")
+            if ai_state.get('gold') is not None:
+                char_parts.append(f"Gold {ai_state['gold']}")
+            if char_parts:
+                parts.append("Character: " + "  ".join(char_parts))
+
+        return "\n".join(parts)
+
+    def send_initial_context(self):
+        """
+        Proactively send world knowledge to the LLM right after login, before the
+        player types any commands.  Runs in a background thread so the main loop
+        is not blocked.
+        """
+        if not self.is_available():
+            return
+        self._call_count += 1
+        thread = threading.Thread(
+            target=self._initial_context_worker,
+            daemon=True,
+            name=f"llm-init-{self._call_count}"
+        )
+        thread.start()
+
+    def _initial_context_worker(self):
+        """Background worker for send_initial_context()."""
+        if not self.client.current_profile:
+            return
+        profile = self.client.profiles.get(self.client.current_profile, {})
+        ai_state = profile.get('ai_state', {})
+        world = self._build_world_knowledge_block(profile, ai_state)
+        if not world:
+            return
+        system_prompt = self._build_system_prompt()
+        user_msg = (
+            "Before we begin, here is everything known about this world from "
+            "previous sessions. Use this to inform your advice throughout our session.\n\n"
+            + world
+        )
+        self._messages.append({"role": "user", "content": user_msg})
+        self._is_first_message = False
+        logger = self.client.session_logger
+        logger.log_llm_prompt(f"[init]\n{user_msg}")
+        try:
+            reply = self._call_backend(system_prompt, list(self._messages), max_tokens=256)
+            if reply:
+                logger.log_llm_response(reply)
+                self._messages.append({"role": "assistant", "content": reply})
+        except Exception:
+            # Roll back so the next real message retries as first
+            if self._messages and self._messages[-1]['role'] == 'user':
+                self._messages.pop()
+                self._is_first_message = True
+
+    def _build_world_knowledge_block(self, profile, ai_state):
+        """
+        Build a comprehensive world-knowledge block.
+        Combines combat history (npc_danger) with the broader mob sighting
+        database (mob_db) and the full room roster.
+        """
+        rooms = profile.get('rooms', {})
+        parts = []
+
+        # --- Mob database: merge npc_danger (combat stats) + mob_db (sightings) ---
+        npc_danger = ai_state.get('npc_danger', {})
+        mob_db     = profile.get('mob_db', {})
+
+        all_mob_names = sorted(set(list(npc_danger.keys()) + list(mob_db.keys())))
+        if all_mob_names:
+            mob_lines = []
+            for name in all_mob_names:
+                danger = npc_danger.get(name, {})
+                db     = mob_db.get(name, {})
+
+                deaths     = danger.get('deaths', 0)
+                wins       = danger.get('wins', 0)
+                near_kills = danger.get('near_kills', 0)
+                fast       = danger.get('fastest_death_secs')
+                sightings  = db.get('total_sightings', 0)
+                is_wanderer = db.get('is_wanderer', False)
+                display    = db.get('display_name', name)
+
+                # Last known room (prefer combat record, fall back to mob_db)
+                last_room = danger.get('last_room') or db.get('last_room')
+                room_name = rooms.get(last_room, {}).get('name', '') if last_room else ''
+
+                xp_total = danger.get('xp_total', 0)
+                xp_kills = danger.get('xp_kills', 0)
+
+                stats = []
+                if deaths:
+                    stats.append(f"KILLED US {deaths}x")
+                    if fast:
+                        stats.append(f"fastest kill: {fast}s")
+                if wins:
+                    avg_xp = (xp_total // xp_kills) if xp_kills else None
+                    win_str = f"we won {wins}x"
+                    if avg_xp:
+                        win_str += f" (~{avg_xp} xp/kill)"
+                    stats.append(win_str)
+                if near_kills:
+                    stats.append(f"near-kills: {near_kills}")
+                if sightings and not deaths and not wins:
+                    stats.append(f"seen {sightings}x")
+                if is_wanderer:
+                    stats.append("wanderer")
+                if room_name:
+                    stats.append(f"last seen: {room_name}")
+
+                label = display if display != name else name
+                mob_lines.append(
+                    f"  {label}: " + ", ".join(stats) if stats else f"  {label}: observed"
+                )
+
+            parts.append("Known mobs:\n" + "\n".join(mob_lines))
+
+        # --- Room roster ---
+        room_links = profile.get('room_links', {})
+        current_hash = self.client.current_room_hash
+        if rooms:
+            room_lines = []
+            for h, room in rooms.items():
+                name = room.get('name', '?')
+                links = room_links.get(h, {})
+                passable = [d for d, dest in links.items() if dest is not None]
+                exit_str = ", ".join(passable) if passable else (room.get('exits', '') or "none")
+                marker = " <-- YOU ARE HERE" if h == current_hash else ""
+                room_lines.append(f"  {name} [exits: {exit_str}]{marker}")
+
+            parts.append(f"Known rooms ({len(rooms)} mapped):\n" + "\n".join(room_lines))
+
+        return "\n\n".join(parts)
+
+    def _build_advisor_message(self, context):
+        """Format one or more command+response events into the advisor user-turn message."""
+        events = context.get('events', [])
+        parts = []
+
+        if len(events) == 1:
+            ev = events[0]
+            parts.append(f'Player typed: "{ev["command"]}"')
+            parts.append("")
+            parts.append("MUD response:")
+            mud = '\n'.join(ev.get('mud_lines', [])).strip()
+            parts.append(mud if mud else "(no response)")
+        else:
+            parts.append(
+                f"The following {len(events)} commands were sent since the last advice:"
+            )
+            for i, ev in enumerate(events, 1):
+                parts.append(f"\n[{i}] Player typed: \"{ev['command']}\"")
+                mud = '\n'.join(ev.get('mud_lines', [])).strip()
+                parts.append("MUD response:")
+                parts.append(mud if mud else "(no response)")
+
+        room_name = context.get('room_name', '')
+        room_exits = context.get('room_exits', '')
+        if room_name:
+            parts.append(f"\nCurrent room: {room_name}")
+        if room_exits:
+            parts.append(f"Exits: {room_exits}")
+
+        game_state = self._build_game_state_block()
+        if game_state:
+            parts.append("\n" + game_state)
+
+        return "\n".join(parts)
+
+    def _worker(self, context, on_result):
+        """Background worker for request_action() (legacy autonomous-play API)."""
+        logger = self.client.session_logger
+        user_msg = self._build_user_message(context)
+        logger.log_llm_prompt(f"[system]\n{ACTION_SYSTEM_PROMPT}\n[user]\n{user_msg}")
+        try:
+            raw_response = self._call_backend(
+                ACTION_SYSTEM_PROMPT,
+                [{"role": "user", "content": user_msg}],
+                max_tokens=2048
+            )
             logger.log_llm_response(raw_response)
             command = self._sanitize(raw_response)
         except Exception as e:
@@ -283,23 +697,25 @@ class LLMAdvisor:
                 0, lambda m=msg: self.client.append_text(
                     f"[AI/LLM] Error: {m}\n", "error"))
             command = None
-        finally:
-            self._call_in_flight = False
 
         # Deliver result on the main thread
         self.client.master.after(0, lambda: on_result(command))
 
-    def _call_llm(self, context):
-        """Dispatch to the appropriate backend."""
+    def _call_backend(self, system_prompt, messages, max_tokens=2048):
+        """
+        Dispatch to the configured backend.
+
+        messages — list of {role, content} dicts representing the full conversation
+                   history for this call (system prompt is passed separately).
+        """
         cfg = self._config()
         if cfg is None:
             raise RuntimeError("No LLM configured. Add ai_config to profile.")
-
         backend = cfg.get('llm_backend', 'ollama').lower()
         if backend == 'ollama':
-            return self._call_ollama(cfg, context)
+            return self._call_ollama(cfg, system_prompt, messages, max_tokens)
         elif backend == 'claude':
-            return self._call_claude(cfg, context)
+            return self._call_claude(cfg, system_prompt, messages, max_tokens)
         else:
             raise RuntimeError(f"Unknown llm_backend: {backend!r}")
 
@@ -378,18 +794,13 @@ class LLMAdvisor:
         if ns.get('here'):
             parts.append("Beatable NPCs HERE: " + "; ".join(ns['here']))
         if ns.get('nearby'):
-            nearby_strs = [f"{desc} [{d} steps]" for d, desc in ns['nearby'][:4]]
+            nearby_strs = [f"{desc} [{d} steps]" for d, desc in ns['nearby']]
             parts.append("Beatable NPCs nearby: " + "; ".join(nearby_strs))
         if ns.get('distant_beatable'):
-            count = len(ns['distant_beatable'])
-            nearest_d, nearest_desc = ns['distant_beatable'][0]
-            parts.append(
-                f"Beatable NPCs further away: {count} known"
-                + (f"; nearest: {nearest_desc} [{nearest_d} steps]"
-                   if nearest_d < 999 else "")
-            )
+            distant_strs = [f"{desc} [{d} steps]" for d, desc in ns['distant_beatable']]
+            parts.append("Beatable NPCs further away: " + "; ".join(distant_strs))
         if ns.get('dangerous'):
-            parts.append("AVOID: " + "; ".join(ns['dangerous'][:5]))
+            parts.append("AVOID: " + "; ".join(ns['dangerous']))
 
         if context['recent_actions']:
             parts.append("Recent actions: " + " | ".join(context['recent_actions']))
@@ -442,8 +853,8 @@ class LLMAdvisor:
         port = parsed.port or (443 if parsed.scheme == 'https' else 80)
         use_ssl = parsed.scheme == 'https'
         if use_ssl:
-            return http.client.HTTPSConnection(host, port, timeout=30), endpoint, True
-        return http.client.HTTPConnection(host, port, timeout=30), endpoint, False
+            return http.client.HTTPSConnection(host, port, timeout=180), endpoint, True
+        return http.client.HTTPConnection(host, port, timeout=180), endpoint, False
 
     def check_ollama_model(self, cfg):
         """
@@ -475,7 +886,7 @@ class LLMAdvisor:
             f"Available models: {', '.join(available) or 'none'}"
         )
 
-    def _call_ollama(self, cfg, context):
+    def _call_ollama(self, cfg, system_prompt, messages, max_tokens=2048):
         endpoint = cfg.get('llm_endpoint', 'http://localhost:11434')
         model = cfg.get('llm_model', 'llama3.1:8b')
 
@@ -486,16 +897,11 @@ class LLMAdvisor:
 
         payload = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": self._build_user_message(context)},
-            ],
-            # "temperature": 0.3,
+            "messages": [{"role": "system", "content": system_prompt}] + messages,
             "temperature": 0.5,
-            # "max_tokens": 60,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
             "stream": False,
-            "options": {"num_ctx": 8192},
+            "options": {"num_ctx": 131072},
         }
 
         body = json.dumps(payload).encode('utf-8')
@@ -505,9 +911,9 @@ class LLMAdvisor:
         }
 
         if use_ssl:
-            conn = http.client.HTTPSConnection(host, port, timeout=30)
+            conn = http.client.HTTPSConnection(host, port, timeout=180)
         else:
-            conn = http.client.HTTPConnection(host, port, timeout=30)
+            conn = http.client.HTTPConnection(host, port, timeout=180)
 
         try:
             conn.request("POST", "/v1/chat/completions", body=body, headers=headers)
@@ -520,14 +926,13 @@ class LLMAdvisor:
             raise RuntimeError(f"Ollama returned HTTP {resp.status}: {raw[:200]}")
 
         data = json.loads(raw)
-        # Return the full content - let _sanitize() handle extraction
         return data['choices'][0]['message']['content']
 
     # ------------------------------------------------------------------
     # Claude backend
     # ------------------------------------------------------------------
 
-    def _call_claude(self, cfg, context):
+    def _call_claude(self, cfg, system_prompt, messages, max_tokens=1024):
         api_key = cfg.get('claude_api_key', '')
         if not api_key:
             raise RuntimeError("claude_api_key is not set in profile ai_config.")
@@ -536,11 +941,9 @@ class LLMAdvisor:
 
         payload = {
             "model": model,
-            "max_tokens": 60,
-            "system": SYSTEM_PROMPT,
-            "messages": [
-                {"role": "user", "content": self._build_user_message(context)},
-            ],
+            "max_tokens": max_tokens,
+            "system": system_prompt,
+            "messages": messages,
         }
 
         body = json.dumps(payload).encode('utf-8')
@@ -551,7 +954,7 @@ class LLMAdvisor:
             "anthropic-version": "2023-06-01",
         }
 
-        conn = http.client.HTTPSConnection("api.anthropic.com", timeout=30)
+        conn = http.client.HTTPSConnection("api.anthropic.com", timeout=180)
         try:
             conn.request("POST", "/v1/messages", body=body, headers=headers)
             resp = conn.getresponse()

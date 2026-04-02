@@ -393,6 +393,10 @@ class ExplorationAgent:
 
         self.llm = LLMAdvisor(client)
 
+        # Human-play mode: disable autonomous tick loop and most text parsing.
+        # Set to False to restore automated exploration behaviour.
+        self.AUTONOMOUS_DISABLED = True
+
         self.is_running = False
         self._timer_handle = None     # tkinter after() handle
         self._waiting_for_room = False
@@ -469,6 +473,13 @@ class ExplorationAgent:
     def start(self):
         """Load persisted state and begin the tick loop."""
         self.load_state()
+        self.is_running = True
+
+        if self.AUTONOMOUS_DISABLED:
+            # Human-play mode: just load state and mark running so that
+            # on_room_entered / on_text_received are called by the client.
+            return
+
         # Request score immediately on startup to detect hunger/thirst/buffs from login
         self._last_score_request = 0.0
         # Also request inventory early to see what food we have
@@ -498,7 +509,6 @@ class ExplorationAgent:
             self._wait_started = time.monotonic()
             self._look_retry_count = 0
             self.client.send_ai_command('look')
-        self.is_running = True
         # Ask Otto what he can do (once per session)
         if not self.state.otto_queried:
             self.client.master.after(
@@ -546,6 +556,8 @@ class ExplorationAgent:
 
     def _tick_body(self):
         """Inner tick logic — separated so exceptions can be caught cleanly."""
+        if self.AUTONOMOUS_DISABLED:
+            return
         if not self.is_running or not self.client.connected:
             return
 
@@ -941,9 +953,9 @@ class ExplorationAgent:
         self._heal_request_failures = 0
         self._hp_before_heal = None
 
-        # Scan room for resources — run on EVERY visit so we catch shops/water
-        # even when returning after a previous session.
-        if room_data:
+        # Scan room for resources, detect mobs, trigger autonomous actions.
+        # Gated in human-play mode — room collection (visited/frontier) still runs below.
+        if room_data and not self.AUTONOMOUS_DISABLED:
             description = room_data.get('description', '')
             objects_text = ' '.join(room_data.get('objects', []))
             full_text = room_data.get('name', '') + ' ' + description + ' ' + objects_text
@@ -1186,6 +1198,20 @@ class ExplorationAgent:
     def on_text_received(self, clean_text):
         """Called by MUDClient for every block of incoming text (main thread)."""
         if not self.is_running:
+            return
+
+        if self.AUTONOMOUS_DISABLED:
+            # Human-play mode: only maintain the recent-text buffer (fed to the LLM
+            # advisor) and parse HP stats (used for danger-room detection on room entry).
+            for line in clean_text.splitlines():
+                line = line.strip()
+                if line and not _MUD_NOISE_RE.match(line):
+                    self._recent_mud_lines.append(line)
+            stats = self.parser.parse_prompt_stats(clean_text)
+            if stats:
+                self.state.current_hp = stats.get('hp', self.state.current_hp)
+                self.state.current_mp = stats.get('mp', self.state.current_mp)
+                self.state.current_mv = stats.get('mv', self.state.current_mv)
             return
 
         # --- Otto summon success ---
@@ -1447,6 +1473,15 @@ class ExplorationAgent:
         if xp:
             self.state.total_xp_gained += xp
             self.client.append_text(f"[AI] XP gained: +{xp} (total: {self.state.total_xp_gained})\n", "system")
+            # Record XP on the mob that was just killed
+            xp_npc = self._combat_npc or self._last_combat_npc
+            if xp_npc:
+                xp_rec = self.state.npc_danger.setdefault(xp_npc, {
+                    "deaths": 0, "fastest_death_secs": None,
+                    "wins": 0, "near_kills": 0, "last_room": None,
+                })
+                xp_rec["xp_total"] = xp_rec.get("xp_total", 0) + xp
+                xp_rec["xp_kills"] = xp_rec.get("xp_kills", 0) + 1
             # XP gain is a reliable kill signal — queue looting and credit win if the
             # opp%-transition paths missed it (e.g. combat_over fired prematurely).
             for cmd in ('get all corpse', 'inventory', 'equipment'):
