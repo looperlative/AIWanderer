@@ -434,6 +434,18 @@ class MUDClient:
                                       variable=self._advisor_var,
                                       command=self.toggle_advisor)
         settings_menu.add_separator()
+
+        # Autoloot submenu
+        self._autoloot_var = tk.StringVar(value=self.profiles.get('_settings', {}).get('autoloot', 'off'))
+        autoloot_menu = tk.Menu(settings_menu, tearoff=0)
+        settings_menu.add_cascade(label="Autoloot", menu=autoloot_menu)
+        for opt in ('off', 'gold', 'all'):
+            autoloot_menu.add_radiobutton(label=opt.capitalize(),
+                                          variable=self._autoloot_var,
+                                          value=opt,
+                                          command=self._save_autoloot)
+
+        settings_menu.add_separator()
         settings_menu.add_command(label="AI Config...", command=self.open_ai_config)
         settings_menu.add_command(label="Room Colors...", command=self.open_color_calibration)
 
@@ -974,6 +986,9 @@ class MUDClient:
                 # Parse character stats and queue status panel update
                 self._parse_and_queue_stats(clean_text)
 
+                # Autoloot on kill
+                self._handle_autoloot(clean_text)
+
                 # Handle autologin (use clean text without ANSI codes)
                 if self.autologin_pending and self.current_profile:
                     self.handle_autologin(clean_text)
@@ -1398,6 +1413,36 @@ class MUDClient:
         state = "enabled" if self._advisor_active else "disabled"
         self.append_text(f"[LLM Advisor {state}]\n", "system")
 
+    def _save_autoloot(self):
+        """Persist the autoloot setting."""
+        if '_settings' not in self.profiles:
+            self.profiles['_settings'] = {}
+        self.profiles['_settings']['autoloot'] = self._autoloot_var.get()
+        self.save_profiles()
+
+    _KILL_RE = re.compile(r'^.+ is dead!\s+R\.I\.P\.$', re.MULTILINE)
+
+    def _handle_autoloot(self, text):
+        """Send loot command after a kill if autoloot is enabled.
+        Called from the receive thread — uses after() to send on the main thread."""
+        mode = self._autoloot_var.get()
+        if mode == 'off':
+            return
+        if not self._KILL_RE.search(text):
+            return
+        cmd = 'get gold corpse' if mode == 'gold' else 'get all corpse'
+        self.master.after(300, lambda: self._send_autoloot_cmd(cmd))
+
+    def _send_autoloot_cmd(self, cmd):
+        """Send the autoloot command on the main thread."""
+        if not self.connected:
+            return
+        try:
+            self.ssl_socket.sendall((cmd + '\n').encode('utf-8'))
+            self.append_text(f"[Autoloot] {cmd}\n", "system")
+        except Exception:
+            pass
+
     def detect_room_color(self, segments):
         """Detect the color used for room names by looking for bluish colors"""
         # Look for bluish colors in the segments (blues and cyans)
@@ -1743,13 +1788,24 @@ class MUDClient:
             # If in quit sequence and user manually sends something, learn it
             if self.quit_pending and self.last_line:
                 self.learn_quit_response(self.last_line, message)
-            
-            # Track movement/look commands for room tracking
+
+            # Speedwalk: a string of only n/s/e/w letters (2+ chars) expands to
+            # one command per letter, e.g. "nnew" -> "n", "n", "e", "w"
             message_lower = message.lower().strip()
+            if len(message_lower) > 1 and re.fullmatch(r'[nsew]+', message_lower):
+                self.input_entry.delete(0, tk.END)
+                payload = "".join(ch + "\n" for ch in message_lower)
+                self.ssl_socket.sendall(payload.encode('utf-8'))
+                self.append_text(f"> {message_lower}  [speedwalk: {len(message_lower)} steps]\n", "user")
+                self._pending_command = message_lower[-1]
+                self._response_buffer = []
+                return
+
+            # Track movement/look commands for room tracking
             if self.room_tracking_enabled and message_lower in self.movement_commands:
                 self.last_command = message_lower
                 self.expecting_room_data = True
-                
+
                 # Track direction if it's a movement command (not look)
                 if message_lower in self.direction_map and message_lower not in ['l', 'look']:
                     self.previous_room_hash = self.current_room_hash
@@ -1757,7 +1813,7 @@ class MUDClient:
                 else:
                     # Just looking, not moving
                     self.last_movement_direction = None
-            
+
             # Send message with newline
             self.ssl_socket.sendall((message + "\n").encode('utf-8'))
             self.append_text(f"> {message}\n", "user")

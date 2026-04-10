@@ -73,11 +73,14 @@ class LLMAdvisor:
     the main thread with master.after(0, ...).
     """
 
+    # How often (in advice calls) to inject a full game-state refresh message.
+    STATE_REFRESH_INTERVAL = 10
+
     def __init__(self, client):
         self.client = client          # MUDClient instance
         self._call_count = 0
-        self._messages = []           # in-session conversation history
-        self._history_limit = 100     # max user+assistant pairs to keep
+        self._messages = []           # persistent context: init block + direct chat only
+        self._advice_call_count = 0   # counts regular advice calls for refresh scheduling
         self._is_first_message = True # send full state on first turn only
         self._last_inventory = None   # track inventory for change detection
         self._last_equipment = None   # track equipment for change detection
@@ -94,6 +97,7 @@ class LLMAdvisor:
     def reset_history(self):
         """Clear in-session conversation history. Called at each new connection."""
         self._messages = []
+        self._advice_call_count = 0
         self._is_first_message = True
         self._last_inventory = None
         self._last_equipment = None
@@ -346,13 +350,35 @@ class LLMAdvisor:
     # ------------------------------------------------------------------
 
     def _advice_worker(self, context, on_result):
-        """Background worker for request_advice()."""
+        """Background worker for request_advice().
+
+        Each call sends: system_prompt + persistent_context + [state_refresh] + current_event.
+        Regular advice Q&A is NOT accumulated in self._messages — the LLM's large context
+        window makes per-call history unnecessary, and omitting it keeps requests small.
+        A full game-state refresh is injected every STATE_REFRESH_INTERVAL calls so the
+        LLM stays current without redundant repetition every turn.
+        """
         logger = self.client.session_logger
-        self._trim_history()
+        self._advice_call_count += 1
+        self._is_first_message = False
+
         system_prompt = self._build_system_prompt()
         user_msg = self._build_advisor_message(context)
-        self._messages.append({"role": "user", "content": user_msg})
-        self._is_first_message = False
+
+        # Build per-call message list: persistent context + optional refresh + event
+        msgs = list(self._messages)  # initial world knowledge + any direct chat
+
+        if self._advice_call_count % self.STATE_REFRESH_INTERVAL == 1:
+            # First call and every Nth call: inject a current game-state block
+            state = self._build_game_state_block()
+            if state:
+                msgs.append({"role": "user",
+                             "content": f"[State refresh]\n{state}"})
+                msgs.append({"role": "assistant",
+                             "content": "Understood, I have your current state."})
+
+        msgs.append({"role": "user", "content": user_msg})
+
         logger.log_llm_prompt(f"[system]\n{system_prompt}\n[user]\n{user_msg}")
 
         master = self.client.master
@@ -363,16 +389,11 @@ class LLMAdvisor:
 
         advice = None
         try:
-            advice = self._call_backend(system_prompt, list(self._messages),
+            advice = self._call_backend(system_prompt, msgs,
                                         max_tokens=1024, on_token=on_token)
             logger.log_llm_response(advice)
-            if advice:
-                self._messages.append({"role": "assistant", "content": advice})
             master.after(0, self.client.end_advisor_stream)
         except Exception as e:
-            if self._messages and self._messages[-1]['role'] == 'user':
-                self._messages.pop()
-                self._is_first_message = True
             master.after(0, self.client.cancel_advisor_stream)
             msg = str(e)
             master.after(0, lambda m=msg: self.client.append_advisor_text(
@@ -382,7 +403,6 @@ class LLMAdvisor:
     def _direct_worker(self, prompt, on_result):
         """Background worker for request_direct()."""
         logger = self.client.session_logger
-        self._trim_history()
         system_prompt = self._build_system_prompt()
         self._messages.append({"role": "user", "content": prompt})
         self._is_first_message = False
