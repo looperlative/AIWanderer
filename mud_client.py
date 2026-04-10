@@ -95,6 +95,14 @@ class MUDClient:
         from session_logger import SessionLogger
         self.session_logger = SessionLogger()
 
+        # Command history (within session)
+        self._cmd_history = []
+        self._cmd_history_pos = -1   # -1 = not browsing
+
+        # Command frequency scores (persistent, exponential decay per session)
+        self._cmd_scores = self.profiles.get('_settings', {}).get('cmd_scores', {})
+        self._decay_cmd_scores()
+
         # Font size (loaded from settings, default 11)
         self._font_size = self.profiles.get('_settings', {}).get('font_size', 11)
 
@@ -449,6 +457,11 @@ class MUDClient:
         settings_menu.add_command(label="AI Config...", command=self.open_ai_config)
         settings_menu.add_command(label="Room Colors...", command=self.open_color_calibration)
 
+        # Commands menu (top 20 by frequency score)
+        self._cmd_menu = tk.Menu(menubar, tearoff=0,
+                                 postcommand=self._rebuild_cmd_menu)
+        menubar.add_cascade(label="Commands", menu=self._cmd_menu)
+
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
@@ -525,6 +538,8 @@ class MUDClient:
         self.input_entry = ttk.Entry(input_frame, font=self._font_main)
         self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         self.input_entry.bind('<Return>', self.send_message)
+        self.input_entry.bind('<Up>',   self._history_prev)
+        self.input_entry.bind('<Down>', self._history_next)
 
         # Keep keyboard focus in the entry whenever the main window is active
         self.master.bind_all('<FocusIn>', self._redirect_focus_to_entry)
@@ -1121,6 +1136,33 @@ class MUDClient:
         self._font_size = 11
         self._apply_font_size()
 
+    def _history_prev(self, event):
+        """Up arrow — go back in command history."""
+        if not self._cmd_history:
+            return 'break'
+        if self._cmd_history_pos == -1:
+            self._cmd_history_pos = len(self._cmd_history) - 1
+        elif self._cmd_history_pos > 0:
+            self._cmd_history_pos -= 1
+        self._set_entry(self._cmd_history[self._cmd_history_pos])
+        return 'break'
+
+    def _history_next(self, event):
+        """Down arrow — go forward in command history."""
+        if self._cmd_history_pos == -1:
+            return 'break'
+        if self._cmd_history_pos < len(self._cmd_history) - 1:
+            self._cmd_history_pos += 1
+            self._set_entry(self._cmd_history[self._cmd_history_pos])
+        else:
+            self._cmd_history_pos = -1
+            self._set_entry('')
+        return 'break'
+
+    def _set_entry(self, text):
+        self.input_entry.delete(0, tk.END)
+        self.input_entry.insert(0, text)
+
     def _redirect_focus_to_entry(self, event):
         """Keep keyboard focus in the input entry whenever the main window is active."""
         # Allow focus in dialog boxes (Toplevel windows other than master)
@@ -1412,6 +1454,49 @@ class MUDClient:
         self._advisor_active = self._advisor_var.get()
         state = "enabled" if self._advisor_active else "disabled"
         self.append_text(f"[LLM Advisor {state}]\n", "system")
+
+    # ------------------------------------------------------------------
+    # Command frequency / quick-commands menu
+    # ------------------------------------------------------------------
+
+    _SCORE_DECAY    = 0.85   # multiplied into every score at each app start
+    _SCORE_PRUNE    = 0.05   # scores below this are removed
+    _CMD_MENU_SIZE  = 20     # entries shown in the Commands menu
+
+    def _decay_cmd_scores(self):
+        """Apply per-session exponential decay and prune near-zero scores."""
+        self._cmd_scores = {
+            cmd: score * self._SCORE_DECAY
+            for cmd, score in self._cmd_scores.items()
+            if score * self._SCORE_DECAY >= self._SCORE_PRUNE
+        }
+
+    def _record_cmd_score(self, command):
+        """Increment score for a command and persist."""
+        self._cmd_scores[command] = self._cmd_scores.get(command, 0.0) + 1.0
+        if '_settings' not in self.profiles:
+            self.profiles['_settings'] = {}
+        self.profiles['_settings']['cmd_scores'] = self._cmd_scores
+        self.save_profiles()
+
+    def _rebuild_cmd_menu(self):
+        """Populate the Commands menu with the top scored commands."""
+        self._cmd_menu.delete(0, tk.END)
+        top = sorted(self._cmd_scores.items(), key=lambda x: x[1], reverse=True)
+        top = top[:self._CMD_MENU_SIZE]
+        if not top:
+            self._cmd_menu.add_command(label="(no commands yet)", state=tk.DISABLED)
+            return
+        for cmd, score in top:
+            self._cmd_menu.add_command(
+                label=cmd,
+                command=lambda c=cmd: self._send_quick_command(c)
+            )
+
+    def _send_quick_command(self, command):
+        """Send a command chosen from the Commands menu."""
+        self._set_entry(command)
+        self.send_message()
 
     def _save_autoloot(self):
         """Persist the autoloot setting."""
@@ -1785,14 +1870,24 @@ class MUDClient:
             return
 
         try:
+            message_lower = message.lower().strip()
+
+            # Record in command history (skip duplicates of the immediately previous entry)
+            if not self._cmd_history or self._cmd_history[-1] != message:
+                self._cmd_history.append(message)
+            self._cmd_history_pos = -1
+
+            # Update persistent frequency scores (exclude movement commands)
+            if message_lower not in self.movement_commands:
+                self._record_cmd_score(message)
+
             # If in quit sequence and user manually sends something, learn it
             if self.quit_pending and self.last_line:
                 self.learn_quit_response(self.last_line, message)
 
             # Speedwalk: a string of only n/s/e/w letters (2+ chars) expands to
             # one command per letter, e.g. "nnew" -> "n", "n", "e", "w"
-            message_lower = message.lower().strip()
-            if len(message_lower) > 1 and re.fullmatch(r'[nsew]+', message_lower):
+            if len(message_lower) > 1 and re.fullmatch(r'[nsewud]+', message_lower):
                 self.input_entry.delete(0, tk.END)
                 payload = "".join(ch + "\n" for ch in message_lower)
                 self.ssl_socket.sendall(payload.encode('utf-8'))
