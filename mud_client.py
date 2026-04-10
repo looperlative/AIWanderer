@@ -10,7 +10,7 @@ import socket
 import ssl
 import threading
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, ttk, simpledialog
+from tkinter import scrolledtext, messagebox, ttk, simpledialog, font as tkfont
 import queue
 import re
 import json
@@ -94,6 +94,9 @@ class MUDClient:
         # Session logging
         from session_logger import SessionLogger
         self.session_logger = SessionLogger()
+
+        # Font size (loaded from settings, default 11)
+        self._font_size = self.profiles.get('_settings', {}).get('font_size', 11)
 
         # Character status (updated from MUD output)
         self.char_stats = {}
@@ -387,6 +390,12 @@ class MUDClient:
     
     def setup_ui(self):
         """Setup the user interface"""
+        # ── Shared font objects (updating these resizes all widgets at once) ──
+        self._font_main   = tkfont.Font(family="Courier", size=self._font_size)
+        self._font_status = tkfont.Font(family="Courier", size=self._font_size - 1)
+        self._font_status_hdr = tkfont.Font(family="Courier", size=self._font_size - 1,
+                                            weight="bold")
+
         # ── Menu bar ──────────────────────────────────────────────────
         menubar = tk.Menu(self.master)
         self.master.config(menu=menubar)
@@ -433,6 +442,10 @@ class MUDClient:
         menubar.add_cascade(label="View", menu=view_menu)
         view_menu.add_command(label="Clear MUD Output", command=self.clear_output)
         view_menu.add_command(label="Clear Advisor", command=self.clear_advisor)
+        view_menu.add_separator()
+        view_menu.add_command(label="Larger Text  (Ctrl++)", command=self._zoom_in)
+        view_menu.add_command(label="Smaller Text (Ctrl+-)", command=self._zoom_out)
+        view_menu.add_command(label="Reset Text Size (Ctrl+0)", command=self._zoom_reset)
 
         # Profile vars (profile combo is now in a menu)
         self.profile_var = tk.StringVar()
@@ -449,7 +462,7 @@ class MUDClient:
         self.text_area = scrolledtext.ScrolledText(
             paned,
             wrap=tk.WORD,
-            font=("Courier", 10),
+            font=self._font_main,
             bg="#1e1e1e",
             fg="#d4d4d4",
             insertbackground="white"
@@ -460,7 +473,7 @@ class MUDClient:
         self.advisor_area = scrolledtext.ScrolledText(
             paned,
             wrap=tk.WORD,
-            font=("Courier", 10),
+            font=self._font_main,
             bg="#1a1a2e",
             fg="#d4d4d4",
             insertbackground="white"
@@ -497,9 +510,19 @@ class MUDClient:
         input_frame = ttk.Frame(self.master)
         input_frame.pack(fill=tk.X, padx=4, pady=(0, 4))
 
-        self.input_entry = ttk.Entry(input_frame, font=("Courier", 10))
+        self.input_entry = ttk.Entry(input_frame, font=self._font_main)
         self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         self.input_entry.bind('<Return>', self.send_message)
+
+        # Keep keyboard focus in the entry whenever the main window is active
+        self.master.bind_all('<FocusIn>', self._redirect_focus_to_entry)
+        self.master.after(100, self.input_entry.focus_set)
+
+        # Font size keyboard shortcuts
+        self.master.bind_all('<Control-equal>', lambda e: self._zoom_in())
+        self.master.bind_all('<Control-plus>',  lambda e: self._zoom_in())
+        self.master.bind_all('<Control-minus>', lambda e: self._zoom_out())
+        self.master.bind_all('<Control-0>',     lambda e: self._zoom_reset())
 
         self.send_btn = ttk.Button(input_frame, text="Send", command=self.send_message,
                                    width=8)
@@ -515,8 +538,8 @@ class MUDClient:
         BG      = "#1a1a1a"
         HDR_FG  = "#4ec9b0"
         VAL_FG  = "#d4d4d4"
-        F_HDR   = ("Courier", 9, "bold")
-        F_LBL   = ("Courier", 9)
+        F_HDR   = self._font_status_hdr
+        F_LBL   = self._font_status
 
         def section(text):
             tk.Label(parent, text=f"\u2500 {text} \u2500", bg=BG, fg=HDR_FG,
@@ -630,12 +653,12 @@ class MUDClient:
                 row = tk.Frame(self._spells_frame, bg="#1a1a1a")
                 row.pack(fill=tk.X)
                 tk.Label(row, text=spell, bg="#1a1a1a", fg=OK_FG,
-                         font=("Courier", 9), anchor='w', width=10).pack(side=tk.LEFT)
+                         font=self._font_status, anchor='w', width=10).pack(side=tk.LEFT)
                 tk.Label(row, text=f"{ticks}t", bg="#1a1a1a", fg=BLUE,
-                         font=("Courier", 9), anchor='e').pack(side=tk.RIGHT)
+                         font=self._font_status, anchor='e').pack(side=tk.RIGHT)
         else:
             tk.Label(self._spells_frame, text="none", bg="#1a1a1a", fg=DIM,
-                     font=("Courier", 9), anchor='w').pack(fill=tk.X)
+                     font=self._font_status, anchor='w').pack(fill=tk.X)
 
     def update_profile_list(self):
         """Update the profile list and rebuild the profile menu"""
@@ -1061,6 +1084,38 @@ class MUDClient:
                     self._complete_autologin()
                     break
     
+    def _apply_font_size(self):
+        """Update all font objects and persist the size to settings."""
+        self._font_main.configure(size=self._font_size)
+        self._font_status.configure(size=self._font_size - 1)
+        self._font_status_hdr.configure(size=self._font_size - 1)
+        if '_settings' not in self.profiles:
+            self.profiles['_settings'] = {}
+        self.profiles['_settings']['font_size'] = self._font_size
+        self.save_profiles()
+
+    def _zoom_in(self):
+        self._font_size = min(self._font_size + 1, 32)
+        self._apply_font_size()
+
+    def _zoom_out(self):
+        self._font_size = max(self._font_size - 1, 6)
+        self._apply_font_size()
+
+    def _zoom_reset(self):
+        self._font_size = 11
+        self._apply_font_size()
+
+    def _redirect_focus_to_entry(self, event):
+        """Keep keyboard focus in the input entry whenever the main window is active."""
+        # Allow focus in dialog boxes (Toplevel windows other than master)
+        if event.widget.winfo_toplevel() is not self.master:
+            return
+        # Don't fight the entry with itself
+        if event.widget is self.input_entry:
+            return
+        self.input_entry.focus_set()
+
     def _complete_autologin(self):
         """Finalize autologin: clear pending flag and enable room tracking if needed."""
         self.autologin_pending = False
@@ -1472,6 +1527,11 @@ class MUDClient:
             spells = self.mud_parser.parse_spell_affects(text)
             updates['spells'] = spells  # replace entirely from score output
 
+        # Buff expiration messages
+        buff_events = self.mud_parser.detect_buff_events(text)
+        if buff_events['expired']:
+            updates['spells_expired'] = buff_events['expired']
+
         # Combat end detection
         if re.search(r'\b(?:is dead|has fled|you flee|you stop fighting)\b',
                      text, re.IGNORECASE):
@@ -1641,7 +1701,13 @@ class MUDClient:
                     self.append_text(msg_data, "error")
                     self.disconnect()
                 elif msg_type == "stats":
+                    expired = msg_data.pop('spells_expired', [])
                     self.char_stats.update(msg_data)
+                    if expired:
+                        spells = self.char_stats.get('spells', {})
+                        for s in expired:
+                            spells.pop(s, None)
+                        self.char_stats['spells'] = spells
                     self._update_status_panel()
                 elif msg_type == "disconnect":
                     self.append_text(msg_data, "system")

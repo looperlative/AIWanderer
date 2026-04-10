@@ -309,8 +309,8 @@ class MUDTextParser:
 
     _BUFF_EXPIRED_PATTERNS = {
         'bless':     re.compile(r'you feel less righteous', re.IGNORECASE),
-        'sanctuary': re.compile(r'you feel less protected', re.IGNORECASE),
-        'armor':     re.compile(r'you feel less (?:armored|armoured)', re.IGNORECASE),
+        'sanctuary': re.compile(r'white aura around your body fades', re.IGNORECASE),
+        'armor':     re.compile(r'you feel less protected', re.IGNORECASE),
     }
 
     def detect_buff_events(self, text):
