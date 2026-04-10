@@ -88,10 +88,19 @@ class MUDClient:
         self._advisor_active = True    # LLM advisor on/off
         self._advisor_busy = False     # True while an LLM call is in flight
         self._advisor_queue = []       # events queued while LLM is busy: list of {'command','mud_lines'}
+        self._advisor_streamed = False # True if current response was already streamed to UI
+        self._advisor_stream_start = None  # text index where streaming body began
 
         # Session logging
         from session_logger import SessionLogger
         self.session_logger = SessionLogger()
+
+        # Character status (updated from MUD output)
+        self.char_stats = {}
+
+        # Auto-score state
+        self._suppress_score_output = False
+        self._auto_score_job = None
 
         self.setup_ui()
 
@@ -428,10 +437,14 @@ class MUDClient:
         # Profile vars (profile combo is now in a menu)
         self.profile_var = tk.StringVar()
 
+        # ── Main content area (MUD pane left, status panel right) ─────
+        content_frame = tk.Frame(self.master)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 0))
+
         # ── PanedWindow: MUD output (top) + Advisor (bottom) ──────────
-        paned = tk.PanedWindow(self.master, orient=tk.VERTICAL, sashrelief=tk.RAISED,
+        paned = tk.PanedWindow(content_frame, orient=tk.VERTICAL, sashrelief=tk.RAISED,
                                sashwidth=6, bg="#3c3c3c")
-        paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 0))
+        paned.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.text_area = scrolledtext.ScrolledText(
             paned,
@@ -458,6 +471,12 @@ class MUDClient:
         # Set initial sash position after window draws
         self.master.after(100, lambda: paned.sash_place(0, 0,
             int(self.master.winfo_height() * 0.70)))
+
+        # ── Right-hand character status panel ─────────────────────────
+        status_panel = tk.Frame(content_frame, bg="#1a1a1a", width=190)
+        status_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(3, 0))
+        status_panel.pack_propagate(False)
+        self._build_status_panel(status_panel)
 
         # ── Status bar ────────────────────────────────────────────────
         status_bar = ttk.Frame(self.master, relief=tk.SUNKEN)
@@ -491,6 +510,133 @@ class MUDClient:
         self.update_profile_list()
         self._rebuild_profile_menu()
     
+    def _build_status_panel(self, parent):
+        """Build the right-hand character status panel."""
+        BG      = "#1a1a1a"
+        HDR_FG  = "#4ec9b0"
+        VAL_FG  = "#d4d4d4"
+        F_HDR   = ("Courier", 9, "bold")
+        F_LBL   = ("Courier", 9)
+
+        def section(text):
+            tk.Label(parent, text=f"\u2500 {text} \u2500", bg=BG, fg=HDR_FG,
+                     font=F_HDR, anchor='w').pack(fill=tk.X, padx=4, pady=(6, 1))
+
+        def stat_row(label, width=6):
+            row = tk.Frame(parent, bg=BG)
+            row.pack(fill=tk.X, padx=4, pady=1)
+            tk.Label(row, text=f"{label}:", bg=BG, fg=VAL_FG,
+                     font=F_LBL, anchor='w', width=width).pack(side=tk.LEFT)
+            var = tk.StringVar(value="?")
+            lbl = tk.Label(row, textvariable=var, bg=BG, fg=VAL_FG,
+                           font=F_LBL, anchor='w')
+            lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            return var, lbl
+
+        section("VITALS")
+        self._sv_hp,   self._lbl_hp   = stat_row("HP")
+        self._sv_mana, self._lbl_mana = stat_row("Mana")
+        self._sv_mv,   self._lbl_mv   = stat_row("Move")
+
+        section("CHARACTER")
+        self._sv_level, _ = stat_row("Level")
+        self._sv_ac,    _ = stat_row("AC")
+        self._sv_align, _ = stat_row("Align")
+        self._sv_xp,    _ = stat_row("XP")
+        self._sv_xp_next, _ = stat_row("To Lvl")
+        self._sv_gold,  _ = stat_row("Gold")
+
+        section("CONDITION")
+        self._sv_hunger, self._lbl_hunger = stat_row("Hunger")
+        self._sv_thirst, self._lbl_thirst = stat_row("Thirst")
+
+        section("COMBAT")
+        self._sv_fighting, self._lbl_fighting = stat_row("Fight")
+        self._sv_tank,     self._lbl_tank     = stat_row("Tank")
+        self._sv_opp,      self._lbl_opp      = stat_row("Opp")
+
+        section("SPELLS")
+        self._spells_frame = tk.Frame(parent, bg=BG)
+        self._spells_frame.pack(fill=tk.X, padx=4)
+        self._update_status_panel()
+
+    def _update_status_panel(self):
+        """Refresh all status panel labels from self.char_stats."""
+        s = self.char_stats
+        WARN  = "#f48771"
+        OK_FG = "#d4d4d4"
+        DIM   = "#666666"
+        BLUE  = "#9cdcfe"
+
+        def fmt_stat(cur_key, max_key=None):
+            cur = s.get(cur_key)
+            if max_key:
+                mx = s.get(max_key)
+                if cur is None and mx is None:
+                    return "?"
+                if mx is not None:
+                    return f"{cur if cur is not None else '?'}/{mx}"
+            return str(cur) if cur is not None else "?"
+
+        # Vitals
+        self._sv_hp.set(fmt_stat('hp', 'max_hp'))
+        if s.get('max_hp') and s.get('hp') is not None:
+            pct = s['hp'] / s['max_hp']
+            color = WARN if pct < 0.25 else "#dcdcaa" if pct < 0.5 else OK_FG
+        else:
+            color = OK_FG
+        self._lbl_hp.config(fg=color)
+
+        self._sv_mana.set(fmt_stat('mp', 'max_mp'))
+        self._sv_mv.set(fmt_stat('mv', 'max_mv'))
+
+        # Character
+        self._sv_level.set(str(s.get('level', '?')))
+        self._sv_ac.set(str(s.get('ac', '?')))
+        self._sv_align.set(str(s.get('alignment', '?')))
+        xp = s.get('xp')
+        self._sv_xp.set(f"{xp:,}" if xp is not None else "?")
+        xp_next = s.get('xp_next')
+        self._sv_xp_next.set(f"{xp_next:,}" if xp_next is not None else "?")
+        gold = s.get('gold')
+        self._sv_gold.set(f"{gold:,}" if gold is not None else "?")
+
+        # Condition
+        hunger = s.get('hunger', 'OK')
+        self._sv_hunger.set(hunger)
+        self._lbl_hunger.config(fg=WARN if hunger != 'OK' else OK_FG)
+        thirst = s.get('thirst', 'OK')
+        self._sv_thirst.set(thirst)
+        self._lbl_thirst.config(fg=WARN if thirst != 'OK' else OK_FG)
+
+        # Combat
+        fighting = s.get('fighting', False)
+        self._sv_fighting.set("YES" if fighting else "No")
+        self._lbl_fighting.config(fg=WARN if fighting else DIM)
+        tank = s.get('tank')
+        self._sv_tank.set(f"{tank}%" if tank is not None else "-")
+        self._lbl_tank.config(fg=(WARN if tank is not None and tank < 30 else OK_FG)
+                               if tank is not None else DIM)
+        opp = s.get('opp')
+        self._sv_opp.set(f"{opp}%" if opp is not None else "-")
+        self._lbl_opp.config(fg=OK_FG if opp is not None else DIM)
+
+        # Spells
+        for w in self._spells_frame.winfo_children():
+            w.destroy()
+        spells = s.get('spells', {})
+        if spells:
+            for spell, ticks in sorted(spells.items()):
+                row = tk.Frame(self._spells_frame, bg="#1a1a1a")
+                row.pack(fill=tk.X)
+                tk.Label(row, text=spell, bg="#1a1a1a", fg=OK_FG,
+                         font=("Courier", 9), anchor='w', width=10).pack(side=tk.LEFT)
+                tk.Label(row, text=f"{ticks}t", bg="#1a1a1a", fg=BLUE,
+                         font=("Courier", 9), anchor='e').pack(side=tk.RIGHT)
+        else:
+            tk.Label(self._spells_frame, text="none", bg="#1a1a1a", fg=DIM,
+                     font=("Courier", 9), anchor='w').pack(fill=tk.X)
+
     def update_profile_list(self):
         """Update the profile list and rebuild the profile menu"""
         # Filter out the _settings key from profile names
@@ -722,6 +868,7 @@ class MUDClient:
             self.llm_advisor.generate_session_summary(self._on_session_summary)
         self.session_logger.close()
         self._status_log_label.config(text="Log: off", foreground="gray")
+        self._cancel_auto_score()
         self.quit_pending = False
         self.quit_stage = 0
         self.quit_prompts_seen = []
@@ -801,6 +948,9 @@ class MUDClient:
                             and self.llm_advisor:
                         self.master.after(0, self._trigger_advisor)
 
+                # Parse character stats and queue status panel update
+                self._parse_and_queue_stats(clean_text)
+
                 # Handle autologin (use clean text without ANSI codes)
                 if self.autologin_pending and self.current_profile:
                     self.handle_autologin(clean_text)
@@ -871,19 +1021,117 @@ class MUDClient:
                         self.ssl_socket.sendall((password + "\n").encode('utf-8'))
                         self.message_queue.put(("system", "[Autologin] Sent password\n"))
                         self.autologin_stage = 2
-                        self.autologin_pending = False
-                        self.message_queue.put(("system", "[Autologin] Login sequence completed\n"))
-                        
-                        # Enable entry room detection if room tracking is enabled
-                        if self.room_tracking_enabled:
-                            self.detect_entry_room = True
-                            self.expecting_room_data = True
-                            self.message_queue.put(("system", "[Room tracking] Detecting entry room...\n"))
+                        # Stay pending — may still need to clear MOTD and main menu
                     except Exception as e:
                         self.message_queue.put(("error", f"Autologin failed: {e}\n"))
                         self.autologin_pending = False
                     break
+
+        # Stage 2+: Handle post-password prompts (MOTD, main menu) or detect game entry
+        elif self.autologin_stage >= 2:
+            for line in lines:
+                line_lower = line.strip().lower()
+
+                # MOTD "press return" prompt
+                if '*** press return' in line_lower or 'press return' in line_lower:
+                    time.sleep(0.3)
+                    try:
+                        self.ssl_socket.sendall(b"\n")
+                        self.message_queue.put(("system", "[Autologin] Cleared MOTD\n"))
+                        self.autologin_stage += 1
+                    except Exception as e:
+                        self.message_queue.put(("error", f"Autologin failed: {e}\n"))
+                        self.autologin_pending = False
+                    break
+
+                # CircleMUD main menu — enter the game
+                if 'make your choice' in line_lower:
+                    time.sleep(0.3)
+                    try:
+                        self.ssl_socket.sendall(b"1\n")
+                        self.message_queue.put(("system", "[Autologin] Selected 'Enter the game'\n"))
+                        self.autologin_stage += 1
+                    except Exception as e:
+                        self.message_queue.put(("error", f"Autologin failed: {e}\n"))
+                        self.autologin_pending = False
+                    break
+
+                # Game prompt detected — we're in
+                if line_lower.rstrip().endswith('>') and ('h ' in line_lower or 'hp' in line_lower):
+                    self._complete_autologin()
+                    break
     
+    def _complete_autologin(self):
+        """Finalize autologin: clear pending flag and enable room tracking if needed."""
+        self.autologin_pending = False
+        self.message_queue.put(("system", "[Autologin] Login sequence completed\n"))
+        if self.room_tracking_enabled:
+            self.detect_entry_room = True
+            self.expecting_room_data = True
+            self.message_queue.put(("system", "[Room tracking] Detecting entry room...\n"))
+        # Issue first score fetch after a short settle delay, then every 60 s
+        self.master.after(1500, self._send_auto_score)
+
+    def _send_auto_score(self):
+        """Send score command silently and reschedule."""
+        if not self.connected:
+            self._auto_score_job = None
+            return
+        try:
+            self._suppress_score_output = True
+            self.ssl_socket.sendall(b"score\n")
+            # Safety: clear suppression if prompt never arrives
+            self.master.after(5000, self._clear_score_suppression)
+        except Exception:
+            self._suppress_score_output = False
+        self._auto_score_job = self.master.after(60000, self._send_auto_score)
+
+    def _clear_score_suppression(self):
+        self._suppress_score_output = False
+
+    def _cancel_auto_score(self):
+        if self._auto_score_job:
+            self.master.after_cancel(self._auto_score_job)
+            self._auto_score_job = None
+        self._suppress_score_output = False
+
+    def _filter_display_segments(self, segments):
+        """Remove prompt lines and suppressed score output from display segments."""
+        # Rebuild segment list line by line so we can inspect each line independently
+        lines = []
+        current = []
+        for seg_text, color in segments:
+            parts = seg_text.split('\n')
+            for i, piece in enumerate(parts):
+                if piece:
+                    current.append((piece, color))
+                if i < len(parts) - 1:
+                    lines.append(current)
+                    current = []
+        if current:
+            lines.append(current)
+
+        result = []
+        for line_pieces in lines:
+            plain = ''.join(t for t, _ in line_pieces).strip()
+
+            if not plain:
+                result.append(('\n', '#d4d4d4'))
+                continue
+
+            # Prompt line — update stats panel, never display, clear suppression
+            if self.mud_parser.parse_prompt_stats(plain) is not None:
+                self._suppress_score_output = False
+                continue
+
+            if self._suppress_score_output:
+                continue
+
+            result.extend(line_pieces)
+            result.append(('\n', '#d4d4d4'))
+
+        return result
+
     def handle_custom_responses(self, text):
         """Handle custom learned prompt-response pairs"""
         if not self.current_profile or self.current_profile not in self.profiles:
@@ -1194,6 +1442,46 @@ class MUDClient:
         
         return None
     
+    def _parse_and_queue_stats(self, text):
+        """Parse stat/combat data from MUD text and queue a status panel update.
+        Called from the receive thread — must not touch UI directly."""
+        updates = {}
+
+        # Prompt stats: current HP/MP/MV, tank%, opp%
+        prompt = self.mud_parser.parse_prompt_stats(text)
+        if prompt:
+            for k in ('hp', 'mp', 'mv'):
+                if k in prompt:
+                    updates[k] = prompt[k]
+            if 'tank' in prompt:
+                updates['tank'] = prompt['tank']
+            if 'opp' in prompt:
+                updates['opp'] = prompt['opp']
+                updates['fighting'] = prompt['opp'] > 0
+
+        # Score block: max values, level, AC, alignment, xp, gold, hunger, thirst, spells
+        if self.mud_parser.is_score_block(text):
+            score = self.mud_parser.parse_score(text)
+            if score:
+                for k in ('level', 'ac', 'alignment', 'xp', 'xp_next',
+                          'gold', 'max_hp', 'max_mp', 'max_mv'):
+                    if k in score:
+                        updates[k] = score[k]
+                updates['hunger'] = score.get('hunger', 'OK')
+                updates['thirst'] = score.get('thirst', 'OK')
+            spells = self.mud_parser.parse_spell_affects(text)
+            updates['spells'] = spells  # replace entirely from score output
+
+        # Combat end detection
+        if re.search(r'\b(?:is dead|has fled|you flee|you stop fighting)\b',
+                     text, re.IGNORECASE):
+            updates.setdefault('fighting', False)
+            updates.setdefault('tank', None)
+            updates.setdefault('opp', None)
+
+        if updates:
+            self.message_queue.put(("stats", updates))
+
     def process_room_data(self, segments):
         """Process and store room data"""
         if not self.room_tracking_enabled or not self.expecting_room_data:
@@ -1341,7 +1629,9 @@ class MUDClient:
                     if self.room_tracking_enabled and self.expecting_room_data:
                         self.process_room_data(msg_data)
                     
-                    self.append_text(msg_data, "mud_colored")
+                    filtered = self._filter_display_segments(msg_data)
+                    if filtered:
+                        self.append_text(filtered, "mud_colored")
                 elif msg_type == "ai_text":
                     if self.ai_agent:
                         self.ai_agent.on_text_received(msg_data)
@@ -1350,6 +1640,9 @@ class MUDClient:
                 elif msg_type == "error":
                     self.append_text(msg_data, "error")
                     self.disconnect()
+                elif msg_type == "stats":
+                    self.char_stats.update(msg_data)
+                    self._update_status_panel()
                 elif msg_type == "disconnect":
                     self.append_text(msg_data, "system")
                     self.disconnect()
@@ -1465,11 +1758,51 @@ class MUDClient:
             room_data = rooms.get(self.current_room_hash)
         self.llm_advisor.request_advice(events, room_data, self._on_advisor_result)
 
+    def begin_advisor_stream(self):
+        """Open a new streaming advisor entry in the advisor pane."""
+        self._advisor_streamed = True
+        self.advisor_area.config(state=tk.NORMAL)
+        self.advisor_area.insert(tk.END, "[Advisor] ", "advisor_prefix")
+        self.advisor_area.tag_config("advisor_prefix", foreground="#89d185",
+                                     font=("Courier", 10, "bold"))
+        self._advisor_stream_start = self.advisor_area.index(tk.END)
+
+    def append_advisor_token(self, text):
+        """Append a streaming token to the advisor pane."""
+        self.advisor_area.insert(tk.END, text)
+        self.advisor_area.see(tk.END)
+
+    def end_advisor_stream(self):
+        """Close the current streaming advisor entry."""
+        if self._advisor_stream_start:
+            end_idx = self.advisor_area.index(tk.END)
+            self.advisor_area.tag_add("advisor_body",
+                                      self._advisor_stream_start, end_idx)
+            self.advisor_area.tag_config("advisor_body", foreground="#c8c8c8")
+            self._advisor_stream_start = None
+        self.advisor_area.insert(tk.END, "\n\n")
+        self.advisor_area.see(tk.END)
+        self.advisor_area.config(state=tk.DISABLED)
+
+    def cancel_advisor_stream(self):
+        """Remove a started-but-failed streaming entry from the advisor pane."""
+        if self._advisor_stream_start:
+            # _advisor_stream_start points just after "[Advisor] " (10 chars),
+            # so walk back to delete the prefix too.
+            row, col = self._advisor_stream_start.split('.')
+            prefix_col = max(0, int(col) - 10)
+            self.advisor_area.delete(f"{row}.{prefix_col}", tk.END)
+            self._advisor_stream_start = None
+        self._advisor_streamed = False
+        self.advisor_area.config(state=tk.DISABLED)
+
     def _on_advisor_result(self, advice):
         """Called on the main thread when the LLM advisor responds."""
         if advice:
-            self.append_advisor_text(advice)
+            if not self._advisor_streamed:
+                self.append_advisor_text(advice)
             self.session_logger.log_advisor(advice)
+        self._advisor_streamed = False
 
         if self._advisor_queue:
             queued = list(self._advisor_queue)

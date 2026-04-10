@@ -142,6 +142,12 @@ class MUDTextParser:
             re.compile(r'\bcoins?\s*[:\-]?\s*(?P<v>[\d,]+)\b', re.IGNORECASE),
             re.compile(r'\bgp\s*[:\-]?\s*(?P<v>[\d,]+)\b', re.IGNORECASE),
         ],
+        'ac': [
+            # CircleMUD: "Your armor class is 22/10" — take first number before the slash
+            re.compile(r'\barmou?r\s+class\s+is\s+(?P<v>-?\d+)', re.IGNORECASE),
+            re.compile(r'\barmou?r\s+class\s*[:\-]\s*(?P<v>-?\d+)', re.IGNORECASE),
+            re.compile(r'\bAC\s*[:\-]\s*(?P<v>-?\d+)\b'),
+        ],
         'alignment': [
             # CircleMUD: "your alignment is 0" (numeric)
             re.compile(r'\balignment\s+is\s+(?P<v>-?\d+)\b', re.IGNORECASE),
@@ -204,6 +210,15 @@ class MUDTextParser:
                 result['thirst'] = 'thirsty'
         
         return result if result else None
+
+    _SCORE_BLOCK_RE = re.compile(
+        r'\b(?:hit points?|armor class|armour class|experience|your score|your stats?)\b',
+        re.IGNORECASE
+    )
+
+    def is_score_block(self, text):
+        """Return True if text looks like a SCORE/STAT command response."""
+        return bool(self._SCORE_BLOCK_RE.search(text))
 
     # ------------------------------------------------------------------
     # Spell affects / buff duration parsing

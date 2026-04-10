@@ -58,11 +58,17 @@ class SessionLogger:
 
     def open(self):
         """Open a new log file for this session."""
-        os.makedirs(self.LOG_DIR, exist_ok=True)
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self._path = os.path.join(self.LOG_DIR, f"session_{stamp}.log")
-        self._file = open(self._path, 'w', encoding='utf-8', buffering=1)
-        self._write("SYSTEM", f"Session started — log: {self._path}")
+        try:
+            if not os.path.isdir(self.LOG_DIR) and not os.path.islink(self.LOG_DIR):
+                os.makedirs(self.LOG_DIR, exist_ok=True)
+            stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            self._path = os.path.join(self.LOG_DIR, f"session_{stamp}.log")
+            self._file = open(self._path, 'w', encoding='utf-8', buffering=1)
+            self._write("SYSTEM", f"Session started — log: {self._path}")
+        except OSError as e:
+            self._file = None
+            self._path = None
+            print(f"Warning: session logging disabled — {e}")
 
     def close(self):
         """Close the log file."""

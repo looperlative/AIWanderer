@@ -354,22 +354,30 @@ class LLMAdvisor:
         self._messages.append({"role": "user", "content": user_msg})
         self._is_first_message = False
         logger.log_llm_prompt(f"[system]\n{system_prompt}\n[user]\n{user_msg}")
+
+        master = self.client.master
+        master.after(0, self.client.begin_advisor_stream)
+
+        def on_token(text):
+            master.after(0, lambda t=text: self.client.append_advisor_token(t))
+
         advice = None
         try:
-            advice = self._call_backend(system_prompt, list(self._messages), max_tokens=1024)
+            advice = self._call_backend(system_prompt, list(self._messages),
+                                        max_tokens=1024, on_token=on_token)
             logger.log_llm_response(advice)
             if advice:
                 self._messages.append({"role": "assistant", "content": advice})
+            master.after(0, self.client.end_advisor_stream)
         except Exception as e:
-            # Remove the user turn we just appended so history stays consistent
             if self._messages and self._messages[-1]['role'] == 'user':
                 self._messages.pop()
                 self._is_first_message = True
+            master.after(0, self.client.cancel_advisor_stream)
             msg = str(e)
-            self.client.master.after(
-                0, lambda m=msg: self.client.append_advisor_text(
-                    f"[Advisor error: {m}]"))
-        self.client.master.after(0, lambda: on_result(advice))
+            master.after(0, lambda m=msg: self.client.append_advisor_text(
+                f"[Advisor error: {m}]"))
+        master.after(0, lambda: on_result(advice))
 
     def _direct_worker(self, prompt, on_result):
         """Background worker for request_direct()."""
@@ -379,20 +387,29 @@ class LLMAdvisor:
         self._messages.append({"role": "user", "content": prompt})
         self._is_first_message = False
         logger.log_llm_prompt(f"[direct]\n{prompt}")
+
+        master = self.client.master
+        master.after(0, self.client.begin_advisor_stream)
+
+        def on_token(text):
+            master.after(0, lambda t=text: self.client.append_advisor_token(t))
+
         reply = None
         try:
-            reply = self._call_backend(system_prompt, list(self._messages), max_tokens=1024)
+            reply = self._call_backend(system_prompt, list(self._messages),
+                                       max_tokens=1024, on_token=on_token)
             logger.log_llm_response(reply)
             if reply:
                 self._messages.append({"role": "assistant", "content": reply})
+            master.after(0, self.client.end_advisor_stream)
         except Exception as e:
             if self._messages and self._messages[-1]['role'] == 'user':
                 self._messages.pop()
                 self._is_first_message = True
+            master.after(0, self.client.cancel_advisor_stream)
             msg = str(e)
-            self.client.master.after(
-                0, lambda m=msg: self.client.append_advisor_text(f"[Advisor error: {m}]"))
-        self.client.master.after(0, lambda: on_result(reply))
+            master.after(0, lambda m=msg: self.client.append_advisor_text(f"[Advisor error: {m}]"))
+        master.after(0, lambda: on_result(reply))
 
     def _summary_worker(self, assistant_turns, on_result):
         """Background worker for generate_session_summary()."""
@@ -701,21 +718,22 @@ class LLMAdvisor:
         # Deliver result on the main thread
         self.client.master.after(0, lambda: on_result(command))
 
-    def _call_backend(self, system_prompt, messages, max_tokens=2048):
+    def _call_backend(self, system_prompt, messages, max_tokens=2048, on_token=None):
         """
         Dispatch to the configured backend.
 
-        messages — list of {role, content} dicts representing the full conversation
-                   history for this call (system prompt is passed separately).
+        messages  — list of {role, content} dicts (system prompt passed separately)
+        on_token  — optional callable(str) invoked for each streamed chunk;
+                    when provided the backends stream rather than buffer
         """
         cfg = self._config()
         if cfg is None:
             raise RuntimeError("No LLM configured. Add ai_config to profile.")
         backend = cfg.get('llm_backend', 'ollama').lower()
         if backend == 'ollama':
-            return self._call_ollama(cfg, system_prompt, messages, max_tokens)
+            return self._call_ollama(cfg, system_prompt, messages, max_tokens, on_token)
         elif backend == 'claude':
-            return self._call_claude(cfg, system_prompt, messages, max_tokens)
+            return self._call_claude(cfg, system_prompt, messages, max_tokens, on_token)
         else:
             raise RuntimeError(f"Unknown llm_backend: {backend!r}")
 
@@ -886,7 +904,7 @@ class LLMAdvisor:
             f"Available models: {', '.join(available) or 'none'}"
         )
 
-    def _call_ollama(self, cfg, system_prompt, messages, max_tokens=2048):
+    def _call_ollama(self, cfg, system_prompt, messages, max_tokens=2048, on_token=None):
         endpoint = cfg.get('llm_endpoint', 'http://localhost:11434')
         model = cfg.get('llm_model', 'llama3.1:8b')
 
@@ -900,7 +918,7 @@ class LLMAdvisor:
             "messages": [{"role": "system", "content": system_prompt}] + messages,
             "temperature": 0.5,
             "max_tokens": max_tokens,
-            "stream": False,
+            "stream": on_token is not None,
             "options": {"num_ctx": 131072},
         }
 
@@ -918,21 +936,45 @@ class LLMAdvisor:
         try:
             conn.request("POST", "/v1/chat/completions", body=body, headers=headers)
             resp = conn.getresponse()
-            raw = resp.read().decode('utf-8')
+
+            if resp.status != 200:
+                raw = resp.read().decode('utf-8')
+                raise RuntimeError(f"Ollama returned HTTP {resp.status}: {raw[:200]}")
+
+            if on_token is None:
+                # Non-streaming: read full response at once
+                data = json.loads(resp.read().decode('utf-8'))
+                return data['choices'][0]['message']['content']
+
+            # Streaming: read SSE lines
+            accumulated = []
+            while True:
+                line = resp.readline()
+                if not line:
+                    break
+                line = line.decode('utf-8', errors='replace').strip()
+                if not line or not line.startswith('data: '):
+                    continue
+                data_str = line[6:]
+                if data_str == '[DONE]':
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    content = chunk['choices'][0]['delta'].get('content') or ''
+                    if content:
+                        accumulated.append(content)
+                        on_token(content)
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    pass
+            return ''.join(accumulated)
         finally:
             conn.close()
-
-        if resp.status != 200:
-            raise RuntimeError(f"Ollama returned HTTP {resp.status}: {raw[:200]}")
-
-        data = json.loads(raw)
-        return data['choices'][0]['message']['content']
 
     # ------------------------------------------------------------------
     # Claude backend
     # ------------------------------------------------------------------
 
-    def _call_claude(self, cfg, system_prompt, messages, max_tokens=1024):
+    def _call_claude(self, cfg, system_prompt, messages, max_tokens=1024, on_token=None):
         api_key = cfg.get('claude_api_key', '')
         if not api_key:
             raise RuntimeError("claude_api_key is not set in profile ai_config.")
@@ -944,6 +986,7 @@ class LLMAdvisor:
             "max_tokens": max_tokens,
             "system": system_prompt,
             "messages": messages,
+            "stream": on_token is not None,
         }
 
         body = json.dumps(payload).encode('utf-8')
@@ -958,15 +1001,43 @@ class LLMAdvisor:
         try:
             conn.request("POST", "/v1/messages", body=body, headers=headers)
             resp = conn.getresponse()
-            raw = resp.read().decode('utf-8')
+
+            if resp.status != 200:
+                raw = resp.read().decode('utf-8')
+                raise RuntimeError(f"Claude API returned HTTP {resp.status}: {raw[:200]}")
+
+            if on_token is None:
+                # Non-streaming: read full response at once
+                data = json.loads(resp.read().decode('utf-8'))
+                return data['content'][0]['text']
+
+            # Streaming: read SSE events
+            accumulated = []
+            event_type = None
+            while True:
+                line = resp.readline()
+                if not line:
+                    break
+                line = line.decode('utf-8', errors='replace').rstrip('\r\n')
+                if line.startswith('event: '):
+                    event_type = line[7:].strip()
+                elif line.startswith('data: '):
+                    if event_type == 'content_block_delta':
+                        try:
+                            data = json.loads(line[6:])
+                            text = data.get('delta', {}).get('text', '')
+                            if text:
+                                accumulated.append(text)
+                                on_token(text)
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                    elif event_type == 'message_stop':
+                        break
+                elif not line:
+                    event_type = None
+            return ''.join(accumulated)
         finally:
             conn.close()
-
-        if resp.status != 200:
-            raise RuntimeError(f"Claude API returned HTTP {resp.status}: {raw[:200]}")
-
-        data = json.loads(raw)
-        return data['content'][0]['text']
 
     # ------------------------------------------------------------------
     # Helpers
