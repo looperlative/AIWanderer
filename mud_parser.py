@@ -575,9 +575,17 @@ class MUDTextParser:
     # hits you." be parsed correctly — the weapon is consumed but not stored.
     _MOB_NAME = r"(?:(?!\btries\s+to\b)(?!'s\b).)+?"
     _MOB_SEP  = r"(?:'s\s+\w+\s+|\s+)"   # "'s weapon " OR plain whitespace
+    # Optional adverb that some MUDs insert between the mob name and the verb
+    # (e.g. "The White Knight hopelessly tries to crush you.").  Must come
+    # before the "tries to" / "barely" groups so the lazy _MOB_NAME stops at
+    # the clean mob name rather than consuming the adverb.
+    _MOB_ADV  = (r'(?:hopelessly\s+|desperately\s+|frantically\s+|feebly\s+|'
+                 r'weakly\s+|wildly\s+|furiously\s+|savagely\s+|viciously\s+|'
+                 r'awkwardly\s+|clumsily\s+|forcefully\s+|powerfully\s+)?')
 
     _MOB_HIT_RE = re.compile(
         r'^The\s+(?P<mob>' + _MOB_NAME + r')' + _MOB_SEP +
+        _MOB_ADV +
         r'(?:tries\s+to\s+)?'          # optional "tries to" prefix on the verb
         r'(?:barely\s+)?'
         r'(?:tickle(?:s)?|hits?|wound(?:s)?|injure(?:s)?|maul(?:s)?|'
@@ -594,6 +602,7 @@ class MUDTextParser:
     _MOB_MISS_RE = re.compile(
         r'(?:'
         r'^The\s+(?P<mob_a>' + _MOB_NAME + r')' + _MOB_SEP +
+        _MOB_ADV +
         r'(?:tries\s+to\s+.*?but\s+)?'  # "tries to X you but" before misses
         r'misses?\b'
         r'|You\s+(?:duck\s+under|barely\s+avoid|dodge)\s+(?:the\s+)?(?P<mob_b>.+?)\'s\b'

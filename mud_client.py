@@ -491,6 +491,9 @@ class MUDClient:
         survival_menu.add_separator()
         survival_menu.add_command(label="Buy Food Now",
                                   command=self._survival_buy_food)
+        survival_menu.add_separator()
+        survival_menu.add_command(label="Rescue Settings...",
+                                  command=self._rescue_settings_dialog)
 
         settings_menu.add_separator()
         settings_menu.add_command(label="AI Config...", command=self.open_ai_config)
@@ -1597,6 +1600,12 @@ class MUDClient:
             return {}
         return self.profiles[self.current_profile].setdefault('food_drink', {})
 
+    def _rescue_config(self):
+        """Return the rescue config dict for the current profile (may be empty)."""
+        if not self.current_profile or self.current_profile not in self.profiles:
+            return {}
+        return self.profiles[self.current_profile].setdefault('rescue', {})
+
     def _survival_save(self):
         self.save_profiles()
 
@@ -1836,6 +1845,56 @@ class MUDClient:
         self._survival_buy_count -= 1
         self.master.after(350, self._survival_do_buy)
 
+    def _rescue_settings_dialog(self):
+        """Open a dialog to configure the rescue command and thresholds."""
+        cfg = self._rescue_config()
+        dlg = tk.Toplevel(self.master)
+        dlg.title("Rescue Settings")
+        dlg.resizable(False, False)
+        dlg.transient(self.master)
+        dlg.grab_set()
+
+        pad = {'padx': 8, 'pady': 4}
+
+        tk.Label(dlg, text="Rescue command:").grid(row=0, column=0, sticky='e', **pad)
+        cmd_var = tk.StringVar(value=cfg.get('rescue_command', ''))
+        tk.Entry(dlg, textvariable=cmd_var, width=30).grid(row=0, column=1, **pad)
+
+        tk.Label(dlg, text="Fixed HP threshold (0 = off):").grid(row=1, column=0, sticky='e', **pad)
+        hp_var = tk.StringVar(value=str(cfg.get('rescue_hp_threshold', 0)))
+        tk.Entry(dlg, textvariable=hp_var, width=10).grid(row=1, column=1, sticky='w', **pad)
+
+        tk.Label(dlg, text="Damage multiplier (0 = off):").grid(row=2, column=0, sticky='e', **pad)
+        mult_var = tk.StringVar(value=str(cfg.get('rescue_damage_multiplier', 0.0)))
+        tk.Entry(dlg, textvariable=mult_var, width=10).grid(row=2, column=1, sticky='w', **pad)
+        tk.Label(dlg, text="(rescue if HP < multiplier × opponent's max single hit)",
+                 fg='gray').grid(row=3, column=0, columnspan=2, **pad)
+
+        def on_ok():
+            try:
+                hp_thresh = int(hp_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Rescue Settings", "HP threshold must be an integer.", parent=dlg)
+                return
+            try:
+                mult = float(mult_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Rescue Settings", "Damage multiplier must be a number.", parent=dlg)
+                return
+            cfg['rescue_command'] = cmd_var.get().strip()
+            cfg['rescue_hp_threshold'] = hp_thresh
+            cfg['rescue_damage_multiplier'] = mult
+            self.save_profiles()
+            self.append_text(
+                f"[Rescue] Settings saved — command: '{cfg['rescue_command']}', "
+                f"HP threshold: {hp_thresh}, damage multiplier: {mult}\n", "system")
+            dlg.destroy()
+
+        btn_frame = tk.Frame(dlg)
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=6)
+        tk.Button(btn_frame, text="OK", width=8, command=on_ok).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_frame, text="Cancel", width=8, command=dlg.destroy).pack(side=tk.LEFT, padx=4)
+
     # ------------------------------------------------------------------
     # Tick timer
     # ------------------------------------------------------------------
@@ -1997,6 +2056,34 @@ class MUDClient:
                         entry['max_hit'] = damage
             else:
                 entry['misses'] += 1
+
+        # Rescue check — evaluated on every HP prompt update during combat,
+        # independent of the AI agent.  Dispatched to the main thread via after().
+        if new_hp is not None and self._combat_mob:
+            cfg = self._rescue_config()
+            rescue_cmd = cfg.get('rescue_command', '').strip()
+            if rescue_cmd:
+                triggered = False
+                reason = ''
+                fixed = cfg.get('rescue_hp_threshold', 0)
+                if fixed and new_hp < fixed:
+                    triggered = True
+                    reason = f"HP {new_hp} < fixed threshold {fixed}"
+                if not triggered:
+                    mult = cfg.get('rescue_damage_multiplier', 0.0)
+                    if mult:
+                        mob_stats = self.profiles.get(self.current_profile, {}).get('mob_combat_stats', {})
+                        max_hit = mob_stats.get(self._combat_mob, {}).get('max_hit', 0)
+                        if max_hit > 0 and new_hp < mult * max_hit:
+                            triggered = True
+                            reason = f"HP {new_hp} < {mult}x max_hit {max_hit} ({mult * max_hit:.0f})"
+                if triggered:
+                    msg = f"[Rescue] {reason} — sending: {rescue_cmd}\n"
+                    cmd = rescue_cmd
+                    self.master.after(0, lambda m=msg, c=cmd: (
+                        self.append_text(m, "error"),
+                        self.send_ai_command(c)
+                    ))
 
         # Kill confirmed — note which mob was killed so we can attach XP
         if self._KILL_RE.search(text):
@@ -2745,20 +2832,32 @@ class MUDClient:
 
         tk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 6))
 
+    # Adverb suffixes that old regex versions leaked into mob names.
+    _MOB_NAME_BAD_SUFFIXES = (
+        ' tries to', ' hopelessly', ' desperately', ' frantically', ' feebly',
+        ' weakly', ' wildly', ' furiously', ' savagely', ' viciously',
+        ' awkwardly', ' clumsily', ' forcefully', ' powerfully',
+    )
+
     @staticmethod
     def _mob_stats_cleanup(mob_combat_stats):
-        """Remove stale 'tries to' artefacts from mob_combat_stats in place.
+        """Remove stale artefact suffixes from mob_combat_stats in place.
 
-        Old versions of the hit/miss regex would capture 'beastly fido tries to'
-        instead of 'beastly fido'.  This method finds keys ending with ' tries to'
-        (or that ARE 'tries to'), merges their stats into the base name entry if
-        it exists, then deletes the bad key.  Returns True if anything was changed.
+        Old regex versions captured trailing adverbs or 'tries to' as part of
+        the mob name (e.g. 'white knight hopelessly', 'beastly fido tries to').
+        Finds such keys, merges their stats into the clean base-name entry if
+        one exists, then deletes the bad key.  Returns True if anything changed.
         """
-        bad_keys = [k for k in mob_combat_stats if k.endswith(' tries to') or k == 'tries to']
+        bad_keys = [
+            k for k in mob_combat_stats
+            if any(k.endswith(s) for s in MUDClient._MOB_NAME_BAD_SUFFIXES)
+            or k == 'tries to'
+        ]
         if not bad_keys:
             return False
         for bad in bad_keys:
-            base = bad[:-len(' tries to')].strip() if bad != 'tries to' else None
+            suffix = next((s for s in MUDClient._MOB_NAME_BAD_SUFFIXES if bad.endswith(s)), None)
+            base = bad[:-len(suffix)].strip() if suffix and bad != suffix.strip() else None
             if base and base in mob_combat_stats:
                 good = mob_combat_stats[base]
                 stale = mob_combat_stats[bad]
