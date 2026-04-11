@@ -113,6 +113,22 @@ class MUDClient:
         self._suppress_score_output = False
         self._auto_score_job = None
 
+        # Survival (food/drink) automation state
+        self._prev_hunger = None          # Last hunger level seen (for transition detection)
+        self._prev_thirst = None          # Last thirst level seen
+        self._survival_state = None       # None | 'walking' | 'inv_wait' | 'buying'
+        self._survival_path = []          # Remaining direction steps when walking to store
+        self._survival_buy_count = 0      # Buy commands still to issue
+        self._survival_inv_text = ''      # Buffered inventory output
+
+        # Mob combat stat tracking (receive-thread state)
+        self._combat_mob = None           # Normalised mob name currently fighting us
+        self._kill_cmd_pending = False    # Player sent kill/k command
+        self._kill_cmd_target = None      # Target typed by player
+        self._last_kill_cmd_time = 0.0
+        self._prev_combat_hp = None       # HP before last round for damage calc
+        self._last_killed_mob = None      # Mob key awaiting XP attribution
+
         self.setup_ui()
 
         # Restore saved window geometry (position + size)
@@ -454,6 +470,24 @@ class MUDClient:
                                           command=self._save_autoloot)
 
         settings_menu.add_separator()
+
+        # Survival submenu
+        survival_menu = tk.Menu(settings_menu, tearoff=0)
+        settings_menu.add_cascade(label="Survival", menu=survival_menu)
+        survival_menu.add_command(label="Set Drink Container...",
+                                  command=self._survival_set_drink_container)
+        survival_menu.add_command(label="Set Food Item...",
+                                  command=self._survival_set_food_item)
+        survival_menu.add_separator()
+        survival_menu.add_command(label="Set Fountain Room",
+                                  command=self._survival_set_fountain_room)
+        survival_menu.add_command(label="Set Food Store Room",
+                                  command=self._survival_set_food_store_room)
+        survival_menu.add_separator()
+        survival_menu.add_command(label="Buy Food Now",
+                                  command=self._survival_buy_food)
+
+        settings_menu.add_separator()
         settings_menu.add_command(label="AI Config...", command=self.open_ai_config)
         settings_menu.add_command(label="Room Colors...", command=self.open_color_calibration)
 
@@ -467,6 +501,8 @@ class MUDClient:
         menubar.add_cascade(label="View", menu=view_menu)
         view_menu.add_command(label="Clear MUD Output", command=self.clear_output)
         view_menu.add_command(label="Clear Advisor", command=self.clear_advisor)
+        view_menu.add_separator()
+        view_menu.add_command(label="Mob Stats...", command=self._show_mob_stats_dialog)
         view_menu.add_separator()
         view_menu.add_command(label="Larger Text  (Ctrl++)", command=self._zoom_in)
         view_menu.add_command(label="Smaller Text (Ctrl+-)", command=self._zoom_out)
@@ -1004,6 +1040,12 @@ class MUDClient:
                 # Autoloot on kill
                 self._handle_autoloot(clean_text)
 
+                # Per-mob combat stat tracking
+                self._update_mob_combat_stats(clean_text)
+
+                # Survival automation (inventory collection)
+                self._survival_handle_text(clean_text)
+
                 # Handle autologin (use clean text without ANSI codes)
                 if self.autologin_pending and self.current_profile:
                     self.handle_autologin(clean_text)
@@ -1176,6 +1218,10 @@ class MUDClient:
     def _complete_autologin(self):
         """Finalize autologin: clear pending flag and enable room tracking if needed."""
         self.autologin_pending = False
+        self._prev_combat_hp = None  # Reset damage baseline on fresh login
+        self._kill_cmd_pending = False
+        self._combat_mob = None
+        self._last_killed_mob = None
         self.message_queue.put(("system", "[Autologin] Login sequence completed\n"))
         if self.room_tracking_enabled:
             self.detect_entry_room = True
@@ -1505,6 +1551,259 @@ class MUDClient:
         self.profiles['_settings']['autoloot'] = self._autoloot_var.get()
         self.save_profiles()
 
+    # ------------------------------------------------------------------
+    # Survival automation (food / drink)
+    # ------------------------------------------------------------------
+
+    _SURVIVAL_MAX_FOOD = 5
+    _DIR_ABBREV = {'north': 'n', 'south': 's', 'east': 'e',
+                   'west': 'w', 'up': 'u', 'down': 'd'}
+
+    def _fd_config(self):
+        """Return the food_drink config dict for the current profile (may be empty)."""
+        if not self.current_profile or self.current_profile not in self.profiles:
+            return {}
+        return self.profiles[self.current_profile].setdefault('food_drink', {})
+
+    def _survival_save(self):
+        self.save_profiles()
+
+    # ── Settings setters ──────────────────────────────────────────────
+
+    def _survival_set_drink_container(self):
+        val = simpledialog.askstring(
+            "Drink Container",
+            "Enter the name of your drink container (e.g. waterskin):",
+            initialvalue=self._fd_config().get('drink_container', ''),
+            parent=self.master)
+        if val is not None:
+            self._fd_config()['drink_container'] = val.strip()
+            self._survival_save()
+            self.append_text(f"[Survival] Drink container set to: {val.strip()}\n", "system")
+
+    def _survival_set_food_item(self):
+        val = simpledialog.askstring(
+            "Food Item",
+            "Enter the name of your food item (e.g. bread):",
+            initialvalue=self._fd_config().get('food_item', ''),
+            parent=self.master)
+        if val is not None:
+            self._fd_config()['food_item'] = val.strip()
+            self._survival_save()
+            self.append_text(f"[Survival] Food item set to: {val.strip()}\n", "system")
+
+    def _survival_set_fountain_room(self):
+        if not self.current_room_hash:
+            messagebox.showwarning("Survival",
+                "Not in a known room. Enable room tracking and enter a room first.")
+            return
+        cfg = self._fd_config()
+        cfg['fountain_room'] = self.current_room_hash
+        self._survival_save()
+        room_name = (self.profiles.get(self.current_profile, {})
+                     .get('rooms', {})
+                     .get(self.current_room_hash, {})
+                     .get('name', self.current_room_hash[:8]))
+        self.append_text(f"[Survival] Fountain room set: {room_name}\n", "system")
+
+    def _survival_set_food_store_room(self):
+        if not self.current_room_hash:
+            messagebox.showwarning("Survival",
+                "Not in a known room. Enable room tracking and enter a room first.")
+            return
+        cfg = self._fd_config()
+        cfg['food_store_room'] = self.current_room_hash
+        self._survival_save()
+        room_name = (self.profiles.get(self.current_profile, {})
+                     .get('rooms', {})
+                     .get(self.current_room_hash, {})
+                     .get('name', self.current_room_hash[:8]))
+        self.append_text(f"[Survival] Food store room set: {room_name}\n", "system")
+
+    # ── Pathfinding ───────────────────────────────────────────────────
+
+    def _survival_find_path(self, from_hash, to_hash):
+        """BFS through room_links; returns list of short direction strings or None."""
+        if from_hash == to_hash:
+            return []
+        profile = self.profiles.get(self.current_profile, {})
+        links = profile.get('room_links', {})
+        queue = deque([(from_hash, [])])
+        visited = {from_hash}
+        while queue:
+            room, path = queue.popleft()
+            for direction, neighbor in links.get(room, {}).items():
+                abbrev = self._DIR_ABBREV.get(direction, direction)
+                new_path = path + [abbrev]
+                if neighbor == to_hash:
+                    return new_path
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, new_path))
+        return None   # no path found
+
+    # ── Core survival commands ────────────────────────────────────────
+
+    def _survival_send_cmd(self, cmd):
+        """Send a survival command directly (shown with [Survival] prefix)."""
+        if not self.connected:
+            return
+        try:
+            self.ssl_socket.sendall((cmd + '\n').encode('utf-8'))
+            self.append_text(f"[Survival] {cmd}\n", "system")
+        except Exception:
+            pass
+
+    # ── Auto-fill fountain ────────────────────────────────────────────
+
+    def _survival_on_room_entered(self, room_hash):
+        """Called from process_room_data (main thread) whenever current_room_hash changes."""
+        cfg = self._fd_config()
+
+        # Auto-fill drink container when entering fountain room
+        fountain = cfg.get('fountain_room')
+        container = cfg.get('drink_container')
+        if fountain and container and room_hash == fountain:
+            self.master.after(400, lambda: self._survival_send_cmd(
+                f"fill {container} fountain"))
+
+        # Advance buy-food walk state
+        if self._survival_state == 'walking':
+            store_room = cfg.get('food_store_room')
+            if room_hash == store_room:
+                # Arrived — send inventory to count what we have
+                self._survival_state = 'inv_wait'
+                self._survival_inv_text = ''
+                self.master.after(400, lambda: self._survival_send_cmd('inventory'))
+            elif self._survival_path:
+                # Send next direction step
+                direction = self._survival_path.pop(0)
+                self.master.after(300, lambda d=direction: self.send_ai_command(d))
+            else:
+                # Path exhausted but not at destination — map may be stale
+                self._survival_state = None
+                self.append_text(
+                    "[Survival] Walk complete but food store room not reached. "
+                    "Is the map up to date?\n", "system")
+
+    # ── Inventory parsing (receive thread) ───────────────────────────
+
+    def _survival_handle_text(self, text):
+        """Called from the receive thread to collect inventory output."""
+        if self._survival_state != 'inv_wait':
+            return
+        self._survival_inv_text += text
+        # Wait for a prompt line before processing
+        if self.last_line.rstrip().endswith('>'):
+            full_text = self._survival_inv_text
+            self._survival_inv_text = ''
+            self.message_queue.put(('survival_inv', full_text))
+
+    # ── Auto-eat / auto-drink ─────────────────────────────────────────
+
+    def _check_hunger_thirst_transitions(self):
+        """Detect hunger/thirst state changes and auto-eat/drink."""
+        cfg = self._fd_config()
+        hunger = self.char_stats.get('hunger')
+        thirst = self.char_stats.get('thirst')
+
+        bad_hunger = hunger in ('hungry', 'starving')
+        bad_thirst = thirst in ('thirsty', 'parched')
+        prev_bad_hunger = self._prev_hunger in ('hungry', 'starving')
+        prev_bad_thirst = self._prev_thirst in ('thirsty', 'parched')
+
+        # Trigger on transition into a bad state (not every update)
+        if bad_hunger and not prev_bad_hunger:
+            food = cfg.get('food_item')
+            if food:
+                self._survival_send_cmd(f"eat {food}")
+
+        if bad_thirst and not prev_bad_thirst:
+            container = cfg.get('drink_container')
+            if container:
+                self._survival_send_cmd(f"drink {container}")
+
+        self._prev_hunger = hunger
+        self._prev_thirst = thirst
+
+    # ── Buy food flow ─────────────────────────────────────────────────
+
+    def _survival_buy_food(self):
+        """Start the buy-food flow: pathfind to store, check inventory, buy."""
+        if self._survival_state is not None:
+            messagebox.showinfo("Survival", "A survival action is already in progress.")
+            return
+
+        cfg = self._fd_config()
+        food_item  = cfg.get('food_item', '').strip()
+        store_room = cfg.get('food_store_room')
+
+        if not food_item:
+            messagebox.showwarning("Survival",
+                "Food item not set. Use Settings → Survival → Set Food Item.")
+            return
+        if not store_room:
+            messagebox.showwarning("Survival",
+                "Food store room not set. Stand in the store and use "
+                "Settings → Survival → Set Food Store Room.")
+            return
+        if not self.current_room_hash:
+            messagebox.showwarning("Survival",
+                "Current room unknown. Enable room tracking and move around first.")
+            return
+
+        # Already in the store?
+        if self.current_room_hash == store_room:
+            self._survival_state = 'inv_wait'
+            self._survival_inv_text = ''
+            self.master.after(300, lambda: self._survival_send_cmd('inventory'))
+            return
+
+        path = self._survival_find_path(self.current_room_hash, store_room)
+        if path is None:
+            messagebox.showwarning("Survival",
+                "No mapped path to the food store. Walk there at least once "
+                "with room tracking enabled to build the map.")
+            return
+
+        self.append_text(
+            f"[Survival] Walking to food store ({len(path)} steps)...\n", "system")
+        self._survival_state = 'walking'
+        self._survival_path = list(path)
+
+        # Send the first step; subsequent steps are triggered by room-entry events
+        first = self._survival_path.pop(0)
+        self.master.after(300, lambda d=first: self.send_ai_command(d))
+
+    def _survival_start_buying(self, current_count):
+        """Begin issuing buy commands after inventory check."""
+        cfg = self._fd_config()
+        food_item = cfg.get('food_item', '').strip()
+        needed = max(0, self._SURVIVAL_MAX_FOOD - current_count)
+        if needed == 0:
+            self.append_text(
+                f"[Survival] Already carrying {current_count} {food_item}. Nothing to buy.\n",
+                "system")
+            self._survival_state = None
+            return
+        self.append_text(
+            f"[Survival] Carrying {current_count}, buying {needed} {food_item}.\n", "system")
+        self._survival_state = 'buying'
+        self._survival_buy_count = needed
+        self._survival_do_buy()
+
+    def _survival_do_buy(self):
+        """Send one buy command and schedule the next."""
+        if self._survival_buy_count <= 0 or not self.connected:
+            self._survival_state = None
+            self.append_text("[Survival] Buy complete.\n", "system")
+            return
+        cfg = self._fd_config()
+        food_item = cfg.get('food_item', '').strip()
+        self._survival_send_cmd(f"buy {food_item}")
+        self._survival_buy_count -= 1
+        self.master.after(350, self._survival_do_buy)
+
     _KILL_RE = re.compile(r'^.+ is dead!\s+R\.I\.P\.$', re.MULTILINE)
 
     def _handle_autoloot(self, text):
@@ -1527,6 +1826,95 @@ class MUDClient:
             self.append_text(f"[Autoloot] {cmd}\n", "system")
         except Exception:
             pass
+
+    def _update_mob_combat_stats(self, text):
+        """Track per-mob hit/miss/damage/room/aggression stats.
+        Called from the receive thread — must not touch UI directly."""
+        if not self.current_profile or self.current_profile not in self.profiles:
+            return
+
+        # Parse HP from this text chunk for damage calculation
+        new_prompt = self.mud_parser.parse_prompt_stats(text)
+        new_hp = new_prompt.get('hp') if new_prompt else None
+
+        # Detect hit and miss in this chunk
+        hit_mob = self.mud_parser.detect_mob_hit(text)
+        miss_mob = self.mud_parser.detect_mob_miss(text)
+        active_mob = hit_mob or miss_mob
+
+        if active_mob:
+            mob_key = active_mob.lower()
+            self._combat_mob = mob_key
+
+            # Aggression: mob hit/missed us without a recent player kill command
+            is_aggressive = False
+            if not self._kill_cmd_pending:
+                is_aggressive = True
+            elif self._kill_cmd_target and self._kill_cmd_target not in mob_key:
+                # Kill target doesn't match this mob's name
+                is_aggressive = True
+            elif (time.time() - self._last_kill_cmd_time) > 5.0:
+                # Kill command was too long ago
+                is_aggressive = True
+                self._kill_cmd_pending = False
+
+            # Get or create mob stats entry
+            profile = self.profiles[self.current_profile]
+            mob_stats = profile.setdefault('mob_combat_stats', {})
+            entry = mob_stats.setdefault(mob_key, {
+                'max_hit': 0,
+                'hits': 0,
+                'misses': 0,
+                'rooms': [],
+                'aggressive': False,
+            })
+
+            if is_aggressive:
+                entry['aggressive'] = True
+
+            # Track current room (keep last 10 unique hashes)
+            if self.current_room_hash:
+                if self.current_room_hash not in entry['rooms']:
+                    entry['rooms'].append(self.current_room_hash)
+                    if len(entry['rooms']) > 10:
+                        entry['rooms'].pop(0)
+
+            if hit_mob:
+                entry['hits'] += 1
+                # Compute damage from HP delta
+                if self._prev_combat_hp is not None and new_hp is not None:
+                    damage = self._prev_combat_hp - new_hp
+                    if damage > 0 and damage > entry['max_hit']:
+                        entry['max_hit'] = damage
+            else:
+                entry['misses'] += 1
+
+        # Kill confirmed — note which mob was killed so we can attach XP
+        if self._KILL_RE.search(text):
+            self._last_killed_mob = self._combat_mob
+            self._kill_cmd_pending = False
+            self._kill_cmd_target = None
+            self._combat_mob = None
+
+        # XP gain — attribute to the most recently killed mob
+        xp_gained = self.mud_parser.detect_xp_gain(text)
+        if xp_gained and self._last_killed_mob:
+            mob_key = self._last_killed_mob
+            self._last_killed_mob = None
+            profile = self.profiles.get(self.current_profile, {})
+            mob_stats = profile.get('mob_combat_stats', {})
+            if mob_key in mob_stats:
+                entry = mob_stats[mob_key]
+                entry['xp_total'] = entry.get('xp_total', 0) + xp_gained
+                entry['xp_kills'] = entry.get('xp_kills', 0) + 1
+            self.master.after(0, self.save_profiles)
+        elif self._KILL_RE.search(text):
+            # Kill without XP message in same chunk — save now; XP may arrive next chunk
+            self.master.after(0, self.save_profiles)
+
+        # Update prev HP for next round's damage calculation
+        if new_hp is not None:
+            self._prev_combat_hp = new_hp
 
     def detect_room_color(self, segments):
         """Detect the color used for room names by looking for bluish colors"""
@@ -1652,10 +2040,16 @@ class MUDClient:
                           'gold', 'max_hp', 'max_mp', 'max_mv'):
                     if k in score:
                         updates[k] = score[k]
+                # Score always gives a definitive hunger/thirst state (OK if absent)
                 updates['hunger'] = score.get('hunger', 'OK')
                 updates['thirst'] = score.get('thirst', 'OK')
             spells = self.mud_parser.parse_spell_affects(text)
             updates['spells'] = spells  # replace entirely from score output
+        else:
+            # Not a score block — check for spontaneous "You are thirsty/hungry"
+            # messages the MUD sends between auto-score calls.
+            ht = self.mud_parser.detect_hunger_thirst(text)
+            updates.update(ht)
 
         # Buff expiration messages
         buff_events = self.mud_parser.detect_buff_events(text)
@@ -1778,6 +2172,9 @@ class MUDClient:
             
             self.expecting_room_data = False
 
+            # Survival hook — fountain fill and buy-food walk progression
+            self._survival_on_room_entered(self.current_room_hash)
+
             if self.ai_agent and self.ai_agent.is_running:
                 self.ai_agent.on_room_entered(self.current_room_hash, room_data)
 
@@ -1839,6 +2236,19 @@ class MUDClient:
                             spells.pop(s, None)
                         self.char_stats['spells'] = spells
                     self._update_status_panel()
+                    self._check_hunger_thirst_transitions()
+                elif msg_type == "survival_inv":
+                    # Inventory text collected after arriving at food store
+                    food_item = self._fd_config().get('food_item', '').strip()
+                    if food_item and self._survival_state == 'inv_wait':
+                        count = self.mud_parser.parse_inventory_count(msg_data, food_item)
+                        self._survival_state = None
+                        if count is None:
+                            self.append_text(
+                                "[Survival] Could not parse inventory. "
+                                "Try buying manually.\n", "system")
+                        else:
+                            self._survival_start_buying(count)
                 elif msg_type == "disconnect":
                     self.append_text(msg_data, "system")
                     self.disconnect()
@@ -1884,6 +2294,13 @@ class MUDClient:
             # If in quit sequence and user manually sends something, learn it
             if self.quit_pending and self.last_line:
                 self.learn_quit_response(self.last_line, message)
+
+            # Track kill commands for aggression detection
+            kill_match = re.match(r'^(?:kill|k)\s+(.+)', message_lower)
+            if kill_match:
+                self._kill_cmd_pending = True
+                self._kill_cmd_target = kill_match.group(1).strip()
+                self._last_kill_cmd_time = time.time()
 
             # Speedwalk: a string of only n/s/e/w letters (2+ chars) expands to
             # one command per letter, e.g. "nnew" -> "n", "n", "e", "w"
@@ -2145,6 +2562,139 @@ class MUDClient:
             self.save_profiles()
             roles = ', '.join(f"{r}={c}" for r, c in dialog.result.items())
             self.append_text(f"[Room Colors saved: {roles}]\n", "system")
+
+    def _show_mob_stats_dialog(self):
+        """Open a table showing collected per-mob combat statistics."""
+        profile_name = self.current_profile or self.profile_var.get()
+        if not profile_name or profile_name not in self.profiles:
+            messagebox.showinfo("Mob Stats", "No active profile.")
+            return
+
+        mob_combat_stats = self.profiles[profile_name].get('mob_combat_stats', {})
+        if self._mob_stats_cleanup(mob_combat_stats):
+            self.save_profiles()
+
+        win = tk.Toplevel(self.master)
+        win.title("Mob Combat Stats")
+        win.geometry("860x400")
+        win.resizable(True, True)
+
+        # Toolbar frame
+        toolbar = tk.Frame(win)
+        toolbar.pack(fill=tk.X, padx=6, pady=(6, 2))
+        tk.Label(toolbar, text="Profile: " + profile_name).pack(side=tk.LEFT)
+        tk.Button(toolbar, text="Delete Selected",
+                  command=lambda: self._mob_stats_delete(win, tree, profile_name)
+                  ).pack(side=tk.RIGHT, padx=4)
+        tk.Button(toolbar, text="Refresh",
+                  command=lambda: self._mob_stats_refresh(tree, profile_name)
+                  ).pack(side=tk.RIGHT)
+
+        # Treeview with scrollbar
+        frame = tk.Frame(win)
+        frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+
+        cols = ('mob', 'hits', 'misses', 'hit_pct', 'max_hit',
+                'xp_total', 'xp_avg', 'rooms', 'aggressive')
+        tree = ttk.Treeview(frame, columns=cols, show='headings', selectmode='extended')
+
+        tree.heading('mob',        text='Mob Name')
+        tree.heading('hits',       text='Hits')
+        tree.heading('misses',     text='Misses')
+        tree.heading('hit_pct',    text='Hit %')
+        tree.heading('max_hit',    text='Max Dmg')
+        tree.heading('xp_total',   text='XP Total')
+        tree.heading('xp_avg',     text='XP Avg')
+        tree.heading('rooms',      text='Rooms')
+        tree.heading('aggressive', text='Aggressive')
+
+        tree.column('mob',        width=200, anchor='w')
+        tree.column('hits',       width=50,  anchor='center')
+        tree.column('misses',     width=50,  anchor='center')
+        tree.column('hit_pct',    width=55,  anchor='center')
+        tree.column('max_hit',    width=65,  anchor='center')
+        tree.column('xp_total',   width=75,  anchor='center')
+        tree.column('xp_avg',     width=65,  anchor='center')
+        tree.column('rooms',      width=50,  anchor='center')
+        tree.column('aggressive', width=75,  anchor='center')
+
+        vsb = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Populate rows
+        self._mob_stats_populate(tree, mob_combat_stats)
+
+        tk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 6))
+
+    @staticmethod
+    def _mob_stats_cleanup(mob_combat_stats):
+        """Remove stale 'tries to' artefacts from mob_combat_stats in place.
+
+        Old versions of the hit/miss regex would capture 'beastly fido tries to'
+        instead of 'beastly fido'.  This method finds keys ending with ' tries to'
+        (or that ARE 'tries to'), merges their stats into the base name entry if
+        it exists, then deletes the bad key.  Returns True if anything was changed.
+        """
+        bad_keys = [k for k in mob_combat_stats if k.endswith(' tries to') or k == 'tries to']
+        if not bad_keys:
+            return False
+        for bad in bad_keys:
+            base = bad[:-len(' tries to')].strip() if bad != 'tries to' else None
+            if base and base in mob_combat_stats:
+                good = mob_combat_stats[base]
+                stale = mob_combat_stats[bad]
+                good['hits']    = good.get('hits', 0)    + stale.get('hits', 0)
+                good['misses']  = good.get('misses', 0)  + stale.get('misses', 0)
+                good['xp_total']= good.get('xp_total', 0)+ stale.get('xp_total', 0)
+                good['xp_kills']= good.get('xp_kills', 0)+ stale.get('xp_kills', 0)
+                good['max_hit'] = max(good.get('max_hit', 0), stale.get('max_hit', 0))
+                if stale.get('aggressive'):
+                    good['aggressive'] = True
+                for room in stale.get('rooms', []):
+                    if room not in good.setdefault('rooms', []):
+                        good['rooms'].append(room)
+                        if len(good['rooms']) > 10:
+                            good['rooms'].pop(0)
+            del mob_combat_stats[bad]
+        return True
+
+    def _mob_stats_populate(self, tree, mob_combat_stats):
+        """Fill the treeview from mob_combat_stats dict."""
+        for row in tree.get_children():
+            tree.delete(row)
+        for mob_name, s in sorted(mob_combat_stats.items()):
+            hits      = s.get('hits', 0)
+            misses    = s.get('misses', 0)
+            total     = hits + misses
+            hit_pct   = f"{hits * 100 // total}%" if total else "—"
+            max_hit   = s.get('max_hit', 0) or "—"
+            xp_total  = s.get('xp_total', 0)
+            xp_kills  = s.get('xp_kills', 0)
+            xp_avg    = f"{xp_total // xp_kills}" if xp_kills else "—"
+            xp_total_s = str(xp_total) if xp_total else "—"
+            rooms     = len(s.get('rooms', []))
+            agg       = "Yes" if s.get('aggressive') else "No"
+            tree.insert('', 'end', iid=mob_name,
+                        values=(mob_name, hits, misses, hit_pct, max_hit,
+                                xp_total_s, xp_avg, rooms, agg))
+
+    def _mob_stats_refresh(self, tree, profile_name):
+        """Reload stats from the current profile into the treeview."""
+        mob_combat_stats = self.profiles.get(profile_name, {}).get('mob_combat_stats', {})
+        self._mob_stats_populate(tree, mob_combat_stats)
+
+    def _mob_stats_delete(self, win, tree, profile_name):
+        """Delete selected mob entries from the profile."""
+        selected = tree.selection()
+        if not selected:
+            return
+        mob_combat_stats = self.profiles.get(profile_name, {}).get('mob_combat_stats', {})
+        for mob_key in selected:
+            mob_combat_stats.pop(mob_key, None)
+            tree.delete(mob_key)
+        self.save_profiles()
 
     def _extract_color_samples(self):
         """

@@ -252,6 +252,40 @@ class MUDTextParser:
         re.IGNORECASE
     )
 
+    # Spontaneous hunger/thirst messages sent by the MUD between score calls.
+    # Patterns are anchored to "you are" to avoid false positives on room
+    # descriptions or mob names that happen to contain words like "thirsty".
+    _SPONTANEOUS_HUNGER_RE = re.compile(
+        r'\byou are (?P<v>hungry|starving|famished|dying of hunger)\b',
+        re.IGNORECASE
+    )
+    _SPONTANEOUS_THIRST_RE = re.compile(
+        r'\byou are (?P<v>thirsty|parched|dying of thirst)\b',
+        re.IGNORECASE
+    )
+
+    def detect_hunger_thirst(self, text):
+        """
+        Detect spontaneous hunger/thirst notification messages.
+
+        Returns a dict with 'hunger' and/or 'thirst' keys set to the
+        canonical level ('hungry'/'starving', 'thirsty'/'parched').
+        Returns an empty dict if neither is mentioned.
+
+        Intended for non-score text chunks; use parse_score() for full
+        score-block parsing (which also covers the 'OK' / absent case).
+        """
+        result = {}
+        m = self._SPONTANEOUS_HUNGER_RE.search(text)
+        if m:
+            raw = m.group('v').lower()
+            result['hunger'] = 'starving' if ('starv' in raw or 'famish' in raw or 'dying' in raw) else 'hungry'
+        m = self._SPONTANEOUS_THIRST_RE.search(text)
+        if m:
+            raw = m.group('v').lower()
+            result['thirst'] = 'parched' if ('parch' in raw or 'dying' in raw) else 'thirsty'
+        return result
+
     def parse_spell_affects(self, text):
         """
         Extract active buff durations from score output.
@@ -425,6 +459,49 @@ class MUDTextParser:
         return None
 
     # ------------------------------------------------------------------
+    # Inventory parsing
+    # ------------------------------------------------------------------
+
+    _INVENTORY_START_RE = re.compile(r'you are carrying', re.IGNORECASE)
+    _NOTHING_RE = re.compile(r'you are not carrying anything', re.IGNORECASE)
+
+    def parse_inventory_count(self, text, item_name):
+        """
+        Count how many of item_name the player is carrying based on inventory output.
+
+        CircleMUD inventory format:
+            You are carrying:
+              a loaf of bread
+              a loaf of bread
+              a waterskin
+
+        Matching is case-insensitive substring: item_name "bread" matches
+        "a loaf of bread".  Returns an int (0 if none found or not carrying
+        anything, None if inventory output is not present in this text).
+        """
+        if self._NOTHING_RE.search(text):
+            return 0
+        if not self._INVENTORY_START_RE.search(text):
+            return None   # inventory output not present in this chunk
+        item_lower = item_name.lower()
+        count = 0
+        in_inv = False
+        for line in text.splitlines():
+            if self._INVENTORY_START_RE.search(line):
+                in_inv = True
+                continue
+            if in_inv:
+                # Inventory lines are indented or start with an article/item name.
+                # Stop on a blank line that follows at least one item line, or on
+                # a line that looks like a MUD prompt (ends with '>').
+                stripped = line.strip()
+                if not stripped or stripped.endswith('>'):
+                    break
+                if item_lower in stripped.lower():
+                    count += 1
+        return count
+
+    # ------------------------------------------------------------------
     # Combat detection
     # ------------------------------------------------------------------
 
@@ -433,6 +510,82 @@ class MUDTextParser:
         r'charges? at you|engages? you|strikes? at you)',
         re.IGNORECASE
     )
+
+    # ------------------------------------------------------------------
+    # Mob hit / miss detection (for per-mob combat stat tracking)
+    # ------------------------------------------------------------------
+    #
+    # CircleMUD sends lines like:
+    #   "The beastly fido hits you."
+    #   "The large cobra barely hits you."
+    #   "The guard misses you."
+    #   "The guard misses a wild punch at you."
+    #   "You duck under the guard's fist as it takes a swing at you."
+    #   "You barely avoid the guard's fist as it takes a swing at you!"
+    #
+    # All non-miss verbs are considered hits.  Damage is inferred from
+    # the HP delta between consecutive prompt readings.
+
+    # Mob name is captured with a negative lookahead that prevents the lazy
+    # .+? from consuming "tries to" — CircleMUD sends "The [mob] tries to
+    # [verb] you." for some skill attempts and without the lookahead the
+    # phrase "tries to" would become part of the stored mob name.
+    # Mob name is captured with a negative lookahead that prevents the lazy
+    # .+? from consuming "tries to" — CircleMUD sends "The [mob] tries to
+    # [verb] you." for some skill attempts and without the lookahead the
+    # phrase "tries to" would become part of the stored mob name.
+    #
+    # Verb list covers both conjugated ("slashes") and infinitive ("slash")
+    # forms because skill-attempt messages use the infinitive after "tries to".
+    # A negative lookahead on "you" excludes "tries to X you but misses"
+    # from being counted as a hit — those are handled by _MOB_MISS_RE.
+    # _MOB_NAME — shared sub-pattern for mob name capture:
+    #   • Stops before "tries to" (would corrupt the name with skill-attempt text)
+    #   • Stops before 's  (prevents "[mob]'s [weapon]" from bloating the name)
+    # After the mob name, an optional "'s <weapon>" clause lets messages like
+    # "The troll's claws slash you." or "The pawn of the black court's slash
+    # hits you." be parsed correctly — the weapon is consumed but not stored.
+    _MOB_NAME = r"(?:(?!\btries\s+to\b)(?!'s\b).)+?"
+    _MOB_SEP  = r"(?:'s\s+\w+\s+|\s+)"   # "'s weapon " OR plain whitespace
+
+    _MOB_HIT_RE = re.compile(
+        r'^The\s+(?P<mob>' + _MOB_NAME + r')' + _MOB_SEP +
+        r'(?:tries\s+to\s+)?'          # optional "tries to" prefix on the verb
+        r'(?:barely\s+)?'
+        r'(?:tickle(?:s)?|hits?|wound(?:s)?|injure(?:s)?|maul(?:s)?|'
+        r'decimate(?:s)?|devastate(?:s)?|massacre(?:s)?|obliterate(?:s)?|'
+        r'incinerate(?:s)?|disembowel(?:s)?|mutilate(?:s)?|annihilate(?:s)?|'
+        r'scratch(?:es)?|claw(?:s)?|bite(?:s)?|sting(?:s)?|whip(?:s)?|'
+        r'slash(?:es)?|bludgeon(?:s)?|crush(?:es)?|pound(?:s)?|'
+        r'thrash(?:es)?|pierce(?:s)?|blast(?:s)?|punch(?:es)?|stab(?:s)?)'
+        r'\s+you\b(?!\s+but\b)',       # exclude "X you but misses" — that's a miss
+        re.IGNORECASE | re.MULTILINE
+    )
+
+    # Named groups mob_a (explicit miss) and mob_b (dodge/avoid)
+    _MOB_MISS_RE = re.compile(
+        r'(?:'
+        r'^The\s+(?P<mob_a>' + _MOB_NAME + r')' + _MOB_SEP +
+        r'(?:tries\s+to\s+.*?but\s+)?'  # "tries to X you but" before misses
+        r'misses?\b'
+        r'|You\s+(?:duck\s+under|barely\s+avoid|dodge)\s+(?:the\s+)?(?P<mob_b>.+?)\'s\b'
+        r')',
+        re.IGNORECASE | re.MULTILINE
+    )
+
+    def detect_mob_hit(self, text):
+        """Return mob name if text contains a mob-hits-player message, else None."""
+        m = self._MOB_HIT_RE.search(text)
+        return m.group('mob').strip() if m else None
+
+    def detect_mob_miss(self, text):
+        """Return mob name if text contains a mob-misses-player message, else None."""
+        m = self._MOB_MISS_RE.search(text)
+        if m:
+            mob = m.group('mob_a') or m.group('mob_b')
+            if mob:
+                return mob.strip()
+        return None
 
     COMBAT_ROUND_RE = re.compile(
         r'(?P<attacker>.+?)\s+(?P<verb>hits?|misses?|slashes?|slays?|'
