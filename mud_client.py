@@ -128,6 +128,7 @@ class MUDClient:
 
         # Mob combat stat tracking (receive-thread state)
         self._combat_mob = None           # Normalised mob name currently fighting us
+        self._rescue_sent = False         # True after rescue command sent this combat
         self._kill_cmd_pending = False    # Player sent kill/k command
         self._kill_cmd_target = None      # Target typed by player
         self._last_kill_cmd_time = 0.0
@@ -2012,6 +2013,8 @@ class MUDClient:
 
         if active_mob:
             mob_key = active_mob.lower()
+            if mob_key != self._combat_mob:
+                self._rescue_sent = False  # new fight — allow rescue again
             self._combat_mob = mob_key
 
             # Aggression: mob hit/missed us without a recent player kill command
@@ -2057,9 +2060,21 @@ class MUDClient:
             else:
                 entry['misses'] += 1
 
+        # Combat-end detection: flee or summon clears fight state so rescue stops.
+        if self._combat_mob:
+            if self.mud_parser.detect_flee(text):
+                self._combat_mob = None
+                self._rescue_sent = False
+            elif re.search(
+                r'(?:has summoned you|you are (?:transported|teleported|summoned))',
+                text, re.IGNORECASE
+            ):
+                self._combat_mob = None
+                self._rescue_sent = False
+
         # Rescue check — evaluated on every HP prompt update during combat,
         # independent of the AI agent.  Dispatched to the main thread via after().
-        if new_hp is not None and self._combat_mob:
+        if new_hp is not None and self._combat_mob and not self._rescue_sent:
             cfg = self._rescue_config()
             rescue_cmd = cfg.get('rescue_command', '').strip()
             if rescue_cmd:
@@ -2078,6 +2093,7 @@ class MUDClient:
                             triggered = True
                             reason = f"HP {new_hp} < {mult}x max_hit {max_hit} ({mult * max_hit:.0f})"
                 if triggered:
+                    self._rescue_sent = True
                     msg = f"[Rescue] {reason} — sending: {rescue_cmd}\n"
                     cmd = rescue_cmd
                     self.master.after(0, lambda m=msg, c=cmd: (
@@ -2091,6 +2107,7 @@ class MUDClient:
             self._kill_cmd_pending = False
             self._kill_cmd_target = None
             self._combat_mob = None
+            self._rescue_sent = False
 
         # XP gain — attribute to the most recently killed mob
         xp_gained = self.mud_parser.detect_xp_gain(text)
