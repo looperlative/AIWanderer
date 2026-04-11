@@ -17,6 +17,7 @@ import json
 import os
 import time
 import hashlib
+import statistics
 from collections import deque
 from mud_parser import MUDTextParser
 
@@ -112,6 +113,13 @@ class MUDClient:
         # Auto-score state
         self._suppress_score_output = False
         self._auto_score_job = None
+
+        # Tick timer state
+        self._tick_times = deque(maxlen=10)  # raw inter-event intervals (seconds)
+        self._tick_interval = None           # estimated interval in seconds (float)
+        self._last_tick_time = None          # time.time() of most recent tick event
+        self._tick_countdown_job = None      # after() job id for 1-s countdown updates
+        self._tick_win = None                # dedicated tick-timer Toplevel
 
         # Survival (food/drink) automation state
         self._prev_hunger = None          # Last hunger level seen (for transition detection)
@@ -595,6 +603,7 @@ class MUDClient:
         # Initialize profile list after all UI elements are created
         self.update_profile_list()
         self._rebuild_profile_menu()
+        self._build_tick_window()
     
     def _build_status_panel(self, parent):
         """Build the right-hand character status panel."""
@@ -644,6 +653,7 @@ class MUDClient:
         section("SPELLS")
         self._spells_frame = tk.Frame(parent, bg=BG)
         self._spells_frame.pack(fill=tk.X, padx=4)
+
         self._update_status_panel()
 
     def _update_status_panel(self):
@@ -722,6 +732,7 @@ class MUDClient:
         else:
             tk.Label(self._spells_frame, text="none", bg="#1a1a1a", fg=DIM,
                      font=self._font_status, anchor='w').pack(fill=tk.X)
+
 
     def update_profile_list(self):
         """Update the profile list and rebuild the profile menu"""
@@ -955,6 +966,12 @@ class MUDClient:
         self.session_logger.close()
         self._status_log_label.config(text="Log: off", foreground="gray")
         self._cancel_auto_score()
+        # Reset tick sync state (keep _tick_interval — it's seeded from saved profile)
+        self._tick_times.clear()
+        self._last_tick_time = None
+        if self._tick_countdown_job:
+            self.master.after_cancel(self._tick_countdown_job)
+            self._tick_countdown_job = None
         self.quit_pending = False
         self.quit_stage = 0
         self.quit_prompts_seen = []
@@ -1045,6 +1062,10 @@ class MUDClient:
 
                 # Survival automation (inventory collection)
                 self._survival_handle_text(clean_text)
+
+                # Tick synchronisation
+                if self.mud_parser.detect_tick_event(clean_text):
+                    self.message_queue.put(('tick_event', time.time()))
 
                 # Handle autologin (use clean text without ANSI codes)
                 if self.autologin_pending and self.current_profile:
@@ -1222,6 +1243,12 @@ class MUDClient:
         self._kill_cmd_pending = False
         self._combat_mob = None
         self._last_killed_mob = None
+
+        # Seed tick interval from saved profile value (keeps estimate across sessions)
+        saved_tick = (self.profiles.get(self.current_profile, {})
+                      .get('tick_interval'))
+        if saved_tick and float(saved_tick) > 0:
+            self._tick_interval = float(saved_tick)
         self.message_queue.put(("system", "[Autologin] Login sequence completed\n"))
         if self.room_tracking_enabled:
             self.detect_entry_room = True
@@ -1804,6 +1831,170 @@ class MUDClient:
         self._survival_buy_count -= 1
         self.master.after(350, self._survival_do_buy)
 
+    # ------------------------------------------------------------------
+    # Tick timer
+    # ------------------------------------------------------------------
+
+    _TICK_RELIABLE_SAMPLES = 5   # minimum samples before interval is persisted
+    _TICK_RELIABLE_STDDEV  = 5.0 # max stddev (seconds) for a reliable estimate
+    _TICK_DUPLICATE_GAP    = 20.0 # fixed floor (s) — events closer than this are same-tick duplicates
+
+    def _on_tick_event(self, now):
+        """Called on the main thread when a tick-boundary message is received.
+
+        _tick_times stores RAW inter-event intervals (not corrected per-tick
+        durations).  The actual tick-period estimate is recomputed from the raw
+        intervals each time via _estimate_tick_period(), which handles multi-tick
+        gaps robustly using iterative median refinement.
+
+        Storing raw values means a previously bad estimate never permanently
+        corrupts the deque — the algorithm self-heals as new data arrives.
+        """
+        prev = self._last_tick_time
+
+        if prev is None:
+            # First sync this session — no diff yet.
+            self._last_tick_time = now
+            # If we have a seeded interval from a saved profile, show countdown
+            # immediately; otherwise wait silently for the second event.
+            if self._tick_interval is not None:
+                self._start_tick_countdown()
+            return
+
+        elapsed = now - prev
+
+        # Same-tick duplicate guard: multiple messages can fire on the same tick
+        # boundary (e.g. weather + spell expiry arrive together).  Use a fixed
+        # floor instead of a fraction of the current estimate — a mis-calibrated
+        # estimate would otherwise swallow genuine single-tick events and prevent
+        # the estimate from ever self-correcting.
+        if elapsed < self._TICK_DUPLICATE_GAP:
+            return  # duplicate — do NOT update _last_tick_time
+
+        self._last_tick_time = now
+        self._tick_times.append(elapsed)   # raw inter-event interval
+
+        self._tick_interval = self._estimate_tick_period(
+            list(self._tick_times), self._tick_interval)
+
+        # Persist once the estimate is reliable
+        if (len(self._tick_times) >= self._TICK_RELIABLE_SAMPLES and
+                self.current_profile and self.current_profile in self.profiles):
+            est = self._tick_interval
+            corrected = [d / max(1, round(d / est)) for d in self._tick_times]
+            variance = sum((d - est) ** 2 for d in corrected) / len(corrected)
+            if variance ** 0.5 < self._TICK_RELIABLE_STDDEV:
+                saved = self.profiles[self.current_profile].get('tick_interval')
+                if saved != round(est, 1):
+                    self.profiles[self.current_profile]['tick_interval'] = round(est, 1)
+                    self.save_profiles()
+
+        self._start_tick_countdown()
+
+    @staticmethod
+    def _estimate_tick_period(raw_intervals, current_estimate=None):
+        """Return the fundamental tick period from raw inter-event gaps.
+
+        Observed gaps may be integer multiples of the real tick because only
+        some ticks produce a detectable message.  The algorithm:
+
+        1. Seeds the estimate from the smallest observed interval (can't be
+           shorter than one tick) or the current saved estimate, whichever is
+           smaller — giving it the best possible starting point.
+        2. Repeatedly divides each raw interval by round(d/estimate) to get a
+           per-tick duration, then takes the median of those corrected values as
+           the new estimate.  Median is used (not mean) to be robust against
+           outliers.
+        3. Iterates until convergence (typically 3–5 passes).
+
+        If we have even one single-tick observation in the deque the algorithm
+        converges to the correct period; incorrect prior estimates stored in
+        the deque are corrected automatically once single-tick data arrives.
+        """
+        if not raw_intervals:
+            return current_estimate
+
+        min_raw = min(raw_intervals)
+        if current_estimate:
+            # Take the smaller of the two — the true tick can't exceed the
+            # shortest interval we've ever observed.
+            estimate = min(current_estimate, min_raw)
+        else:
+            estimate = min_raw
+
+        for _ in range(12):
+            corrected = [d / max(1, round(d / estimate)) for d in raw_intervals]
+            new_est = statistics.median(corrected)
+            if abs(new_est - estimate) < 0.05:
+                break
+            estimate = new_est
+
+        return estimate
+
+    def _build_tick_window(self):
+        """Create the always-on-top tick timer window (called once)."""
+        BG     = "#1a1a1a"
+        FG     = "#d4d4d4"
+        HDR_FG = "#4ec9b0"
+        win = tk.Toplevel(self.master)
+        win.title("Tick")
+        win.configure(bg=BG)
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", lambda: None)  # prevent close
+
+        tk.Label(win, text="\u2500 TICK TIMER \u2500", bg=BG, fg=HDR_FG,
+                 font=self._font_status_hdr, anchor='w').pack(fill=tk.X, padx=6, pady=(6, 2))
+
+        self._sv_tick_interval = tk.StringVar(value="--")
+        self._sv_tick_next     = tk.StringVar(value="--")
+
+        for label, var in (("Interval:", self._sv_tick_interval),
+                           ("Next tick:", self._sv_tick_next)):
+            row = tk.Frame(win, bg=BG)
+            row.pack(fill=tk.X, padx=6, pady=1)
+            tk.Label(row, text=label, bg=BG, fg=FG,
+                     font=self._font_status, anchor='w', width=9).pack(side=tk.LEFT)
+            tk.Label(row, textvariable=var, bg=BG, fg=FG,
+                     font=self._font_status, anchor='w').pack(side=tk.LEFT)
+
+        # Restore saved position
+        pos = self.profiles.get('_settings', {}).get('tick_win_geometry')
+        if pos:
+            win.geometry(pos)
+        else:
+            win.geometry("+100+100")
+
+        def _on_move(event):
+            self.profiles.setdefault('_settings', {})['tick_win_geometry'] = win.geometry()
+            self.save_profiles()
+        win.bind("<Configure>", _on_move)
+
+        self._tick_win = win
+
+    def _start_tick_countdown(self):
+        """Cancel any running countdown and start a fresh one."""
+        if self._tick_countdown_job:
+            self.master.after_cancel(self._tick_countdown_job)
+            self._tick_countdown_job = None
+        self._tick_countdown_update()
+
+    def _tick_countdown_update(self):
+        """Update tick window labels every second — no widget destruction."""
+        if self._last_tick_time and self._tick_interval and self._tick_interval > 0:
+            elapsed = time.time() - self._last_tick_time
+            remaining = self._tick_interval - elapsed
+            self._sv_tick_interval.set(f"~{self._tick_interval:.0f}s")
+            self._sv_tick_next.set(f"{remaining:.0f}s" if remaining > 0 else "now")
+            # Keep the loop running unconditionally so the display automatically
+            # picks up the next tick event (which resets _last_tick_time) without
+            # needing an explicit restart call.
+            self._tick_countdown_job = self.master.after(1000, self._tick_countdown_update)
+        else:
+            self._sv_tick_interval.set("--")
+            self._sv_tick_next.set("--")
+            self._tick_countdown_job = None
+
     _KILL_RE = re.compile(r'^.+ is dead!\s+R\.I\.P\.$', re.MULTILINE)
 
     def _handle_autoloot(self, text):
@@ -2249,6 +2440,8 @@ class MUDClient:
                                 "Try buying manually.\n", "system")
                         else:
                             self._survival_start_buying(count)
+                elif msg_type == "tick_event":
+                    self._on_tick_event(msg_data)
                 elif msg_type == "disconnect":
                     self.append_text(msg_data, "system")
                     self.disconnect()
@@ -2302,16 +2495,22 @@ class MUDClient:
                 self._kill_cmd_target = kill_match.group(1).strip()
                 self._last_kill_cmd_time = time.time()
 
-            # Speedwalk: a string of only n/s/e/w letters (2+ chars) expands to
-            # one command per letter, e.g. "nnew" -> "n", "n", "e", "w"
-            if len(message_lower) > 1 and re.fullmatch(r'[nsewud]+', message_lower):
-                self.input_entry.delete(0, tk.END)
-                payload = "".join(ch + "\n" for ch in message_lower)
-                self.ssl_socket.sendall(payload.encode('utf-8'))
-                self.append_text(f"> {message_lower}  [speedwalk: {len(message_lower)} steps]\n", "user")
-                self._pending_command = message_lower[-1]
-                self._response_buffer = []
-                return
+            # Speedwalk: a string of direction tokens (2+ steps) expands to one
+            # command per step.  Each token is an optional repeat count followed
+            # by a direction letter, e.g. "3n2ew" -> n n n e w
+            _sw_tokens = re.fullmatch(r'(\d*[nsewud])+', message_lower)
+            if _sw_tokens:
+                steps = [m.group(2)
+                         for m in re.finditer(r'(\d*)([nsewud])', message_lower)
+                         for _ in range(int(m.group(1)) if m.group(1) else 1)]
+                if len(steps) > 1 or (len(steps) == 1 and steps[0] != message_lower):
+                    self.input_entry.delete(0, tk.END)
+                    payload = "".join(s + "\n" for s in steps)
+                    self.ssl_socket.sendall(payload.encode('utf-8'))
+                    self.append_text(f"> {message_lower}  [speedwalk: {len(steps)} steps]\n", "user")
+                    self._pending_command = steps[-1]
+                    self._response_buffer = []
+                    return
 
             # Track movement/look commands for room tracking
             if self.room_tracking_enabled and message_lower in self.movement_commands:

@@ -430,6 +430,34 @@ class MUDTextParser:
         return None
 
     # ------------------------------------------------------------------
+    # Tick event detection
+    # ------------------------------------------------------------------
+    #
+    # These messages are only sent by CircleMUD on a tick boundary, making
+    # them reliable synchronisation signals for estimating the tick interval.
+    # Source: weather changes, day/night transitions, spell expiry, and
+    # spontaneous hunger/thirst notifications.
+
+    _TICK_EVENT_RE = re.compile(
+        r'(?:the sun rises in the east'
+        r'|the day has begun'
+        r'|the night has begun'
+        r'|it starts to rain'
+        r'|the clouds disappear'
+        r'|the sun slowly disappears in the west'
+        r'|the lightning stops'
+        r'|white aura around your body fades'
+        r'|you feel less protected'
+        r'|you feel less righteous'
+        r'|you are (?:hungry|thirsty))',
+        re.IGNORECASE
+    )
+
+    def detect_tick_event(self, text):
+        """Return True if text contains a known tick-boundary message."""
+        return bool(self._TICK_EVENT_RE.search(text))
+
+    # ------------------------------------------------------------------
     # XP / experience gain
     # ------------------------------------------------------------------
 
