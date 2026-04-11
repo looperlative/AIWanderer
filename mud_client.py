@@ -2731,15 +2731,6 @@ class MUDClient:
         self.advisor_area.delete(1.0, tk.END)
         self.advisor_area.config(state=tk.DISABLED)
 
-    def _on_speed_change(self, value):
-        """Update AI agent command delay from the speed slider (legacy)."""
-        if self.ai_agent:
-            self.ai_agent.COMMAND_DELAY_MS = int(float(value))
-
-    def toggle_ai_mode(self):
-        """Toggle the autonomous AI exploration agent on or off (legacy — autonomous disabled)."""
-        pass
-
     def open_ai_config(self):
         """Open the AI configuration dialog for the current profile."""
         profile_name = self.profile_var.get()
@@ -2984,27 +2975,14 @@ class MUDClient:
             a = self.ai_agent
             s = a.state
             out.append(f"agent.is_running:     {a.is_running}")
-            out.append(f"agent._waiting_room:  {a._waiting_for_room}")
-            out.append(f"agent._waiting_llm:   {a._waiting_for_llm}")
-            out.append(f"agent._combat:        {a._combat_active}")
-            out.append(f"agent._dead:          {a._dead}")
             out.append(f"agent._last_dir:      {a._last_direction}")
-            out.append(f"agent.COMMAND_DELAY:  {a.COMMAND_DELAY_MS}ms")
-            out.append(f"state.current_goal:   {s.current_goal}")
             out.append(f"state.visited:        {len(s.visited)} rooms")
             out.append(f"state.frontier:       {len(s.frontier)} rooms")
             out.append(f"state.danger_rooms:   {len(s.danger_rooms)}")
             out.append(f"state.dead_ends:      {dict((k[:8], list(v)) for k,v in s.dead_ends.items())}")
             out.append(f"state.hp/mp/mv:       {s.current_hp}/{s.current_mp}/{s.current_mv}")
             out.append(f"state.hunger/thirst:  {s.hunger_level} / {s.thirst_level}")
-            out.append(f"state.has_light:      {s.has_light}")
-            out.append(f"state.water_room:     {s.water_room}")
-            out.append(f"state.food_room:      {s.food_room}")
             out.append(f"state.gold:           {s.gold}")
-            out.append(f"state.seeking:        {s.seeking_resource}")
-            # Show what choose_next_direction would do right now
-            direction = a._choose_next_direction()
-            out.append(f"next_direction:       {direction!r}")
         else:
             out.append("ai_agent:             (not created)")
 
