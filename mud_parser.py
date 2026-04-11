@@ -212,7 +212,7 @@ class MUDTextParser:
         return result if result else None
 
     _SCORE_BLOCK_RE = re.compile(
-        r'\b(?:hit points?|armor class|armour class|experience|your score|your stats?)\b',
+        r'\b(?:hit points?|armor class|armour class|your score|your stats?)\b',
         re.IGNORECASE
     )
 
