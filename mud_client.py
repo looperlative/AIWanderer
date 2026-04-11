@@ -1236,6 +1236,9 @@ class MUDClient:
 
     def _redirect_focus_to_entry(self, event):
         """Keep keyboard focus in the input entry whenever the main window is active."""
+        # event.widget can be a bare string (Tk path) for destroyed widgets
+        if not isinstance(event.widget, tk.Misc):
+            return
         # Allow focus in dialog boxes (Toplevel windows other than master)
         if event.widget.winfo_toplevel() is not self.master:
             return
@@ -2750,6 +2753,23 @@ class MUDClient:
         self.advisor_area.delete(1.0, tk.END)
         self.advisor_area.config(state=tk.DISABLED)
 
+    @staticmethod
+    def _load_llm_local():
+        """Load host-local LLM overrides from ~/.mud_client_llm_local.json."""
+        path = os.path.join(os.path.expanduser("~"), ".mud_client_llm_local.json")
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    @staticmethod
+    def _save_llm_local(data):
+        """Write host-local LLM overrides to ~/.mud_client_llm_local.json."""
+        path = os.path.join(os.path.expanduser("~"), ".mud_client_llm_local.json")
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+
     def open_ai_config(self):
         """Open the AI configuration dialog for the current profile."""
         profile_name = self.profile_var.get()
@@ -2757,12 +2777,26 @@ class MUDClient:
             messagebox.showwarning("AI Config", "Please select a profile first.")
             return
         profile = self.profiles[profile_name]
-        current_cfg = profile.get('ai_config', {})
-        dialog = AIConfigDialog(self.master, current_cfg)
+        base_cfg = profile.get('ai_config', {})
+        local_all = self._load_llm_local()
+        local_overrides = local_all.get(profile_name, {})
+        # Show merged config so the dialog reflects what's actually in effect
+        merged_cfg = dict(base_cfg)
+        merged_cfg.update(local_overrides)
+        dialog = AIConfigDialog(self.master, merged_cfg, local_overrides)
         if dialog.result is not None:
             profile['ai_config'] = dialog.result
+            # Clear host-local overrides for this profile since user chose
+            # "Save to Profile" (shared config)
+            if profile_name in local_all:
+                del local_all[profile_name]
+                self._save_llm_local(local_all)
             self.save_profiles()
             self.append_text("[AI Config saved to profile.]\n", "system")
+        elif dialog.local_result is not None:
+            local_all[profile_name] = dialog.local_result
+            self._save_llm_local(local_all)
+            self.append_text("[AI Config saved to this host only.]\n", "system")
 
     def open_color_calibration(self):
         """Open the Room Colors calibration dialog."""
@@ -3209,13 +3243,19 @@ class RunOnceDialog:
 class AIConfigDialog:
     """Dialog for configuring the LLM backend used by the AI agent."""
 
-    def __init__(self, parent, current_cfg):
-        self.result = None
+    # Keys that the "Save to Host" button writes to the local override file.
+    _LLM_KEYS = ("llm_backend", "llm_endpoint", "llm_model",
+                 "claude_model", "claude_api_key")
+
+    def __init__(self, parent, current_cfg, local_overrides=None):
+        self.result = None          # set on "Save to Profile"
+        self.local_result = None    # set on "Save to Host"
         cfg = current_cfg or {}
+        self._local_overrides = local_overrides or {}
 
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("AI / LLM Configuration")
-        self.dialog.geometry("480x320")
+        self.dialog.geometry("480x370")
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self.dialog.resizable(False, False)
@@ -3260,10 +3300,22 @@ class AIConfigDialog:
                          foreground="gray", font=("TkDefaultFont", 8))
         note.grid(row=5, column=0, columnspan=2, pady=4)
 
+        # Indicator when host-local overrides are active
+        if self._local_overrides:
+            local_note = ttk.Label(
+                self.dialog,
+                text="* LLM settings shown include host-local overrides.",
+                foreground="#e5e510", font=("TkDefaultFont", 8))
+            local_note.grid(row=6, column=0, columnspan=2, pady=0)
+
         btn_frame = ttk.Frame(self.dialog)
-        btn_frame.grid(row=6, column=0, columnspan=2, pady=12)
-        ttk.Button(btn_frame, text="Save", command=self._save).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=self.dialog.destroy).pack(side=tk.LEFT, padx=5)
+        btn_frame.grid(row=7, column=0, columnspan=2, pady=12)
+        ttk.Button(btn_frame, text="Save to Profile",
+                   command=self._save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Save to Host",
+                   command=self._save_local).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel",
+                   command=self.dialog.destroy).pack(side=tk.LEFT, padx=5)
 
         self._on_backend_change()
         self.dialog.wait_window()
@@ -3277,15 +3329,21 @@ class AIConfigDialog:
         self.claude_model_entry.config(state=state_claude)
         self.api_key_entry.config(state=state_claude)
 
-    def _save(self):
-        backend = self.backend_var.get()
-        self.result = {
-            "llm_backend":    backend,
+    def _gather(self):
+        return {
+            "llm_backend":    self.backend_var.get(),
             "llm_endpoint":   self.endpoint_entry.get().strip(),
             "llm_model":      self.model_entry.get().strip(),
             "claude_model":   self.claude_model_entry.get().strip(),
             "claude_api_key": self.api_key_entry.get().strip(),
         }
+
+    def _save(self):
+        self.result = self._gather()
+        self.dialog.destroy()
+
+    def _save_local(self):
+        self.local_result = self._gather()
         self.dialog.destroy()
 
 

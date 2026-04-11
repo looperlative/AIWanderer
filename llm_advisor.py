@@ -21,6 +21,7 @@ Configuration (stored in profile["ai_config"]):
 
 import http.client
 import json
+import os
 import re
 import threading
 import urllib.parse
@@ -743,4 +744,21 @@ class LLMAdvisor:
         if not self.client.current_profile:
             return None
         profile = self.client.profiles.get(self.client.current_profile, {})
-        return profile.get('ai_config')
+        cfg = profile.get('ai_config')
+        if cfg is None:
+            return None
+        # Merge host-local LLM overrides (not synced via Dropbox)
+        local_path = os.path.join(
+            os.path.expanduser("~"), ".mud_client_llm_local.json"
+        )
+        try:
+            with open(local_path, 'r') as f:
+                local = json.load(f)
+            overrides = local.get(self.client.current_profile)
+            if overrides:
+                merged = dict(cfg)
+                merged.update(overrides)
+                return merged
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        return cfg
