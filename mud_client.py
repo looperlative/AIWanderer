@@ -2272,8 +2272,10 @@ class MUDClient:
             ht = self.mud_parser.detect_hunger_thirst(text)
             updates.update(ht)
 
-        # Buff expiration messages
+        # Buff application and expiration messages
         buff_events = self.mud_parser.detect_buff_events(text)
+        if buff_events['applied']:
+            updates['spells_applied'] = buff_events['applied']
         if buff_events['expired']:
             updates['spells_expired'] = buff_events['expired']
 
@@ -2449,8 +2451,13 @@ class MUDClient:
                     self.append_text(msg_data, "error")
                     self.disconnect()
                 elif msg_type == "stats":
+                    applied = msg_data.pop('spells_applied', [])
                     expired = msg_data.pop('spells_expired', [])
                     self.char_stats.update(msg_data)
+                    if applied:
+                        spells = self.char_stats.setdefault('spells', {})
+                        for s in applied:
+                            spells[s] = self.mud_parser.BUFF_DEFAULT_TICKS.get(s, 4)
                     if expired:
                         spells = self.char_stats.get('spells', {})
                         for s in expired:

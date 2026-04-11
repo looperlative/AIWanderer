@@ -264,6 +264,16 @@ class MUDTextParser:
         re.IGNORECASE
     )
 
+    # Eat/drink success messages that clear hunger/thirst.
+    # "You are full" appears after both eating and drinking (drink container
+    # being full), so we only treat it as hunger-cleared when "You eat" also
+    # appears in the same text chunk.
+    _ATE_SOMETHING_RE = re.compile(r'\byou eat\b', re.IGNORECASE)
+    _EAT_FULL_RE = re.compile(r'\byou are full\b', re.IGNORECASE)
+    _DRINK_SUCCESS_RE = re.compile(
+        r"\bdon't feel thirsty any more\b", re.IGNORECASE
+    )
+
     def detect_hunger_thirst(self, text):
         """
         Detect spontaneous hunger/thirst notification messages.
@@ -280,10 +290,14 @@ class MUDTextParser:
         if m:
             raw = m.group('v').lower()
             result['hunger'] = 'starving' if ('starv' in raw or 'famish' in raw or 'dying' in raw) else 'hungry'
+        elif self._EAT_FULL_RE.search(text) and self._ATE_SOMETHING_RE.search(text):
+            result['hunger'] = 'OK'
         m = self._SPONTANEOUS_THIRST_RE.search(text)
         if m:
             raw = m.group('v').lower()
             result['thirst'] = 'parched' if ('parch' in raw or 'dying' in raw) else 'thirsty'
+        elif self._DRINK_SUCCESS_RE.search(text):
+            result['thirst'] = 'OK'
         return result
 
     def parse_spell_affects(self, text):
@@ -338,7 +352,8 @@ class MUDTextParser:
 
     _BUFF_APPLIED_PATTERNS = {
         'bless':     re.compile(r'you feel righteous', re.IGNORECASE),
-        'sanctuary': re.compile(r'you feel someone protecting you', re.IGNORECASE),
+        'sanctuary': re.compile(r'white aura momentarily surrounds you', re.IGNORECASE),
+        'armor':     re.compile(r'you feel someone protecting you', re.IGNORECASE),
     }
 
     _BUFF_EXPIRED_PATTERNS = {
