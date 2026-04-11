@@ -1732,14 +1732,15 @@ class MUDClient:
 
     def _survival_handle_text(self, text):
         """Called from the receive thread to collect inventory output."""
-        if self._survival_state != 'inv_wait':
+        if self._survival_state not in ('inv_wait', 'eat_inv_wait'):
             return
         self._survival_inv_text += text
         # Wait for a prompt line before processing
         if self.last_line.rstrip().endswith('>'):
             full_text = self._survival_inv_text
             self._survival_inv_text = ''
-            self.message_queue.put(('survival_inv', full_text))
+            msg_type = 'survival_inv' if self._survival_state == 'inv_wait' else 'eat_inv'
+            self.message_queue.put((msg_type, full_text))
 
     # ── Auto-eat / auto-drink ─────────────────────────────────────────
 
@@ -1759,6 +1760,10 @@ class MUDClient:
             food = cfg.get('food_item')
             if food:
                 self._survival_send_cmd(f"eat {food}")
+                if self._survival_state is None:
+                    self._survival_state = 'eat_inv_wait'
+                    self._survival_inv_text = ''
+                    self.master.after(600, lambda: self._survival_send_cmd('inventory'))
 
         if bad_thirst and not prev_bad_thirst:
             container = cfg.get('drink_container')
@@ -2462,6 +2467,20 @@ class MUDClient:
                                 "Try buying manually.\n", "system")
                         else:
                             self._survival_start_buying(count)
+                elif msg_type == "eat_inv":
+                    food_item = self._fd_config().get('food_item', '').strip()
+                    if food_item and self._survival_state == 'eat_inv_wait':
+                        count = self.mud_parser.parse_inventory_count(msg_data, food_item)
+                        self._survival_state = None
+                        if count is not None and count <= 2:
+                            if count == 0:
+                                self.append_text(
+                                    f"[Survival] No {food_item} left in inventory! "
+                                    "Visit the food store.\n", "system")
+                            else:
+                                self.append_text(
+                                    f"[Survival] Only {count} {food_item} left in "
+                                    "inventory.\n", "system")
                 elif msg_type == "tick_event":
                     self._on_tick_event()
                 elif msg_type == "disconnect":
