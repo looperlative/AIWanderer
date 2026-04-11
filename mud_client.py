@@ -117,7 +117,6 @@ class MUDClient:
         self._tick_interval = None  # known tick period (seconds, multiple of 5)
         self._tick_count    = None  # seconds counted since last reset (None = not started)
         self._tick_countdown_job = None      # after() job id for 1-s countdown updates
-        self._tick_win = None                # dedicated tick-timer Toplevel
 
         # Survival (food/drink) automation state
         self._prev_hunger = None          # Last hunger level seen (for transition detection)
@@ -552,11 +551,20 @@ class MUDClient:
         self.master.after(100, lambda: paned.sash_place(0, 0,
             int(self.master.winfo_height() * 0.70)))
 
-        # ── Right-hand character status panel ─────────────────────────
-        status_panel = tk.Frame(content_frame, bg="#1a1a1a", width=190)
-        status_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(3, 0))
-        status_panel.pack_propagate(False)
-        self._build_status_panel(status_panel)
+        # ── Right-hand column: tick timer (top) + status panel (bottom) ──
+        right_col = tk.Frame(content_frame, bg="#1a1a1a", width=190)
+        right_col.pack(side=tk.RIGHT, fill=tk.Y, padx=(3, 0))
+        right_col.pack_propagate(False)
+
+        tick_frame = tk.Frame(right_col, bg="#1a1a1a")
+        tick_frame.pack(fill=tk.X)
+        self._build_tick_panel(tick_frame)
+
+        tk.Frame(right_col, bg="#3a3a3a", height=1).pack(fill=tk.X, pady=(4, 0))
+
+        status_frame = tk.Frame(right_col, bg="#1a1a1a")
+        status_frame.pack(fill=tk.BOTH, expand=True)
+        self._build_status_panel(status_frame)
 
         # ── Status bar ────────────────────────────────────────────────
         status_bar = ttk.Frame(self.master, relief=tk.SUNKEN)
@@ -601,7 +609,6 @@ class MUDClient:
         # Initialize profile list after all UI elements are created
         self.update_profile_list()
         self._rebuild_profile_menu()
-        self._build_tick_window()
     
     def _build_status_panel(self, parent):
         """Build the right-hand character status panel."""
@@ -1859,46 +1866,26 @@ class MUDClient:
         self._tick_count = 0
         self._start_tick_countdown()
 
-    def _build_tick_window(self):
-        """Create the always-on-top tick timer window (called once)."""
+    def _build_tick_panel(self, parent):
+        """Build the tick timer section into the top of the right column."""
         BG     = "#1a1a1a"
         FG     = "#d4d4d4"
         HDR_FG = "#4ec9b0"
-        win = tk.Toplevel(self.master)
-        win.title("Tick")
-        win.configure(bg=BG)
-        win.attributes("-topmost", True)
-        win.resizable(False, False)
-        win.protocol("WM_DELETE_WINDOW", lambda: None)  # prevent close
 
-        tk.Label(win, text="\u2500 TICK TIMER \u2500", bg=BG, fg=HDR_FG,
-                 font=self._font_status_hdr, anchor='w').pack(fill=tk.X, padx=6, pady=(6, 2))
+        tk.Label(parent, text="\u2500 TICK TIMER \u2500", bg=BG, fg=HDR_FG,
+                 font=self._font_status_hdr, anchor='w').pack(fill=tk.X, padx=4, pady=(6, 1))
 
         self._sv_tick_interval = tk.StringVar(value="--")
         self._sv_tick_next     = tk.StringVar(value="--")
 
         for label, var in (("Interval:", self._sv_tick_interval),
                            ("Next tick:", self._sv_tick_next)):
-            row = tk.Frame(win, bg=BG)
-            row.pack(fill=tk.X, padx=6, pady=1)
+            row = tk.Frame(parent, bg=BG)
+            row.pack(fill=tk.X, padx=4, pady=1)
             tk.Label(row, text=label, bg=BG, fg=FG,
                      font=self._font_status, anchor='w', width=9).pack(side=tk.LEFT)
             tk.Label(row, textvariable=var, bg=BG, fg=FG,
                      font=self._font_status, anchor='w').pack(side=tk.LEFT)
-
-        # Restore saved position
-        pos = self.profiles.get('_settings', {}).get('tick_win_geometry')
-        if pos:
-            win.geometry(pos)
-        else:
-            win.geometry("+100+100")
-
-        def _on_move(event):
-            self.profiles.setdefault('_settings', {})['tick_win_geometry'] = win.geometry()
-            self.save_profiles()
-        win.bind("<Configure>", _on_move)
-
-        self._tick_win = win
 
     def _start_tick_countdown(self):
         """Cancel any running countdown and start a fresh one."""
