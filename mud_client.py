@@ -100,6 +100,11 @@ class MUDClient:
 
         # LLM advisor state
         self.llm_advisor = None
+
+        # LLM skill engine state
+        self.skill_engine = None
+        self._skill_rescue_flag = False  # set by rescue path, consumed on next prompt
+        self._skill_target_killed = False  # set when a kill line fires during active skill
         self._pending_command = None   # last human command sent (awaiting MUD response)
         self._response_buffer = []     # MUD lines received since last command
         self._advisor_active = True    # LLM advisor on/off
@@ -509,6 +514,11 @@ class MUDClient:
         settings_menu.add_separator()
         settings_menu.add_command(label="AI Config...", command=self.open_ai_config)
         settings_menu.add_command(label="Room Colors...", command=self.open_color_calibration)
+
+        # Skills submenu
+        self._skills_menu = tk.Menu(settings_menu, tearoff=0,
+                                    postcommand=self._rebuild_skills_menu)
+        settings_menu.add_cascade(label="Skills", menu=self._skills_menu)
 
         # Commands menu (top 20 by frequency score)
         self._cmd_menu = tk.Menu(menubar, tearoff=0,
@@ -1059,14 +1069,23 @@ class MUDClient:
                         self.last_line = line.strip()
                         break
 
-                # Accumulate MUD response for LLM advisor
-                if self._pending_command is not None:
-                    for ln in clean_text.splitlines():
-                        if ln.strip():
-                            self._response_buffer.append(ln.rstrip())
-                    # Detect MUD command prompt — trigger advisor when prompt arrives
-                    if self.last_line.rstrip().endswith('>') and self._advisor_active \
-                            and self.llm_advisor:
+                # Accumulate MUD response for LLM advisor / skill engine.
+                # Always append so the skill engine (which fires on every prompt,
+                # not just after user-typed commands) has fresh context. The
+                # advisor path still gates on _pending_command below.
+                for ln in clean_text.splitlines():
+                    if ln.strip():
+                        self._response_buffer.append(ln.rstrip())
+
+                # Detect MUD command prompt — trigger skill on every prompt,
+                # trigger advisor only when there's a pending user command.
+                if self.last_line.rstrip().endswith('>'):
+                    # Skill goes first so it sees _response_buffer before the
+                    # advisor consumes and clears it.
+                    if self.skill_engine and self.skill_engine.is_active():
+                        self.master.after(0, self._trigger_skill)
+                    if self._pending_command is not None \
+                            and self._advisor_active and self.llm_advisor:
                         self.master.after(0, self._trigger_advisor)
 
                 # Parse character stats and queue status panel update
@@ -2112,6 +2131,7 @@ class MUDClient:
                             reason = f"HP {new_hp} < {mult}x max_hit {max_hit} ({mult * max_hit:.0f})"
                 if triggered:
                     self._rescue_sent = True
+                    self._skill_rescue_flag = True
                     msg = f"[Rescue] {reason} — sending: {rescue_cmd}\n"
                     cmd = rescue_cmd
                     self.master.after(0, lambda m=msg, c=cmd: (
@@ -2121,6 +2141,8 @@ class MUDClient:
 
         # Kill confirmed — note which mob was killed so we can attach XP
         if self._KILL_RE.search(text):
+            if self.skill_engine and self.skill_engine.is_active():
+                self._skill_target_killed = True
             self._last_killed_mob = self._combat_mob
             self._kill_cmd_pending = False
             self._kill_cmd_target = None
@@ -2739,6 +2761,178 @@ class MUDClient:
             return
         self._advisor_busy = True
         self.llm_advisor.request_direct(prompt, self._on_advisor_result)
+
+    # ------------------------------------------------------------------
+    # LLM Skills
+    # ------------------------------------------------------------------
+
+    def _ensure_skill_engine(self):
+        if self.skill_engine is None:
+            from skill_engine import SkillEngine
+            self.skill_engine = SkillEngine(self)
+        return self.skill_engine
+
+    def _current_skills(self):
+        """Return the skills dict for the current profile (creating it if needed)."""
+        if not self.current_profile or self.current_profile not in self.profiles:
+            return {}
+        return self.profiles[self.current_profile].setdefault('skills', {})
+
+    def _rebuild_skills_menu(self):
+        """Populate the Settings → Skills submenu based on the current profile."""
+        menu = self._skills_menu
+        menu.delete(0, tk.END)
+        menu.add_command(label="Manage Skills...", command=self._open_skills_dialog)
+        menu.add_separator()
+        skills = self._current_skills()
+        active = self.skill_engine.active_name() if self.skill_engine else None
+        if skills:
+            run_menu = tk.Menu(menu, tearoff=0)
+            menu.add_cascade(label="Run", menu=run_menu)
+            for name in sorted(skills.keys()):
+                run_menu.add_command(
+                    label=name,
+                    command=lambda n=name: self._start_skill(n)
+                )
+        else:
+            menu.add_command(label="Run  (no skills defined)", state=tk.DISABLED)
+        menu.add_separator()
+        if active:
+            menu.add_command(label=f"Stop: {active}", command=self._stop_skill)
+        else:
+            menu.add_command(label="Stop", state=tk.DISABLED)
+
+    def _open_skills_dialog(self):
+        if not self.current_profile or self.current_profile not in self.profiles:
+            messagebox.showwarning("Skills", "Please select a profile first.")
+            return
+        SkillsDialog(self.master, self)
+
+    def _start_skill(self, name):
+        skills = self._current_skills()
+        cfg = skills.get(name)
+        if not cfg:
+            messagebox.showwarning("Skills", f"Skill '{name}' not found.")
+            return
+        if not self.connected:
+            messagebox.showwarning("Skills", "Connect to the MUD before starting a skill.")
+            return
+        if not self.llm_advisor or not self.llm_advisor.is_available():
+            messagebox.showwarning("Skills", "Configure the LLM (AI Config) first.")
+            return
+        engine = self._ensure_skill_engine()
+        if engine.is_active():
+            messagebox.showwarning("Skills",
+                                   f"A skill is already active: {engine.active_name()}.\n"
+                                   "Stop it first.")
+            return
+        engine.start(name, cfg)
+        self._skill_rescue_flag = False
+        self._skill_target_killed = False
+        self.append_text(f"[Skill] started: {name}\n", "system")
+        self.session_logger.log_command(f"[Skill start] {name}")
+        # Fire an immediate first turn so the LLM can plan, even before the
+        # next MUD prompt arrives.
+        self.master.after(50, self._trigger_skill)
+
+    def _stop_skill(self):
+        if self.skill_engine and self.skill_engine.is_active():
+            name = self.skill_engine.active_name()
+            self.skill_engine.stop()
+            self.append_text(f"[Skill] stopped: {name}\n", "system")
+            self.session_logger.log_command(f"[Skill stop] {name}")
+
+    _SPEEDWALK_RE = re.compile(r'^\s*(?:\d*[nsewudNSEWUD]\s*)+$')
+    _SPEEDWALK_STEP_RE = re.compile(r'(\d*)([nsewudNSEWUD])')
+
+    def _expand_speedwalk(self, cmd):
+        """If cmd is a speedwalk string like '5n3w4s', return a list of single-
+        direction commands. Return None if cmd is not a speedwalk.
+
+        Only expand if the whole command consists of (optional count + direction)
+        tokens and at least one token has a count > 1 OR there are multiple
+        tokens. A plain 'n' is returned as None so it dispatches unchanged.
+        """
+        if not isinstance(cmd, str) or not self._SPEEDWALK_RE.match(cmd):
+            return None
+        steps = []
+        tokens = 0
+        has_count = False
+        for m in self._SPEEDWALK_STEP_RE.finditer(cmd):
+            tokens += 1
+            n = int(m.group(1)) if m.group(1) else 1
+            if m.group(1) and n > 1:
+                has_count = True
+            steps.extend([m.group(2).lower()] * n)
+        if tokens <= 1 and not has_count:
+            return None
+        return steps
+
+    def _trigger_skill(self):
+        """Feed the current skill engine one turn of context."""
+        engine = self.skill_engine
+        if not engine or not engine.is_active():
+            return
+        mud_lines = list(self._response_buffer)
+        # If the advisor isn't also running, it won't drain the buffer — drain
+        # it here so it doesn't grow without bound. If the advisor IS running,
+        # it will drain independently; double-drain is harmless.
+        if self._pending_command is None:
+            self._response_buffer = []
+        stats = dict(self.char_stats)
+        combat_mob = self._combat_mob
+        rescue_flag = self._skill_rescue_flag
+        self._skill_rescue_flag = False
+        target_killed = self._skill_target_killed
+        engine.on_prompt(mud_lines, stats, combat_mob, rescue_flag,
+                         self._on_skill_result, target_killed=target_killed)
+
+    def _on_skill_result(self, result, skill_name):
+        """Called on the main thread when the skill LLM replies."""
+        engine = self.skill_engine
+        if not engine or engine.active_name() != skill_name:
+            return  # user stopped or swapped skills mid-flight
+        if result is None:
+            self.append_text("[Skill] LLM reply could not be parsed; stopping skill.\n",
+                             "error")
+            engine.stop()
+            return
+        note = result.get("note", "")
+        if note:
+            self.append_text(f"[Skill] {note}\n", "system")
+        commands = result.get("commands", [])
+        if commands:
+            # Record what the LLM emitted (speedwalk strings stay intact in the
+            # ledger so the LLM reasons at that level on the next turn).
+            engine.record_dispatched(commands)
+            # Expand any speedwalk commands into their constituent directions
+            # for dispatch, since the MUD itself does not understand speedwalks.
+            dispatch = []
+            for c in commands:
+                expanded = self._expand_speedwalk(c)
+                if expanded is not None:
+                    dispatch.extend(expanded)
+                else:
+                    dispatch.append(c)
+            # Send sequentially with a small stagger so the MUD has time to
+            # respond between steps.
+            def send_at(idx):
+                if not engine.is_active() or engine.active_name() != skill_name:
+                    return
+                if idx >= len(dispatch):
+                    return
+                self.send_ai_command(dispatch[idx])
+                self.master.after(300, lambda: send_at(idx + 1))
+            send_at(0)
+        if result.get("complete"):
+            if not self._skill_target_killed:
+                self.append_text(
+                    "[Skill] LLM claimed complete but no kill confirmation "
+                    "seen — ignoring and continuing.\n", "error")
+            else:
+                self.append_text(f"[Skill] complete: {skill_name} — {note}\n", "system")
+                self.session_logger.log_command(f"[Skill complete] {skill_name}")
+                engine.stop()
 
     def _on_session_summary(self, summary):
         """Called on the main thread when the end-of-session summary is ready."""
@@ -3555,6 +3749,159 @@ class ProfileDialog:
         self.dialog.destroy()
     
     def cancel_clicked(self):
+        self.dialog.destroy()
+
+
+class SkillsDialog:
+    """List of skills defined for the current profile with add/edit/delete."""
+
+    # Stat keys the user may ask the LLM to watch (from self.char_stats / mud_parser).
+    AVAILABLE_STATS = [
+        "hp", "max_hp", "mp", "max_mp", "mv", "max_mv",
+        "hunger", "thirst", "level", "xp", "gold", "alignment",
+        "tank", "opp",
+    ]
+
+    def __init__(self, parent, client):
+        self.client = client
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title(f"Skills — {client.current_profile}")
+        self.dialog.geometry("520x400")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        frame = ttk.Frame(self.dialog)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        ttk.Label(frame, text="Defined skills:").pack(anchor="w")
+
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
+        self.listbox = tk.Listbox(list_frame, height=12)
+        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.listbox.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.listbox.config(yscrollcommand=sb.set)
+        self.listbox.bind("<Double-Button-1>", lambda _e: self._edit())
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill=tk.X)
+        ttk.Button(btns, text="New...", command=self._new).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Edit...", command=self._edit).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Delete", command=self._delete).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Close", command=self.dialog.destroy).pack(side=tk.RIGHT)
+
+        self._reload()
+
+    def _reload(self):
+        self.listbox.delete(0, tk.END)
+        for name in sorted(self.client._current_skills().keys()):
+            self.listbox.insert(tk.END, name)
+
+    def _selected_name(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return None
+        return self.listbox.get(sel[0])
+
+    def _new(self):
+        ed = SkillEditDialog(self.dialog, "", {}, self.AVAILABLE_STATS)
+        if ed.result is None:
+            return
+        name, cfg = ed.result
+        if not name:
+            return
+        skills = self.client._current_skills()
+        if name in skills:
+            if not messagebox.askyesno("Overwrite?",
+                                       f"A skill named '{name}' already exists. Replace it?"):
+                return
+        skills[name] = cfg
+        self.client.save_profiles()
+        self._reload()
+
+    def _edit(self):
+        name = self._selected_name()
+        if not name:
+            return
+        skills = self.client._current_skills()
+        cfg = skills.get(name, {})
+        ed = SkillEditDialog(self.dialog, name, cfg, self.AVAILABLE_STATS)
+        if ed.result is None:
+            return
+        new_name, new_cfg = ed.result
+        if not new_name:
+            return
+        if new_name != name:
+            skills.pop(name, None)
+        skills[new_name] = new_cfg
+        self.client.save_profiles()
+        self._reload()
+
+    def _delete(self):
+        name = self._selected_name()
+        if not name:
+            return
+        if not messagebox.askyesno("Delete skill", f"Delete skill '{name}'?"):
+            return
+        skills = self.client._current_skills()
+        skills.pop(name, None)
+        self.client.save_profiles()
+        self._reload()
+
+
+class SkillEditDialog:
+    """Edit one skill: name, instructions, watched stats."""
+
+    def __init__(self, parent, name, cfg, available_stats):
+        self.result = None
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Edit Skill" if name else "New Skill")
+        self.dialog.geometry("620x520")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        pad = {"padx": 10, "pady": 6}
+
+        ttk.Label(self.dialog, text="Name:").grid(row=0, column=0, sticky=tk.W, **pad)
+        self.name_entry = ttk.Entry(self.dialog, width=50)
+        self.name_entry.insert(0, name)
+        self.name_entry.grid(row=0, column=1, sticky=tk.W + tk.E, **pad)
+
+        ttk.Label(self.dialog, text="Instructions\n(what, where, how,\nrescue recovery)") \
+            .grid(row=1, column=0, sticky=tk.NW, **pad)
+        self.instructions_text = tk.Text(self.dialog, width=60, height=16, wrap=tk.WORD)
+        self.instructions_text.insert("1.0", cfg.get("instructions", ""))
+        self.instructions_text.grid(row=1, column=1, sticky=tk.NSEW, **pad)
+
+        ttk.Label(self.dialog, text="Watched stats:").grid(row=2, column=0, sticky=tk.NW, **pad)
+        stats_frame = ttk.Frame(self.dialog)
+        stats_frame.grid(row=2, column=1, sticky=tk.W, **pad)
+        selected = set(cfg.get("watch_stats", []))
+        self._stat_vars = {}
+        for i, key in enumerate(available_stats):
+            var = tk.BooleanVar(value=(key in selected))
+            self._stat_vars[key] = var
+            ttk.Checkbutton(stats_frame, text=key, variable=var).grid(
+                row=i // 4, column=i % 4, sticky=tk.W, padx=4, pady=2)
+
+        btns = ttk.Frame(self.dialog)
+        btns.grid(row=3, column=0, columnspan=2, pady=12)
+        ttk.Button(btns, text="Save", command=self._save).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=self.dialog.destroy).pack(side=tk.LEFT, padx=4)
+
+        self.dialog.columnconfigure(1, weight=1)
+        self.dialog.rowconfigure(1, weight=1)
+        self.dialog.wait_window()
+
+    def _save(self):
+        name = self.name_entry.get().strip()
+        if not name:
+            messagebox.showwarning("Skill", "Name is required.")
+            return
+        instructions = self.instructions_text.get("1.0", tk.END).strip()
+        watch = [k for k, v in self._stat_vars.items() if v.get()]
+        self.result = (name, {"instructions": instructions, "watch_stats": watch})
         self.dialog.destroy()
 
 
