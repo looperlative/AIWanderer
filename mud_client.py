@@ -25,7 +25,6 @@ class MUDClient:
     def __init__(self, master):
         self.master = master
         self.master.title("MUD Client - SSL Connection")
-        self.master.geometry("900x600")  # default; overridden below if saved
         
         # Shared parser instance
         self.mud_parser = MUDTextParser()
@@ -41,6 +40,24 @@ class MUDClient:
         self.profiles_file = os.path.join(os.path.expanduser("~"), ".mud_client_profiles.json")
         self.profiles = self.load_profiles()
         self.current_profile = None
+
+        # Apply saved window geometry (or default) before widgets are built so
+        # the WM honors the requested position on first map. Geometry lives in
+        # the host-local UI config since positions/sizes are display-specific.
+        ui_local = self._load_ui_local()
+        saved_geometry = ui_local.get('window_geometry')
+        # Migrate legacy value from shared profiles._settings if present.
+        legacy = self.profiles.get('_settings', {}).pop('window_geometry', None)
+        if saved_geometry is None and legacy:
+            saved_geometry = legacy
+            ui_local['window_geometry'] = legacy
+            self._save_ui_local(ui_local)
+        if legacy:
+            self.save_profiles()
+        try:
+            self.master.geometry(saved_geometry or "900x600")
+        except tk.TclError:
+            self.master.geometry("900x600")
         
         # Autologin state
         self.autologin_pending = False
@@ -137,13 +154,6 @@ class MUDClient:
 
         self.setup_ui()
 
-        # Restore saved window geometry (position + size)
-        saved_geometry = self.profiles.get('_settings', {}).get('window_geometry')
-        if saved_geometry:
-            try:
-                self.master.geometry(saved_geometry)
-            except tk.TclError:
-                pass  # ignore invalid saved geometry
         self.master.after(100, self.process_queue)
         
     def strip_ansi_codes(self, text):
@@ -2777,6 +2787,25 @@ class MUDClient:
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
 
+    @staticmethod
+    def _ui_local_path():
+        return os.path.join(os.path.expanduser("~"), ".mud_client_ui_local.json")
+
+    @classmethod
+    def _load_ui_local(cls):
+        """Load host-local UI settings (window geometry, etc.)."""
+        try:
+            with open(cls._ui_local_path(), 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    @classmethod
+    def _save_ui_local(cls, data):
+        """Write host-local UI settings."""
+        with open(cls._ui_local_path(), 'w') as f:
+            json.dump(data, f, indent=2)
+
     def open_ai_config(self):
         """Open the AI configuration dialog for the current profile."""
         profile_name = self.profile_var.get()
@@ -3202,10 +3231,10 @@ class MUDClient:
         # Flush AI agent state before saving profiles
         if self.ai_agent:
             self.ai_agent.save_state()
-        # Save window geometry for next session
-        if '_settings' not in self.profiles:
-            self.profiles['_settings'] = {}
-        self.profiles['_settings']['window_geometry'] = self.master.geometry()
+        # Save window geometry for next session (host-local, not shared)
+        ui_local = self._load_ui_local()
+        ui_local['window_geometry'] = self.master.geometry()
+        self._save_ui_local(ui_local)
         self.save_profiles()
         self.master.destroy()
 
