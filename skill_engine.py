@@ -98,6 +98,39 @@ Command ledger:
 """
 
 
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+
+
+def render_skill(template_cfg, params):
+    """Return a new skill cfg dict with `{{name}}` placeholders in `instructions`
+    and `reminders` substituted from `params`.
+
+    Copies non-templated fields (`watch_stats`, etc.) through unchanged. Raises
+    `KeyError` listing every placeholder referenced in the template text that
+    wasn't supplied in `params`, so callers can surface a useful error.
+    """
+    out = dict(template_cfg or {})
+    out.pop("placeholders", None)
+    missing = set()
+
+    def sub(match):
+        key = match.group(1)
+        if key not in params:
+            missing.add(key)
+            return match.group(0)
+        return str(params[key])
+
+    for field in ("instructions", "reminders"):
+        text = template_cfg.get(field) if template_cfg else None
+        if isinstance(text, str) and text:
+            out[field] = _PLACEHOLDER_RE.sub(sub, text)
+
+    if missing:
+        raise KeyError(
+            "Missing skill template parameters: " + ", ".join(sorted(missing)))
+    return out
+
+
 class SkillEngine:
     """
     Runs an LLM-driven skill to completion.

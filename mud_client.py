@@ -2778,6 +2778,18 @@ class MUDClient:
             return {}
         return self.profiles[self.current_profile].setdefault('skills', {})
 
+    def _current_skill_templates(self):
+        """Return the skill_templates dict for the current profile."""
+        if not self.current_profile or self.current_profile not in self.profiles:
+            return {}
+        return self.profiles[self.current_profile].setdefault('skill_templates', {})
+
+    def _current_skill_targets(self):
+        """Return the skill_targets dict for the current profile."""
+        if not self.current_profile or self.current_profile not in self.profiles:
+            return {}
+        return self.profiles[self.current_profile].setdefault('skill_targets', {})
+
     def _rebuild_skills_menu(self):
         """Populate the Settings → Skills submenu based on the current profile."""
         menu = self._skills_menu
@@ -2785,8 +2797,9 @@ class MUDClient:
         menu.add_command(label="Manage Skills...", command=self._open_skills_dialog)
         menu.add_separator()
         skills = self._current_skills()
+        targets = self._current_skill_targets()
         active = self.skill_engine.active_name() if self.skill_engine else None
-        if skills:
+        if skills or targets:
             run_menu = tk.Menu(menu, tearoff=0)
             menu.add_cascade(label="Run", menu=run_menu)
             for name in sorted(skills.keys()):
@@ -2794,6 +2807,14 @@ class MUDClient:
                     label=name,
                     command=lambda n=name: self._start_skill(n)
                 )
+            if targets:
+                if skills:
+                    run_menu.add_separator()
+                for tname in sorted(targets.keys()):
+                    run_menu.add_command(
+                        label=f"{tname}  (target)",
+                        command=lambda n=tname: self._start_skill_target(n)
+                    )
         else:
             menu.add_command(label="Run  (no skills defined)", state=tk.DISABLED)
         menu.add_separator()
@@ -2814,6 +2835,33 @@ class MUDClient:
         if not cfg:
             messagebox.showwarning("Skills", f"Skill '{name}' not found.")
             return
+        self._start_skill_core(name, cfg)
+
+    def _start_skill_target(self, target_name):
+        """Render a skill_target through its template and start it."""
+        from skill_engine import render_skill
+        targets = self._current_skill_targets()
+        templates = self._current_skill_templates()
+        target = targets.get(target_name)
+        if not target:
+            messagebox.showwarning("Skills", f"Target '{target_name}' not found.")
+            return
+        tmpl_name = target.get("template")
+        tmpl = templates.get(tmpl_name) if tmpl_name else None
+        if not tmpl:
+            messagebox.showwarning(
+                "Skills",
+                f"Target '{target_name}' references missing template "
+                f"'{tmpl_name}'.")
+            return
+        try:
+            cfg = render_skill(tmpl, target.get("params", {}))
+        except KeyError as e:
+            messagebox.showwarning("Skills", str(e))
+            return
+        self._start_skill_core(target_name, cfg)
+
+    def _start_skill_core(self, name, cfg):
         if not self.connected:
             messagebox.showwarning("Skills", "Connect to the MUD before starting a skill.")
             return
@@ -3753,7 +3801,7 @@ class ProfileDialog:
 
 
 class SkillsDialog:
-    """List of skills defined for the current profile with add/edit/delete."""
+    """Manage skills, templates, and targets for the current profile."""
 
     # Stat keys the user may ask the LLM to watch (from self.char_stats / mud_parser).
     AVAILABLE_STATS = [
@@ -3766,45 +3814,65 @@ class SkillsDialog:
         self.client = client
         self.dialog = tk.Toplevel(parent)
         self.dialog.title(f"Skills — {client.current_profile}")
-        self.dialog.geometry("520x400")
+        self.dialog.geometry("560x440")
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
-        frame = ttk.Frame(self.dialog)
-        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        nb = ttk.Notebook(self.dialog)
+        nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        ttk.Label(frame, text="Defined skills:").pack(anchor="w")
+        self.skill_list = self._build_tab(
+            nb, "Skills",
+            new_cb=self._new_skill, edit_cb=self._edit_skill,
+            delete_cb=self._delete_skill, reload_cb=self._reload_skills)
+        self.template_list = self._build_tab(
+            nb, "Templates",
+            new_cb=self._new_template, edit_cb=self._edit_template,
+            delete_cb=self._delete_template, reload_cb=self._reload_templates)
+        self.target_list = self._build_tab(
+            nb, "Targets",
+            new_cb=self._new_target, edit_cb=self._edit_target,
+            delete_cb=self._delete_target, reload_cb=self._reload_targets)
 
+        ttk.Button(self.dialog, text="Close",
+                   command=self.dialog.destroy).pack(side=tk.RIGHT, padx=10, pady=(0, 10))
+
+        self._reload_skills()
+        self._reload_templates()
+        self._reload_targets()
+
+    def _build_tab(self, nb, label, new_cb, edit_cb, delete_cb, reload_cb):
+        frame = ttk.Frame(nb)
+        nb.add(frame, text=label)
         list_frame = ttk.Frame(frame)
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
-        self.listbox = tk.Listbox(list_frame, height=12)
-        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.listbox.yview)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
+        lb = tk.Listbox(list_frame, height=12)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=lb.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.listbox.config(yscrollcommand=sb.set)
-        self.listbox.bind("<Double-Button-1>", lambda _e: self._edit())
-
+        lb.config(yscrollcommand=sb.set)
+        lb.bind("<Double-Button-1>", lambda _e: edit_cb())
         btns = ttk.Frame(frame)
-        btns.pack(fill=tk.X)
-        ttk.Button(btns, text="New...", command=self._new).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Edit...", command=self._edit).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Delete", command=self._delete).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Close", command=self.dialog.destroy).pack(side=tk.RIGHT)
+        btns.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Button(btns, text="New...", command=new_cb).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Edit...", command=edit_cb).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Delete", command=delete_cb).pack(side=tk.LEFT, padx=4)
+        return lb
 
-        self._reload()
-
-    def _reload(self):
-        self.listbox.delete(0, tk.END)
-        for name in sorted(self.client._current_skills().keys()):
-            self.listbox.insert(tk.END, name)
-
-    def _selected_name(self):
-        sel = self.listbox.curselection()
+    @staticmethod
+    def _selected(lb):
+        sel = lb.curselection()
         if not sel:
             return None
-        return self.listbox.get(sel[0])
+        return lb.get(sel[0])
 
-    def _new(self):
+    # ---- Skills tab ----
+    def _reload_skills(self):
+        self.skill_list.delete(0, tk.END)
+        for name in sorted(self.client._current_skills().keys()):
+            self.skill_list.insert(tk.END, name)
+
+    def _new_skill(self):
         ed = SkillEditDialog(self.dialog, "", {}, self.AVAILABLE_STATS)
         if ed.result is None:
             return
@@ -3818,10 +3886,10 @@ class SkillsDialog:
                 return
         skills[name] = cfg
         self.client.save_profiles()
-        self._reload()
+        self._reload_skills()
 
-    def _edit(self):
-        name = self._selected_name()
+    def _edit_skill(self):
+        name = self._selected(self.skill_list)
         if not name:
             return
         skills = self.client._current_skills()
@@ -3836,18 +3904,131 @@ class SkillsDialog:
             skills.pop(name, None)
         skills[new_name] = new_cfg
         self.client.save_profiles()
-        self._reload()
+        self._reload_skills()
 
-    def _delete(self):
-        name = self._selected_name()
+    def _delete_skill(self):
+        name = self._selected(self.skill_list)
         if not name:
             return
         if not messagebox.askyesno("Delete skill", f"Delete skill '{name}'?"):
             return
-        skills = self.client._current_skills()
-        skills.pop(name, None)
+        self.client._current_skills().pop(name, None)
         self.client.save_profiles()
-        self._reload()
+        self._reload_skills()
+
+    # ---- Templates tab ----
+    def _reload_templates(self):
+        self.template_list.delete(0, tk.END)
+        for name in sorted(self.client._current_skill_templates().keys()):
+            self.template_list.insert(tk.END, name)
+
+    def _new_template(self):
+        ed = TemplateEditDialog(self.dialog, "", {}, self.AVAILABLE_STATS)
+        if ed.result is None:
+            return
+        name, cfg = ed.result
+        if not name:
+            return
+        tmpls = self.client._current_skill_templates()
+        if name in tmpls:
+            if not messagebox.askyesno("Overwrite?",
+                                       f"Template '{name}' already exists. Replace it?"):
+                return
+        tmpls[name] = cfg
+        self.client.save_profiles()
+        self._reload_templates()
+
+    def _edit_template(self):
+        name = self._selected(self.template_list)
+        if not name:
+            return
+        tmpls = self.client._current_skill_templates()
+        cfg = tmpls.get(name, {})
+        ed = TemplateEditDialog(self.dialog, name, cfg, self.AVAILABLE_STATS)
+        if ed.result is None:
+            return
+        new_name, new_cfg = ed.result
+        if not new_name:
+            return
+        if new_name != name:
+            tmpls.pop(name, None)
+        tmpls[new_name] = new_cfg
+        self.client.save_profiles()
+        self._reload_templates()
+
+    def _delete_template(self):
+        name = self._selected(self.template_list)
+        if not name:
+            return
+        if not messagebox.askyesno("Delete template", f"Delete template '{name}'?"):
+            return
+        self.client._current_skill_templates().pop(name, None)
+        self.client.save_profiles()
+        self._reload_templates()
+
+    # ---- Targets tab ----
+    def _reload_targets(self):
+        self.target_list.delete(0, tk.END)
+        for name in sorted(self.client._current_skill_targets().keys()):
+            tgt = self.client._current_skill_targets()[name]
+            self.target_list.insert(tk.END, f"{name}  [{tgt.get('template', '?')}]")
+
+    def _selected_target_name(self):
+        sel = self.target_list.curselection()
+        if not sel:
+            return None
+        raw = self.target_list.get(sel[0])
+        return raw.split("  [")[0]
+
+    def _new_target(self):
+        tmpls = self.client._current_skill_templates()
+        if not tmpls:
+            messagebox.showwarning(
+                "Targets", "Define a template first on the Templates tab.")
+            return
+        ed = TargetEditDialog(self.dialog, "", {}, tmpls)
+        if ed.result is None:
+            return
+        name, cfg = ed.result
+        if not name:
+            return
+        targets = self.client._current_skill_targets()
+        if name in targets:
+            if not messagebox.askyesno("Overwrite?",
+                                       f"Target '{name}' already exists. Replace it?"):
+                return
+        targets[name] = cfg
+        self.client.save_profiles()
+        self._reload_targets()
+
+    def _edit_target(self):
+        name = self._selected_target_name()
+        if not name:
+            return
+        targets = self.client._current_skill_targets()
+        cfg = targets.get(name, {})
+        tmpls = self.client._current_skill_templates()
+        ed = TargetEditDialog(self.dialog, name, cfg, tmpls)
+        if ed.result is None:
+            return
+        new_name, new_cfg = ed.result
+        if not new_name:
+            return
+        if new_name != name:
+            targets.pop(name, None)
+        targets[new_name] = new_cfg
+        self.client.save_profiles()
+        self._reload_targets()
+
+    def _delete_target(self):
+        name = self._selected_target_name()
+        if not name:
+            return
+        if not messagebox.askyesno("Delete target", f"Delete target '{name}'?"):
+            return
+        self.client._current_skill_targets().pop(name, None)
+        self.client.save_profiles()
+        self._reload_targets()
 
 
 class SkillEditDialog:
@@ -3902,6 +4083,170 @@ class SkillEditDialog:
         instructions = self.instructions_text.get("1.0", tk.END).strip()
         watch = [k for k, v in self._stat_vars.items() if v.get()]
         self.result = (name, {"instructions": instructions, "watch_stats": watch})
+        self.dialog.destroy()
+
+
+class TemplateEditDialog:
+    """Edit one skill template: name, instructions (with {{placeholders}}),
+    optional reminders, placeholders list, watched stats."""
+
+    def __init__(self, parent, name, cfg, available_stats):
+        self.result = None
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Edit Template" if name else "New Template")
+        self.dialog.geometry("680x620")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        pad = {"padx": 10, "pady": 4}
+
+        ttk.Label(self.dialog, text="Name:").grid(row=0, column=0, sticky=tk.W, **pad)
+        self.name_entry = ttk.Entry(self.dialog, width=50)
+        self.name_entry.insert(0, name)
+        self.name_entry.grid(row=0, column=1, sticky=tk.W + tk.E, **pad)
+
+        ttk.Label(self.dialog,
+                  text="Placeholders\n(comma-separated,\nused as {{name}}\nin text)") \
+            .grid(row=1, column=0, sticky=tk.NW, **pad)
+        self.placeholders_entry = ttk.Entry(self.dialog, width=60)
+        self.placeholders_entry.insert(0, ", ".join(cfg.get("placeholders", [])))
+        self.placeholders_entry.grid(row=1, column=1, sticky=tk.W + tk.E, **pad)
+
+        ttk.Label(self.dialog, text="Instructions").grid(
+            row=2, column=0, sticky=tk.NW, **pad)
+        self.instructions_text = tk.Text(self.dialog, width=70, height=16, wrap=tk.WORD)
+        self.instructions_text.insert("1.0", cfg.get("instructions", ""))
+        self.instructions_text.grid(row=2, column=1, sticky=tk.NSEW, **pad)
+
+        ttk.Label(self.dialog, text="Reminders\n(optional)").grid(
+            row=3, column=0, sticky=tk.NW, **pad)
+        self.reminders_text = tk.Text(self.dialog, width=70, height=5, wrap=tk.WORD)
+        self.reminders_text.insert("1.0", cfg.get("reminders", ""))
+        self.reminders_text.grid(row=3, column=1, sticky=tk.NSEW, **pad)
+
+        ttk.Label(self.dialog, text="Watched stats:").grid(
+            row=4, column=0, sticky=tk.NW, **pad)
+        stats_frame = ttk.Frame(self.dialog)
+        stats_frame.grid(row=4, column=1, sticky=tk.W, **pad)
+        selected = set(cfg.get("watch_stats", []))
+        self._stat_vars = {}
+        for i, key in enumerate(available_stats):
+            var = tk.BooleanVar(value=(key in selected))
+            self._stat_vars[key] = var
+            ttk.Checkbutton(stats_frame, text=key, variable=var).grid(
+                row=i // 4, column=i % 4, sticky=tk.W, padx=4, pady=2)
+
+        btns = ttk.Frame(self.dialog)
+        btns.grid(row=5, column=0, columnspan=2, pady=12)
+        ttk.Button(btns, text="Save", command=self._save).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=self.dialog.destroy).pack(side=tk.LEFT, padx=4)
+
+        self.dialog.columnconfigure(1, weight=1)
+        self.dialog.rowconfigure(2, weight=1)
+        self.dialog.wait_window()
+
+    def _save(self):
+        name = self.name_entry.get().strip()
+        if not name:
+            messagebox.showwarning("Template", "Name is required.")
+            return
+        raw_ph = self.placeholders_entry.get().strip()
+        placeholders = [p.strip() for p in raw_ph.split(",") if p.strip()] if raw_ph else []
+        instructions = self.instructions_text.get("1.0", tk.END).strip()
+        reminders = self.reminders_text.get("1.0", tk.END).strip()
+        watch = [k for k, v in self._stat_vars.items() if v.get()]
+        cfg = {
+            "instructions": instructions,
+            "watch_stats": watch,
+            "placeholders": placeholders,
+        }
+        if reminders:
+            cfg["reminders"] = reminders
+        self.result = (name, cfg)
+        self.dialog.destroy()
+
+
+class TargetEditDialog:
+    """Edit one skill target: name, bound template, parameter values."""
+
+    def __init__(self, parent, name, cfg, templates):
+        self.result = None
+        self.templates = templates
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Edit Target" if name else "New Target")
+        self.dialog.geometry("620x500")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        pad = {"padx": 10, "pady": 6}
+
+        ttk.Label(self.dialog, text="Name:").grid(row=0, column=0, sticky=tk.W, **pad)
+        self.name_entry = ttk.Entry(self.dialog, width=50)
+        self.name_entry.insert(0, name)
+        self.name_entry.grid(row=0, column=1, sticky=tk.W + tk.E, **pad)
+
+        ttk.Label(self.dialog, text="Template:").grid(row=1, column=0, sticky=tk.W, **pad)
+        tmpl_names = sorted(templates.keys())
+        initial_tmpl = cfg.get("template") or (tmpl_names[0] if tmpl_names else "")
+        self.template_var = tk.StringVar(value=initial_tmpl)
+        self.template_combo = ttk.Combobox(
+            self.dialog, textvariable=self.template_var,
+            values=tmpl_names, state="readonly", width=47)
+        self.template_combo.grid(row=1, column=1, sticky=tk.W + tk.E, **pad)
+        self.template_combo.bind("<<ComboboxSelected>>",
+                                 lambda _e: self._rebuild_params())
+
+        params_outer = ttk.LabelFrame(self.dialog, text="Parameters")
+        params_outer.grid(row=2, column=0, columnspan=2, sticky=tk.NSEW, **pad)
+        self.params_frame = ttk.Frame(params_outer)
+        self.params_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self._param_widgets = {}  # name -> Text widget
+        self._existing_params = dict(cfg.get("params", {}))
+
+        btns = ttk.Frame(self.dialog)
+        btns.grid(row=3, column=0, columnspan=2, pady=12)
+        ttk.Button(btns, text="Save", command=self._save).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=self.dialog.destroy).pack(side=tk.LEFT, padx=4)
+
+        self.dialog.columnconfigure(1, weight=1)
+        self.dialog.rowconfigure(2, weight=1)
+
+        self._rebuild_params()
+        self.dialog.wait_window()
+
+    def _rebuild_params(self):
+        for child in self.params_frame.winfo_children():
+            child.destroy()
+        self._param_widgets = {}
+        tmpl_name = self.template_var.get()
+        tmpl = self.templates.get(tmpl_name, {})
+        placeholders = tmpl.get("placeholders", [])
+        if not placeholders:
+            ttk.Label(self.params_frame,
+                      text="(selected template declares no placeholders)") \
+                .grid(row=0, column=0, sticky=tk.W)
+            return
+        for i, ph in enumerate(placeholders):
+            ttk.Label(self.params_frame, text=f"{ph}:").grid(
+                row=i, column=0, sticky=tk.NW, padx=4, pady=3)
+            txt = tk.Text(self.params_frame, width=60, height=3, wrap=tk.WORD)
+            txt.insert("1.0", str(self._existing_params.get(ph, "")))
+            txt.grid(row=i, column=1, sticky=tk.W + tk.E, padx=4, pady=3)
+            self._param_widgets[ph] = txt
+        self.params_frame.columnconfigure(1, weight=1)
+
+    def _save(self):
+        name = self.name_entry.get().strip()
+        if not name:
+            messagebox.showwarning("Target", "Name is required.")
+            return
+        tmpl_name = self.template_var.get().strip()
+        if not tmpl_name:
+            messagebox.showwarning("Target", "Template is required.")
+            return
+        params = {ph: w.get("1.0", tk.END).strip()
+                  for ph, w in self._param_widgets.items()}
+        self.result = (name, {"template": tmpl_name, "params": params})
         self.dialog.destroy()
 
 
