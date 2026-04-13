@@ -26,6 +26,21 @@ import threading
 from llm_advisor import LLMAdvisor
 
 
+# Keep the last N user+assistant turn pairs in the rolling history.
+# Bounds recency drift: the system prompt stays a constant fraction of
+# context instead of shrinking as the session runs.
+HISTORY_TURN_PAIRS = 3
+
+# Attack-verb lines collapsed during combat turns. Anything not matching
+# these (HP lines, kill lines, tells, room titles, non-target mob
+# mentions) is preserved verbatim.
+_COMBAT_VERB_RE = re.compile(
+    r'\b(?:hits?|miss(?:es)?|slash(?:es)?|crush(?:es)?|pierces?|stabs?|'
+    r'bash(?:es)?|strikes?|claws?|bites?|punch(?:es)?|kicks?|mauls?|'
+    r'slices?|grazes?|pounds?|smites?|parr(?:y|ies)|dodges?)\b',
+    re.IGNORECASE)
+
+
 SKILL_SYSTEM_PROMPT = """You are an agent controlling a character in a text-based MUD.
 The user has given you a named skill to execute from start to finish.
 
@@ -155,9 +170,17 @@ class SkillEngine:
         if not self.is_active():
             return
         if self._busy:
+            # OR-merge sticky flags so a rescue or kill signal raised while
+            # an earlier turn is in flight isn't lost when the payload is
+            # overwritten by a later, flag-less trigger.
+            prev_rescue = False
+            prev_killed = False
+            if self._pending and self._pending_payload is not None:
+                _, _, _, prev_rescue, prev_killed = self._pending_payload
             self._pending = True
-            self._pending_payload = (mud_lines, stats, combat_mob, rescue_just_fired,
-                                     target_killed)
+            self._pending_payload = (mud_lines, stats, combat_mob,
+                                     rescue_just_fired or prev_rescue,
+                                     target_killed or prev_killed)
             self._pending_on_result = on_result
             return
         self._fire_turn(mud_lines, stats, combat_mob, rescue_just_fired, on_result,
@@ -208,6 +231,11 @@ class SkillEngine:
                 return
             if result is not None and raw is not None:
                 self._messages.append({"role": "assistant", "content": raw})
+            # Cap rolling history to last N turn pairs. Command ledger
+            # carries durable state, so dropping old turns is safe.
+            max_entries = 2 * HISTORY_TURN_PAIRS
+            if len(self._messages) > max_entries:
+                self._messages = self._messages[-max_entries:]
             if error:
                 self.client.append_text(f"[Skill error: {error}]\n", "error")
             on_result(result, skill_at_fire)
@@ -242,15 +270,31 @@ class SkillEngine:
     def _build_user_message(self, mud_lines, stats, combat_mob, rescue_just_fired,
                             target_killed=False):
         parts = []
+        reminders = (self._skill_cfg or {}).get("reminders", "").strip()
+        if reminders:
+            parts.append("REMINDERS (re-read each turn):")
+            parts.append(reminders)
+            parts.append("")
         parts.append("MUD output since last command:")
-        mud = "\n".join(mud_lines).strip()
+        lines = self._compress_combat(mud_lines, combat_mob) if combat_mob else list(mud_lines)
+        mud = "\n".join(lines).strip()
         parts.append(mud if mud else "(no new output)")
         parts.append("")
         parts.append("Watched stats:")
         watch = (self._skill_cfg or {}).get("watch_stats", [])
+        # Labels/formatting for stats where the raw number is ambiguous.
+        # `tank` and `opp` come from the prompt as percentages of max HP
+        # (e.g. 87 means the tank is at 87% HP); naming/formatting them
+        # clearly prevents the LLM from reading them as absolute HP.
+        stat_labels = {"opp": "opponent_hp_pct", "tank": "tank_hp_pct"}
         if watch:
             for key in watch:
-                parts.append(f"  {key} = {stats.get(key)}")
+                val = stats.get(key)
+                label = stat_labels.get(key, key)
+                if key in ("tank", "opp") and val is not None:
+                    parts.append(f"  {label} = {val}%  (percentage of max HP)")
+                else:
+                    parts.append(f"  {label} = {val}")
         else:
             parts.append("  (none declared)")
         parts.append("")
@@ -268,6 +312,53 @@ class SkillEngine:
         parts.append("")
         parts.append("Reply with the JSON object now.")
         return "\n".join(parts)
+
+    def _compress_combat(self, lines, combat_mob):
+        """
+        Collapse repetitive attack-verb lines against the current combat_mob
+        into a single summary. Preserve anything that could carry new signal:
+        HP changes, kill/xp lines, tells, room titles, non-target mob mentions.
+        """
+        if not lines:
+            return list(lines)
+        mob = (combat_mob or "").lower().strip()
+        out = []
+        hits_on = hits_from = misses = 0
+
+        def flush():
+            nonlocal hits_on, hits_from, misses
+            if hits_on or hits_from or misses:
+                out.append(
+                    f"[combat: {hits_on} hits on {combat_mob}, "
+                    f"{hits_from} hits from {combat_mob} taken, "
+                    f"{misses} misses]"
+                )
+                hits_on = hits_from = misses = 0
+
+        for raw in lines:
+            line = raw.rstrip()
+            low = line.lower()
+            if not line.strip():
+                continue
+            # Only collapse lines that are pure attack verbs AND mention the
+            # target mob (so pawn/knight interrupt lines fall through).
+            if mob and mob in low and _COMBAT_VERB_RE.search(low):
+                # Heuristic direction: "you <verb> ... <mob>" vs "<mob> <verb> ... you"
+                if low.lstrip().startswith("you "):
+                    if re.search(r'\bmiss(?:es)?\b', low):
+                        misses += 1
+                    else:
+                        hits_on += 1
+                else:
+                    if re.search(r'\bmiss(?:es)?\b', low):
+                        misses += 1
+                    else:
+                        hits_from += 1
+                continue
+            flush()
+            out.append(line)
+        flush()
+        return out
 
     def _format_cmd_history(self):
         """Compact ledger of commands dispatched this session (authoritative count)."""
