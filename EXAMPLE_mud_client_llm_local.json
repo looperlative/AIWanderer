@@ -1,0 +1,9 @@
+{
+  "EXAMPLE_PROFILE_NAME": {
+    "llm_backend": "ollama",
+    "llm_endpoint": "YOUR_LLM_ENDPOINT_URL",
+    "llm_model": "gemma4-e4b-128k",
+    "claude_model": "claude-haiku-4-5-20251001",
+    "claude_api_key": "YOUR_CLAUDE_API_KEY_HERE"
+  }
+}
