@@ -3835,11 +3835,16 @@ class SkillsDialog:
             delete_cb=self._delete_target, reload_cb=self._reload_targets)
 
         ttk.Button(self.dialog, text="Close",
-                   command=self.dialog.destroy).pack(side=tk.RIGHT, padx=10, pady=(0, 10))
+                   command=self._close).pack(side=tk.RIGHT, padx=10, pady=(0, 10))
+        self.dialog.protocol("WM_DELETE_WINDOW", self._close)
 
         self._reload_skills()
         self._reload_templates()
         self._reload_targets()
+
+    def _close(self):
+        self.dialog.destroy()
+        self.client.input_entry.focus_set()
 
     def _build_tab(self, nb, label, new_cb, edit_cb, delete_cb, reload_cb):
         frame = ttk.Frame(nb)
