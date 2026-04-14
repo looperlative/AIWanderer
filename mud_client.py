@@ -2973,14 +2973,9 @@ class MUDClient:
                 self.master.after(300, lambda: send_at(idx + 1))
             send_at(0)
         if result.get("complete"):
-            if not self._skill_target_killed:
-                self.append_text(
-                    "[Skill] LLM claimed complete but no kill confirmation "
-                    "seen — ignoring and continuing.\n", "error")
-            else:
-                self.append_text(f"[Skill] complete: {skill_name} — {note}\n", "system")
-                self.session_logger.log_command(f"[Skill complete] {skill_name}")
-                engine.stop()
+            self.append_text(f"[Skill] complete: {skill_name} — {note}\n", "system")
+            self.session_logger.log_command(f"[Skill complete] {skill_name}")
+            engine.stop()
 
     def _on_session_summary(self, summary):
         """Called on the main thread when the end-of-session summary is ready."""
@@ -3844,7 +3839,7 @@ class SkillsDialog:
 
     def _close(self):
         self.dialog.destroy()
-        self.client.input_entry.focus_set()
+        self.client.master.after(0, self.client.input_entry.focus_set)
 
     def _build_tab(self, nb, label, new_cb, edit_cb, delete_cb, reload_cb):
         frame = ttk.Frame(nb)
@@ -4093,13 +4088,14 @@ class SkillEditDialog:
 
 class TemplateEditDialog:
     """Edit one skill template: name, instructions (with {{placeholders}}),
-    optional reminders, placeholders list, watched stats."""
+    plan (markdown checkboxes), optional reminders, placeholders list, watched stats."""
 
     def __init__(self, parent, name, cfg, available_stats):
         self.result = None
+        self._original_cfg = dict(cfg or {})
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Edit Template" if name else "New Template")
-        self.dialog.geometry("680x620")
+        self.dialog.geometry("680x820")
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
@@ -4119,20 +4115,35 @@ class TemplateEditDialog:
 
         ttk.Label(self.dialog, text="Instructions").grid(
             row=2, column=0, sticky=tk.NW, **pad)
-        self.instructions_text = tk.Text(self.dialog, width=70, height=16, wrap=tk.WORD)
+        self.instructions_text = tk.Text(self.dialog, width=70, height=10, wrap=tk.WORD)
         self.instructions_text.insert("1.0", cfg.get("instructions", ""))
         self.instructions_text.grid(row=2, column=1, sticky=tk.NSEW, **pad)
 
-        ttk.Label(self.dialog, text="Reminders\n(optional)").grid(
+        ttk.Label(self.dialog,
+                  text="Plan\n(markdown,\none step per line:\n- [ ] step_id: desc)").grid(
             row=3, column=0, sticky=tk.NW, **pad)
-        self.reminders_text = tk.Text(self.dialog, width=70, height=5, wrap=tk.WORD)
+        self.plan_text = tk.Text(self.dialog, width=70, height=8, wrap=tk.WORD)
+        plan_val = cfg.get("plan", "")
+        if isinstance(plan_val, list):
+            # Legacy JSON array — show as markdown so the user can edit it
+            from skill_engine import _parse_plan_steps as _pps  # local import avoids cycle
+            plan_val = "\n".join(
+                f"- [ ] {s.get('step', '?')}: {s.get('description', '')}"
+                for s in plan_val
+            )
+        self.plan_text.insert("1.0", plan_val)
+        self.plan_text.grid(row=3, column=1, sticky=tk.NSEW, **pad)
+
+        ttk.Label(self.dialog, text="Reminders\n(optional)").grid(
+            row=4, column=0, sticky=tk.NW, **pad)
+        self.reminders_text = tk.Text(self.dialog, width=70, height=4, wrap=tk.WORD)
         self.reminders_text.insert("1.0", cfg.get("reminders", ""))
-        self.reminders_text.grid(row=3, column=1, sticky=tk.NSEW, **pad)
+        self.reminders_text.grid(row=4, column=1, sticky=tk.NSEW, **pad)
 
         ttk.Label(self.dialog, text="Watched stats:").grid(
-            row=4, column=0, sticky=tk.NW, **pad)
+            row=5, column=0, sticky=tk.NW, **pad)
         stats_frame = ttk.Frame(self.dialog)
-        stats_frame.grid(row=4, column=1, sticky=tk.W, **pad)
+        stats_frame.grid(row=5, column=1, sticky=tk.W, **pad)
         selected = set(cfg.get("watch_stats", []))
         self._stat_vars = {}
         for i, key in enumerate(available_stats):
@@ -4142,12 +4153,13 @@ class TemplateEditDialog:
                 row=i // 4, column=i % 4, sticky=tk.W, padx=4, pady=2)
 
         btns = ttk.Frame(self.dialog)
-        btns.grid(row=5, column=0, columnspan=2, pady=12)
+        btns.grid(row=6, column=0, columnspan=2, pady=12)
         ttk.Button(btns, text="Save", command=self._save).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Cancel", command=self.dialog.destroy).pack(side=tk.LEFT, padx=4)
 
         self.dialog.columnconfigure(1, weight=1)
         self.dialog.rowconfigure(2, weight=1)
+        self.dialog.rowconfigure(3, weight=1)
         self.dialog.wait_window()
 
     def _save(self):
@@ -4158,15 +4170,23 @@ class TemplateEditDialog:
         raw_ph = self.placeholders_entry.get().strip()
         placeholders = [p.strip() for p in raw_ph.split(",") if p.strip()] if raw_ph else []
         instructions = self.instructions_text.get("1.0", tk.END).strip()
+        plan = self.plan_text.get("1.0", tk.END).strip()
         reminders = self.reminders_text.get("1.0", tk.END).strip()
         watch = [k for k, v in self._stat_vars.items() if v.get()]
-        cfg = {
-            "instructions": instructions,
-            "watch_stats": watch,
-            "placeholders": placeholders,
-        }
+        # Start from the original cfg to preserve fields not shown here
+        # (e.g. rescue_restart_step).
+        cfg = dict(self._original_cfg)
+        cfg["instructions"] = instructions
+        cfg["watch_stats"] = watch
+        cfg["placeholders"] = placeholders
+        if plan:
+            cfg["plan"] = plan
+        else:
+            cfg.pop("plan", None)
         if reminders:
             cfg["reminders"] = reminders
+        else:
+            cfg.pop("reminders", None)
         self.result = (name, cfg)
         self.dialog.destroy()
 

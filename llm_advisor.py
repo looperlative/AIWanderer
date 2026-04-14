@@ -204,7 +204,7 @@ class LLMAdvisor:
         system_prompt = self._build_system_prompt()
         self._messages.append({"role": "user", "content": prompt})
         self._is_first_message = False
-        logger.log_llm_prompt(f"[direct]\n{prompt}")
+        logger.log_llm_prompt(f"[direct]\n[system]\n{system_prompt}\n[user]\n{prompt}")
 
         master = self.client.master
         master.after(0, self.client.begin_advisor_stream)
@@ -249,12 +249,15 @@ class LLMAdvisor:
             + advice_block
             + "\n\nWrite the session summary now."
         )
+        logger = self.client.session_logger
+        logger.log_llm_prompt(f"[summary]\n[system]\n{system}\n[user]\n{user}")
         summary = None
         try:
             summary = self._call_backend(
                 system, [{"role": "user", "content": user}], max_tokens=1000)
             if summary:
                 summary = summary.strip()[:8000]
+            logger.log_llm_response(summary or "")
         except Exception:
             pass
         self.client.master.after(0, lambda: on_result(summary))
@@ -383,7 +386,7 @@ class LLMAdvisor:
         self._messages.append({"role": "user", "content": user_msg})
         self._is_first_message = False
         logger = self.client.session_logger
-        logger.log_llm_prompt(f"[init]\n{user_msg}")
+        logger.log_llm_prompt(f"[init]\n[system]\n{system_prompt}\n[user]\n{user_msg}")
         try:
             reply = self._call_backend(system_prompt, list(self._messages), max_tokens=256)
             if reply:

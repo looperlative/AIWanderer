@@ -55,6 +55,7 @@ You must reply with a single JSON object and NOTHING ELSE. Schema:
   {
     "commands": ["mud command 1", "mud command 2", ...],
     "complete": false,
+    "plan_step": "the identifier of the step you are now executing",
     "note": "one short sentence about what you're doing"
   }
 
@@ -63,19 +64,16 @@ Rules:
     means "wait one tick and re-evaluate" — valid and normal.
   - Each command must be a real MUD input line (e.g. "kill rook", "cast bless",
     "n", "tell otto heal"). Do not include prose, quotes, numbering, or prefixes.
-  - Set `complete` to true ONLY when the skill's original objective is achieved
-    (e.g. the target mob is dead). Partial steps (moved, healed, rescued) are
-    not completion.
-  - COMPLETION INVARIANT: never set `complete: true` based on combat silence,
-    absence of the mob, or the fight "feeling over". You MAY only set it when
-    EITHER (a) the turn payload reports `target_killed: true`, OR (b) the MUD
-    output in this turn contains an explicit kill line naming the target
-    (e.g. "<mob> is dead! R.I.P."). If neither is present, combat ended because
-    you fled, were rescued, or were summoned — the target is still alive.
-    The harness will reject `complete: true` without a kill confirmation.
-  - Handle rescues yourself: if you are rescued mid-fight, ask the tank/healer
-    for heals per the instructions, wait until HP recovers, then return and
-    resume the attack. The skill is ONE continuous task from start to finish.
+  - Set `complete` to true ONLY when the plan's "done" step is reached: all
+    prior steps completed. Follow the SKILL PLAN in the user message.
+  - `plan_step`: set to the EXACT identifier string of the step you are
+    currently executing, copied verbatim from the SKILL PLAN in the user
+    message. Do NOT invent, abbreviate, or paraphrase step names — only the
+    identifiers listed in the plan are valid. If you advance this turn, emit
+    the NEW step's identifier. The harness tracks position using exact matches.
+  - Rescues: if the turn payload says a rescue fired, the harness has already
+    reset your plan step to the rescue_restart_step. Read the current plan step
+    from the SKILL PLAN section and follow it.
   - `note` is a short status string shown in the UI; keep it under 80 chars.
   - Respond with valid JSON only. No markdown, no code fences, no commentary
     outside the JSON object.
@@ -99,6 +97,24 @@ Command ledger:
 
 
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+
+# Plan markdown regexes.
+# _PLAN_STEP_RE matches a single step line and captures its components for re-rendering.
+# _PLAN_STEP_ID_RE extracts step identifiers in order from a plan markdown string.
+_PLAN_STEP_RE = re.compile(r'^(\s*-\s*\[)[ xX](\]\s*)(\w+)(\s*:.*)')
+_PLAN_STEP_ID_RE = re.compile(r'^\s*-\s*\[[ xX]\]\s*(\w+)\s*:', re.MULTILINE)
+
+# Matches the MUD prompt line to extract tank% and opp% directly from the buffer.
+# Example: "209H 100M 113V 100%T 97%O >"
+_PROMPT_COMBAT_RE = re.compile(
+    r'\b\d+H\s+\d+M\s+\d+V\s+(\d+)%T\s+(\d+)%O\s*>',
+    re.IGNORECASE
+)
+
+
+def _parse_plan_steps(text):
+    """Return ordered list of step identifiers from plan markdown string."""
+    return _PLAN_STEP_ID_RE.findall(text or "")
 
 
 def render_skill(template_cfg, params):
@@ -125,6 +141,18 @@ def render_skill(template_cfg, params):
         if isinstance(text, str) and text:
             out[field] = _PLACEHOLDER_RE.sub(sub, text)
 
+    raw_plan = template_cfg.get("plan") if template_cfg else None
+    if isinstance(raw_plan, str) and raw_plan:
+        out["plan"] = _PLACEHOLDER_RE.sub(sub, raw_plan)
+    elif isinstance(raw_plan, list):
+        # Legacy JSON array format — convert to markdown on the fly.
+        lines = []
+        for step_obj in raw_plan:
+            step_id = step_obj.get("step", "?")
+            desc = _PLACEHOLDER_RE.sub(sub, step_obj.get("description", ""))
+            lines.append(f"- [ ] {step_id}: {desc}")
+        out["plan"] = "\n".join(lines)
+
     if missing:
         raise KeyError(
             "Missing skill template parameters: " + ", ".join(sorted(missing)))
@@ -150,6 +178,9 @@ class SkillEngine:
         self._busy = False
         self._pending = False     # a turn arrived while busy; fire one more when idle
         self._cmd_history = []    # every command the engine has dispatched this session
+        self._plan_step = None    # current plan step identifier (tracked each turn)
+        self._plan_steps = []     # ordered step IDs parsed from plan markdown
+        self._deferred_rescue = False  # rescue flag preserved when pending turn is skipped
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -169,6 +200,10 @@ class SkillEngine:
         self._busy = False
         self._pending = False
         self._cmd_history = []
+        plan = self._skill_cfg.get("plan", "")
+        self._plan_steps = _parse_plan_steps(plan) if isinstance(plan, str) else []
+        self._plan_step = self._plan_steps[0] if self._plan_steps else None
+        self._deferred_rescue = False
 
     def stop(self):
         """Cancel the active skill. In-flight LLM replies are discarded."""
@@ -178,6 +213,9 @@ class SkillEngine:
         self._busy = False
         self._pending = False
         self._cmd_history = []
+        self._plan_step = None
+        self._plan_steps = []
+        self._deferred_rescue = False
 
     def record_dispatched(self, commands):
         """Called by the client after it sends commands returned by a turn."""
@@ -202,6 +240,10 @@ class SkillEngine:
         """
         if not self.is_active():
             return
+        # Merge in any rescue flag that was preserved when a commands-sent turn
+        # skipped the immediate pending chain (so it isn't lost).
+        rescue_just_fired = rescue_just_fired or self._deferred_rescue
+        self._deferred_rescue = False
         if self._busy:
             # OR-merge sticky flags so a rescue or kill signal raised while
             # an earlier turn is in flight isn't lost when the payload is
@@ -222,6 +264,10 @@ class SkillEngine:
     def _fire_turn(self, mud_lines, stats, combat_mob, rescue_just_fired, on_result,
                    target_killed=False):
         self._busy = True
+        if rescue_just_fired:
+            restart = (self._skill_cfg or {}).get("rescue_restart_step")
+            if restart is not None:
+                self._plan_step = restart
         skill_at_fire = self._skill_name
         user_msg = self._build_user_message(mud_lines, stats, combat_mob,
                                             rescue_just_fired, target_killed)
@@ -243,7 +289,11 @@ class SkillEngine:
         logger = self.client.session_logger
         system_prompt = self._build_system_prompt()
         msgs = list(self._messages)
-        logger.log_llm_prompt(f"[skill:{skill_at_fire}]\n{msgs[-1]['content']}")
+        logger.log_llm_prompt(
+            f"[skill:{skill_at_fire}]\n"
+            f"[system]\n{system_prompt}\n"
+            f"[user]\n{msgs[-1]['content']}"
+        )
 
         result = None
         raw = None
@@ -272,7 +322,25 @@ class SkillEngine:
             if error:
                 self.client.append_text(f"[Skill error: {error}]\n", "error")
             on_result(result, skill_at_fire)
-            # Chain one pending turn if queued.
+            # Update plan step from LLM's reply (before chaining any pending turn).
+            if result is not None and self._skill_name == skill_at_fire:
+                new_step = result.get("plan_step")
+                if new_step:
+                    if not self._plan_steps or new_step in self._plan_steps:
+                        self._plan_step = new_step
+                    else:
+                        self.client.append_text(
+                            f"[Skill] LLM returned unknown plan_step '{new_step}' "
+                            f"(valid: {', '.join(self._plan_steps)}) — keeping '{self._plan_step}'.\n",
+                            "error"
+                        )
+            # Chain one pending turn if queued — but only when no commands were
+            # dispatched this turn.  If commands were sent, the MUD will reply and
+            # send a fresh prompt, which will drive the next turn with up-to-date
+            # context.  Chaining immediately would give the LLM stale MUD output
+            # (collected while the previous LLM call was running, before the MUD
+            # responded to the commands).  Preserve any rescue flag from the
+            # discarded payload so it isn't lost.
             self._busy = False
             if self._pending and self.is_active():
                 self._pending = False
@@ -281,7 +349,12 @@ class SkillEngine:
                 self._pending_payload = None
                 self._pending_on_result = None
                 mud_lines, stats, combat_mob, rescue_flag, tk = payload
-                self._fire_turn(mud_lines, stats, combat_mob, rescue_flag, cb, tk)
+                if result is not None and result.get("commands"):
+                    # Commands were dispatched — skip chain, wait for MUD response.
+                    if rescue_flag:
+                        self._deferred_rescue = True
+                else:
+                    self._fire_turn(mud_lines, stats, combat_mob, rescue_flag, cb, tk)
 
         master.after(0, deliver)
 
@@ -300,6 +373,34 @@ class SkillEngine:
             parts.append("\nWatched stats (reported each turn): " + ", ".join(watch))
         return "\n".join(parts)
 
+    def _render_plan(self):
+        """Return plan markdown with checkboxes reflecting current completion state.
+
+        Steps before the current step get [x] (completed); the current step
+        gets [ ] with a trailing marker; steps after get [ ].  The template
+        always stores [ ] for every step — the harness owns checkbox state.
+        """
+        plan_text = (self._skill_cfg or {}).get("plan", "")
+        if not plan_text or not self._plan_steps:
+            return plan_text
+        current_idx = (self._plan_steps.index(self._plan_step)
+                       if self._plan_step in self._plan_steps else -1)
+        result = []
+        for line in plan_text.split('\n'):
+            m = _PLAN_STEP_RE.match(line)
+            if m:
+                prefix, mid, step_id, rest = m.group(1), m.group(2), m.group(3), m.group(4)
+                if step_id in self._plan_steps:
+                    idx = self._plan_steps.index(step_id)
+                    checked = "x" if (current_idx >= 0 and idx < current_idx) else " "
+                    marker = "  ← CURRENT STEP" if step_id == self._plan_step else ""
+                    result.append(f"{prefix}{checked}{mid}{step_id}{rest}{marker}")
+                else:
+                    result.append(line)
+            else:
+                result.append(line)
+        return '\n'.join(result)
+
     def _build_user_message(self, mud_lines, stats, combat_mob, rescue_just_fired,
                             target_killed=False):
         parts = []
@@ -307,6 +408,12 @@ class SkillEngine:
         if reminders:
             parts.append("REMINDERS (re-read each turn):")
             parts.append(reminders)
+            parts.append("")
+        if (self._skill_cfg or {}).get("plan") and self._plan_steps:
+            parts.append("SKILL PLAN (re-read each turn):")
+            parts.append(self._render_plan())
+            parts.append(f"Current step: {self._plan_step}")
+            parts.append(f"Valid plan_step values (use EXACTLY one): {', '.join(self._plan_steps)}")
             parts.append("")
         parts.append("MUD output since last command:")
         lines = self._compress_combat(mud_lines, combat_mob) if combat_mob else list(mud_lines)
@@ -320,9 +427,24 @@ class SkillEngine:
         # (e.g. 87 means the tank is at 87% HP); naming/formatting them
         # clearly prevents the LLM from reading them as absolute HP.
         stat_labels = {"opp": "opponent_hp_pct", "tank": "tank_hp_pct"}
+        # Override tank/opp with the freshest values parsed directly from the
+        # last prompt line in the buffer.  The snapshot in `stats` can be stale
+        # if a non-combat echo prompt triggered this turn before the combat
+        # round's prompt arrived.
+        fresh_tank, fresh_opp = None, None
+        for line in reversed(mud_lines):
+            m = _PROMPT_COMBAT_RE.search(line)
+            if m:
+                fresh_tank, fresh_opp = int(m.group(1)), int(m.group(2))
+                break
         if watch:
             for key in watch:
-                val = stats.get(key)
+                if key == "tank" and fresh_tank is not None:
+                    val = fresh_tank
+                elif key == "opp" and fresh_opp is not None:
+                    val = fresh_opp
+                else:
+                    val = stats.get(key)
                 label = stat_labels.get(key, key)
                 if key in ("tank", "opp") and val is not None:
                     parts.append(f"  {label} = {val}%  (percentage of max HP)")
@@ -331,7 +453,15 @@ class SkillEngine:
         else:
             parts.append("  (none declared)")
         parts.append("")
-        parts.append(f"Current combat target: {combat_mob if combat_mob else 'none'}")
+        # Use buffer-fresh opp to detect combat when the snapshot is stale.
+        in_combat_by_prompt = fresh_opp is not None and fresh_opp > 0
+        if combat_mob:
+            combat_display = combat_mob
+        elif in_combat_by_prompt:
+            combat_display = f"unknown (opp={fresh_opp}% in MUD prompt — you ARE in combat)"
+        else:
+            combat_display = "none"
+        parts.append(f"Current combat target: {combat_display}")
         parts.append(f"Harness target_killed flag: {bool(target_killed)}")
         if rescue_just_fired:
             parts.append(
@@ -439,9 +569,13 @@ class SkillEngine:
         if not isinstance(cmds, list):
             return None
         cmds = [str(c).strip() for c in cmds if isinstance(c, (str, int, float)) and str(c).strip()]
+        plan_step_val = obj.get("plan_step")
+        if plan_step_val is not None:
+            plan_step_val = str(plan_step_val).strip() or None
         return {
             "commands": cmds,
             "complete": bool(obj.get("complete", False)),
+            "plan_step": plan_step_val,
             "note": str(obj.get("note", ""))[:200],
         }
 
