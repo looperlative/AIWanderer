@@ -272,6 +272,8 @@ class SkillEngine:
             restart = (self._skill_cfg or {}).get("rescue_restart_step")
             if restart is not None:
                 self._plan_step = restart
+                self._cmd_history = []  # stale ledger would block speedwalk on retry
+                self._messages = []     # stale combat history causes bad-state LLM reasoning
         skill_at_fire = self._skill_name
         user_msg = self._build_user_message(mud_lines, stats, combat_mob,
                                             rescue_just_fired, target_killed)
