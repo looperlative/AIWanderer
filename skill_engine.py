@@ -31,6 +31,9 @@ from llm_advisor import LLMAdvisor
 # context instead of shrinking as the session runs.
 HISTORY_TURN_PAIRS = 3
 
+# Emit a group-combat snapshot into the LLM context every N turns.
+BATTLE_SNAPSHOT_TURNS = 5
+
 # Attack-verb lines collapsed during combat turns. Anything not matching
 # these (HP lines, kill lines, tells, room titles, non-target mob
 # mentions) is preserved verbatim.
@@ -103,6 +106,18 @@ _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 # _PLAN_STEP_ID_RE extracts step identifiers in order from a plan markdown string.
 _PLAN_STEP_RE = re.compile(r'^(\s*-\s*\[)[ xX](\]\s*)(\w+)(\s*:.*)')
 _PLAN_STEP_ID_RE = re.compile(r'^\s*-\s*\[[ xX]\]\s*(\w+)\s*:', re.MULTILINE)
+
+# Extract the entity name that follows "the" near the end of an attack line.
+# Captures everything between "the " and the terminal punctuation so we can
+# strip trailing intensity words in a second pass.
+_MOB_THE_RE = re.compile(r'\bthe\s+([a-z][a-z\s]{0,29}?)[.!]\s*$', re.IGNORECASE)
+
+# Strip trailing intensity phrases from a raw mob-name candidate.
+# Ordered longest-first so "very hard" is removed before a bare "hard" pass.
+_MOB_INTENSITY_RE = re.compile(
+    r'\s+(?:very|extremely|quite|rather|exceedingly)\s+\w+$'
+    r'|\s+(?:hard|lightly|softly|barely|savagely|viciously|brutally|effortlessly)$',
+    re.IGNORECASE)
 
 # Matches the MUD prompt line to extract tank% and opp% directly from the buffer.
 # Example: "209H 100M 113V 100%T 97%O >"
@@ -181,6 +196,10 @@ class SkillEngine:
         self._plan_step = None    # current plan step identifier (tracked each turn)
         self._plan_steps = []     # ordered step IDs parsed from plan markdown
         self._deferred_rescue = False  # rescue flag preserved when pending turn is skipped
+        self._battle_attacked_mobs = set()           # mob names hit since last snapshot
+        self._battle_attacked_pcs  = set()           # PC names hit since last snapshot
+        self._battle_turns_since_snap = 0
+        self._battle_snapshot_inflight = False       # True while a snapshot is in an undelivered LLM call
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -204,6 +223,10 @@ class SkillEngine:
         self._plan_steps = _parse_plan_steps(plan) if isinstance(plan, str) else []
         self._plan_step = self._plan_steps[0] if self._plan_steps else None
         self._deferred_rescue = False
+        self._battle_attacked_mobs = set()
+        self._battle_attacked_pcs  = set()
+        self._battle_turns_since_snap = 0
+        self._battle_snapshot_inflight = False
 
     def stop(self):
         """Cancel the active skill. In-flight LLM replies are discarded."""
@@ -216,6 +239,10 @@ class SkillEngine:
         self._plan_step = None
         self._plan_steps = []
         self._deferred_rescue = False
+        self._battle_attacked_mobs = set()
+        self._battle_attacked_pcs  = set()
+        self._battle_turns_since_snap = 0
+        self._battle_snapshot_inflight = False
 
     def record_dispatched(self, commands):
         """Called by the client after it sends commands returned by a turn."""
@@ -318,6 +345,7 @@ class SkillEngine:
             if self._skill_name != skill_at_fire:
                 self._busy = False
                 return
+            self._battle_snapshot_inflight = False
             if result is not None and raw is not None:
                 self._messages.append({"role": "assistant", "content": raw})
             # Cap rolling history to last N turn pairs. Command ledger
@@ -428,9 +456,24 @@ class SkillEngine:
             parts.append(f"Valid plan_step values (use EXACTLY one): {', '.join(self._plan_steps)}")
             parts.append("")
         parts.append("MUD output since last command:")
+        self._scan_battle_targets(mud_lines)
         lines = self._compress_combat(mud_lines, combat_mob) if combat_mob else list(mud_lines)
         mud = "\n".join(lines).strip()
         parts.append(mud if mud else "(no new output)")
+        self._battle_turns_since_snap += 1
+        if (self._battle_turns_since_snap >= BATTLE_SNAPSHOT_TURNS
+                and not self._battle_snapshot_inflight
+                and (self._battle_attacked_mobs or self._battle_attacked_pcs)):
+            mobs_str = ", ".join(sorted(self._battle_attacked_mobs)) or "(none)"
+            pcs_str  = ", ".join(sorted(self._battle_attacked_pcs))  or "(none)"
+            snap = (f"[Group battle snapshot: mobs attacked: {mobs_str}; "
+                    f"PCs attacked: {pcs_str}]")
+            parts.append(snap)
+            self.client.append_battle_snapshot(snap)
+            self._battle_attacked_mobs.clear()
+            self._battle_attacked_pcs.clear()
+            self._battle_turns_since_snap = 0
+            self._battle_snapshot_inflight = True
         parts.append("")
         parts.append("Watched stats:")
         watch = (self._skill_cfg or {}).get("watch_stats", [])
@@ -487,6 +530,42 @@ class SkillEngine:
         parts.append("")
         parts.append("Reply with the JSON object now.")
         return "\n".join(parts)
+
+    def _scan_battle_targets(self, lines):
+        """Scan raw mud_lines for attacked entities using combat-verb patterns.
+
+        Updates _battle_attacked_mobs (mobs that were hit) and
+        _battle_attacked_pcs (PCs that were hit) based on who_list membership.
+        """
+        agent = self.client.ai_agent
+        who_list = set()
+        if agent and getattr(agent, 'state', None):
+            who_list = {e['name'].lower() for e in (agent.state.who_list or [])}
+
+        for raw in lines:
+            line = raw.rstrip()
+            low = line.lower().lstrip()
+            if not _COMBAT_VERB_RE.search(low):
+                continue
+            # PC attacked: a who_list name appears in the line NOT at the start
+            for pc in who_list:
+                if pc in low and not low.startswith(pc):
+                    self._battle_attacked_pcs.add(pc)
+            # Mob attacked: "you <verb> … the <name>" or "<pc> <verb> … the <name>"
+            is_player_attacker = low.startswith('you ') or any(
+                low.startswith(pc + ' ') for pc in who_list)
+            if not is_player_attacker:
+                continue
+            # Skip miss lines: "try to <verb>" and "jumps out of the way" patterns
+            if re.search(r'\btry\s+to\b|\bjumps?\s+out\b', low):
+                continue
+            # Two-step extraction: capture raw text after "the", then strip
+            # trailing intensity phrases ("very hard", "extremely hard", etc.)
+            m = _MOB_THE_RE.search(low)
+            if m:
+                target = _MOB_INTENSITY_RE.sub('', m.group(1)).strip()
+                if target and target not in who_list:
+                    self._battle_attacked_mobs.add(target)
 
     def _compress_combat(self, lines, combat_mob):
         """

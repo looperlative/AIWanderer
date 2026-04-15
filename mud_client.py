@@ -2994,6 +2994,16 @@ class MUDClient:
         self.advisor_area.see(tk.END)
         self.advisor_area.config(state=tk.DISABLED)
 
+    def append_battle_snapshot(self, text):
+        """Display a battle snapshot in the advisor pane with a distinct amber prefix."""
+        self.advisor_area.config(state=tk.NORMAL)
+        self.advisor_area.insert(tk.END, "[Battle] ", "battle_prefix")
+        self.advisor_area.tag_config("battle_prefix", foreground="#ce9178",
+                                     font=("Courier", 10, "bold"))
+        self.advisor_area.insert(tk.END, text.strip() + "\n\n", "advisor_body")
+        self.advisor_area.see(tk.END)
+        self.advisor_area.config(state=tk.DISABLED)
+
     def clear_advisor(self):
         """Clear the advisor output pane."""
         self.advisor_area.config(state=tk.NORMAL)
