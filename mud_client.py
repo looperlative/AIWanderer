@@ -2921,6 +2921,13 @@ class MUDClient:
         if self._pending_command is None:
             self._response_buffer = []
         stats = dict(self.char_stats)
+        # Overlay with the freshest prompt line in the buffer so hp/mp/mv/tank/opp
+        # are current even before the message_queue stats update reaches the main thread.
+        for line in reversed(mud_lines):
+            prompt_update = self.mud_parser.parse_prompt_stats(line)
+            if prompt_update:
+                stats.update(prompt_update)
+                break
         combat_mob = self._combat_mob
         rescue_flag = self._skill_rescue_flag
         self._skill_rescue_flag = False
