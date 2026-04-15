@@ -990,8 +990,6 @@ class MUDClient:
         self._conn_menu.entryconfig("Quit MUD", state=tk.DISABLED)
         if self.ai_agent and self.ai_agent.is_running:
             self.ai_agent.stop()
-        if self.llm_advisor and self.llm_advisor.is_available():
-            self.llm_advisor.generate_session_summary(self._on_session_summary)
         self.session_logger.close()
         self._status_log_label.config(text="Log: off", foreground="gray")
         self._cancel_auto_score()
@@ -1077,16 +1075,13 @@ class MUDClient:
                     if ln.strip():
                         self._response_buffer.append(ln.rstrip())
 
-                # Detect MUD command prompt — trigger skill on every prompt,
-                # trigger advisor only when there's a pending user command.
+                # Detect MUD command prompt — trigger skill on every prompt.
                 if self.last_line.rstrip().endswith('>'):
                     # Skill goes first so it sees _response_buffer before the
                     # advisor consumes and clears it.
                     if self.skill_engine and self.skill_engine.is_active():
                         self.master.after(0, self._trigger_skill)
-                    if self._pending_command is not None \
-                            and self._advisor_active and self.llm_advisor:
-                        self.master.after(0, self._trigger_advisor)
+
 
                 # Parse character stats and queue status panel update
                 self._parse_and_queue_stats(clean_text)
@@ -2380,8 +2375,6 @@ class MUDClient:
                 self.append_text(f"[Entry room detected: {room_data['name']}]\n", "system")
                 self.detect_entry_room = False
                 self.current_room_hash = room_hash
-                if self.llm_advisor:
-                    self.llm_advisor.send_initial_context()
 
             # Handle directional links (if we moved from another room)
             elif self.previous_room_hash and self.last_movement_direction:
@@ -2915,11 +2908,11 @@ class MUDClient:
         if not engine or not engine.is_active():
             return
         mud_lines = list(self._response_buffer)
-        # If the advisor isn't also running, it won't drain the buffer — drain
-        # it here so it doesn't grow without bound. If the advisor IS running,
-        # it will drain independently; double-drain is harmless.
-        if self._pending_command is None:
-            self._response_buffer = []
+        # Drain the buffer every turn — the advisor no longer runs, so the
+        # skill engine is the sole consumer.  Also clear _pending_command so
+        # the stale human command doesn't linger between turns.
+        self._response_buffer = []
+        self._pending_command = None
         stats = dict(self.char_stats)
         # Overlay with the freshest prompt line in the buffer so hp/mp/mv/tank/opp
         # are current even before the message_queue stats update reaches the main thread.
