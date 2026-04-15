@@ -248,12 +248,16 @@ class SkillEngine:
             # OR-merge sticky flags so a rescue or kill signal raised while
             # an earlier turn is in flight isn't lost when the payload is
             # overwritten by a later, flag-less trigger.
+            # Accumulate mud_lines so earlier output (e.g. room description)
+            # is not discarded when a later prompt (e.g. auto-score) arrives
+            # before the in-flight LLM call completes.
+            prev_mud_lines = []
             prev_rescue = False
             prev_killed = False
             if self._pending and self._pending_payload is not None:
-                _, _, _, prev_rescue, prev_killed = self._pending_payload
+                prev_mud_lines, _, _, prev_rescue, prev_killed = self._pending_payload
             self._pending = True
-            self._pending_payload = (mud_lines, stats, combat_mob,
+            self._pending_payload = (list(prev_mud_lines) + list(mud_lines), stats, combat_mob,
                                      rescue_just_fired or prev_rescue,
                                      target_killed or prev_killed)
             self._pending_on_result = on_result
@@ -355,6 +359,12 @@ class SkillEngine:
                         self._deferred_rescue = True
                 else:
                     self._fire_turn(mud_lines, stats, combat_mob, rescue_flag, cb, tk)
+            elif (result is not None and self.is_active()
+                  and not result.get("commands") and not result.get("complete")):
+                # No commands dispatched, no MUD prompt incoming, skill still
+                # running — re-trigger immediately so the LLM can act on the
+                # new plan step without waiting for a natural MUD prompt.
+                master.after(0, self.client._trigger_skill)
 
         master.after(0, deliver)
 

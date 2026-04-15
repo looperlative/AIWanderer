@@ -25,7 +25,7 @@ class MUDClient:
     def __init__(self, master):
         self.master = master
         self.master.title("MUD Client - SSL Connection")
-        
+
         # Shared parser instance
         self.mud_parser = MUDTextParser()
 
@@ -35,7 +35,7 @@ class MUDClient:
         self.connected = False
         self.receive_thread = None
         self.message_queue = queue.Queue()
-        
+
         # Profile management
         self.profiles_file = os.path.join(os.path.expanduser("~"), ".mud_client_profiles.json")
         self.profiles = self.load_profiles()
@@ -58,18 +58,18 @@ class MUDClient:
             self.master.geometry(saved_geometry or "900x600")
         except tk.TclError:
             self.master.geometry("900x600")
-        
+
         # Autologin state
         self.autologin_pending = False
         self.autologin_stage = 0
         self.last_line = ""  # Track last non-empty line for prompt learning
         self.triggered_once_responses = set()  # Track which run_once responses have fired this session
-        
+
         # Quit sequence state
         self.quit_pending = False
         self.quit_stage = 0
         self.quit_prompts_seen = []  # Track prompts seen during this quit sequence
-        
+
         # Room mapping state
         self.room_tracking_enabled = False
         self.last_command = ""
@@ -82,7 +82,7 @@ class MUDClient:
         self.current_room_hash = None  # Hash of the current room
         self.previous_room_hash = None  # Hash of the previous room
         self.detect_entry_room = False  # Flag to detect entry room after login
-        self.movement_commands = ['n', 'north', 's', 'south', 'e', 'east', 
+        self.movement_commands = ['n', 'north', 's', 'south', 'e', 'east',
                                    'w', 'west', 'u', 'up', 'd', 'down', 'l', 'look']
         # Map short commands to directions
         self.direction_map = {
@@ -160,15 +160,15 @@ class MUDClient:
         self.setup_ui()
 
         self.master.after(100, self.process_queue)
-        
+
     def strip_ansi_codes(self, text):
         """Remove ANSI escape sequences from text (for prompt detection)"""
         ansi_pattern = re.compile(r'\x1b\[[0-9;]*m')
         return ansi_pattern.sub('', text)
-    
+
     def normalize_prompt(self, text):
         """Normalize prompts by replacing numeric values with wildcards
-        
+
         This allows prompts with stats like '24H 100M 85V 0%T 0%O >' to match
         regardless of the actual stat values.
         """
@@ -176,7 +176,7 @@ class MUDClient:
         # E.g., "24H 100M 85V 0%T 0%O >" becomes "#H #M #V #%T #%O >"
         normalized = re.sub(r'\d+', '#', text)
         return normalized.strip()
-    
+
     # ANSI foreground color map: basic 8 + bright 8
     _ANSI_COLORS = {
         30: "#000000",  # Black
@@ -309,7 +309,7 @@ class MUDClient:
             result.append((current_text, current_color))
 
         return result
-    
+
     def filter_telnet_sequences(self, data):
         """Filter TELNET protocol sequences and log them"""
         # TELNET commands start with IAC (0xFF)
@@ -320,7 +320,7 @@ class MUDClient:
         DONT = 0xFE
         SB = 0xFA  # Subnegotiation Begin
         SE = 0xF0  # Subnegotiation End
-        
+
         telnet_commands = {
             0xFB: "WILL",
             0xFC: "WONT",
@@ -338,7 +338,7 @@ class MUDClient:
             0xF8: "EL",
             0xF9: "GA",
         }
-        
+
         telnet_options = {
             0: "BINARY",
             1: "ECHO",
@@ -355,14 +355,14 @@ class MUDClient:
             86: "COMPRESS2",
             200: "MCCP",
         }
-        
+
         result = bytearray()
         i = 0
-        
+
         while i < len(data):
             if data[i] == IAC and i + 1 < len(data):
                 cmd = data[i + 1]
-                
+
                 # Handle subnegotiation
                 if cmd == SB and i + 2 < len(data):
                     # Find the end of subnegotiation (IAC SE)
@@ -371,14 +371,14 @@ class MUDClient:
                         if data[end] == IAC and data[end + 1] == SE:
                             break
                         end += 1
-                    
+
                     option = data[i + 2] if i + 2 < len(data) else 0
                     option_name = telnet_options.get(option, f"UNKNOWN({option})")
                     sb_data = data[i+3:end]
                     self.message_queue.put(("telnet", f"TELNET: Subnegotiation for {option_name} (data length: {len(sb_data)})"))
                     i = end + 2
                     continue
-                
+
                 # Handle 3-byte commands (WILL, WONT, DO, DONT)
                 if cmd in [WILL, WONT, DO, DONT] and i + 2 < len(data):
                     option = data[i + 2]
@@ -387,7 +387,7 @@ class MUDClient:
                     self.message_queue.put(("telnet", f"TELNET: {cmd_name} {option_name}"))
                     i += 3
                     continue
-                
+
                 # Handle 2-byte commands
                 cmd_name = telnet_commands.get(cmd, f"UNKNOWN({cmd})")
                 if cmd in telnet_commands:
@@ -396,9 +396,9 @@ class MUDClient:
             else:
                 result.append(data[i])
                 i += 1
-        
+
         return bytes(result)
-    
+
     def load_profiles(self):
         """Load profiles from JSON file"""
         if os.path.exists(self.profiles_file):
@@ -413,7 +413,7 @@ class MUDClient:
                 print(f"Error loading profiles: {e}")
                 return {'_settings': {}}
         return {'_settings': {}}
-    
+
     def save_profiles(self):
         """Save profiles to JSON file"""
         try:
@@ -421,18 +421,18 @@ class MUDClient:
                 json.dump(self.profiles, f, indent=2)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save profiles: {e}")
-    
+
     def save_last_profile(self, profile_name):
         """Save the last connected profile name"""
         if '_settings' not in self.profiles:
             self.profiles['_settings'] = {}
         self.profiles['_settings']['last_profile'] = profile_name
         self.save_profiles()
-    
+
     def get_last_profile(self):
         """Get the last connected profile name"""
         return self.profiles.get('_settings', {}).get('last_profile', None)
-    
+
     def setup_ui(self):
         """Setup the user interface"""
         # ── Shared font objects (updating these resizes all widgets at once) ──
@@ -633,7 +633,7 @@ class MUDClient:
         # Initialize profile list after all UI elements are created
         self.update_profile_list()
         self._rebuild_profile_menu()
-    
+
     def _build_status_panel(self, parent):
         """Build the right-hand character status panel."""
         BG      = "#1a1a1a"
@@ -816,7 +816,7 @@ class MUDClient:
 
             self._update_status_bar()
             self._status_profile_label.config(text=profile_name)
-    
+
     def new_profile(self):
         """Create a new profile"""
         dialog = ProfileDialog(self.master, "New Profile")
@@ -825,7 +825,7 @@ class MUDClient:
             if name in self.profiles:
                 messagebox.showerror("Error", "Profile name already exists")
                 return
-            
+
             self.profiles[name] = {
                 'host': host,
                 'port': port,
@@ -842,21 +842,21 @@ class MUDClient:
         if not profile_name or profile_name not in self.profiles:
             messagebox.showwarning("Warning", "Please select a profile to edit")
             return
-        
+
         profile = self.profiles[profile_name]
-        dialog = ProfileDialog(self.master, "Edit Profile", 
+        dialog = ProfileDialog(self.master, "Edit Profile",
                               profile_name, profile['host'], profile['port'],
                               profile.get('character', ''), profile.get('password', ''))
         if dialog.result:
             name, host, port, character, password = dialog.result
-            
+
             # If name changed, delete old and create new
             if name != profile_name:
                 if name in self.profiles:
                     messagebox.showerror("Error", "Profile name already exists")
                     return
                 del self.profiles[profile_name]
-            
+
             # Preserve existing learned prompts when editing
             self.profiles[name] = {
                 'host': host,
@@ -876,7 +876,7 @@ class MUDClient:
         if not profile_name or profile_name not in self.profiles:
             messagebox.showwarning("Warning", "Please select a profile to delete")
             return
-        
+
         if messagebox.askyesno("Confirm Delete", f"Delete profile '{profile_name}'?"):
             del self.profiles[profile_name]
             self.save_profiles()
@@ -884,14 +884,14 @@ class MUDClient:
             self.current_profile = None
             self.update_profile_list()
             self._status_profile_label.config(text="")
-        
+
     def toggle_connection(self):
         """Toggle connection state"""
         if self.connected:
             self.disconnect()
         else:
             self.connect()
-    
+
     def connect(self):
         """Establish SSL connection to MUD server"""
         if not self.current_profile or self.current_profile not in self.profiles:
@@ -908,23 +908,23 @@ class MUDClient:
         if not host:
             messagebox.showerror("Error", "No host configured in profile")
             return
-        
+
         try:
             self.append_text(f"Connecting to {host}:{port}...\n", "system")
-            
+
             # Create a regular socket
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(10)
-            
+
             # Wrap it with SSL
             context = ssl.create_default_context()
             # Allow self-signed certificates (MUDs often use them)
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
-            
+
             self.ssl_socket = context.wrap_socket(self.socket, server_hostname=host)
             self.ssl_socket.connect((host, port))
-            
+
             self.connected = True
             self._status_conn_label.config(text="Connected", foreground="green")
             self._conn_menu.entryconfig("Connect", label="Disconnect")
@@ -959,11 +959,11 @@ class MUDClient:
                 self.autologin_pending = True
                 self.autologin_stage = 0
                 self.append_text("Autologin enabled for this profile\n", "system")
-            
+
             # Start receiving thread
             self.receive_thread = threading.Thread(target=self.receive_data, daemon=True)
             self.receive_thread.start()
-            
+
         except socket.timeout:
             messagebox.showerror("Error", "Connection timed out")
             self.cleanup_connection()
@@ -976,7 +976,7 @@ class MUDClient:
         except Exception as e:
             messagebox.showerror("Error", f"Connection failed: {str(e)}")
             self.cleanup_connection()
-    
+
     def disconnect(self):
         """Disconnect from MUD server"""
         self.connected = False
@@ -1009,7 +1009,7 @@ class MUDClient:
         self._advisor_queue.clear()
         self.triggered_once_responses.clear()  # Reset run-once tracking
         self.append_text("Disconnected from server\n", "system")
-    
+
     def cleanup_connection(self):
         """Clean up socket resources"""
         if self.ssl_socket:
@@ -1024,7 +1024,7 @@ class MUDClient:
             except:
                 pass
             self.socket = None
-    
+
     def receive_data(self):
         """Receive data from MUD server (runs in separate thread)"""
         buffer = []
@@ -1034,10 +1034,10 @@ class MUDClient:
                 if not data:
                     self.message_queue.put(("disconnect", "Connection closed by server\n"))
                     break
-                
+
                 # Filter TELNET sequences first (works on bytes)
                 data = self.filter_telnet_sequences(data)
-                
+
                 # Decode received data
                 try:
                     text = data.decode('utf-8')
@@ -1045,7 +1045,7 @@ class MUDClient:
                     # Try latin-1 as fallback
                     text = data.decode('latin-1', errors='replace')
                 text = text.replace('\r', '')  # strip CR from CRLF line endings
-                
+
                 # Parse ANSI color codes
                 parsed_segments = self.parse_ansi_text(text)
 
@@ -1061,7 +1061,7 @@ class MUDClient:
                 # For prompt learning, we need text without ANSI codes
                 clean_text = self.strip_ansi_codes(text)
                 self.session_logger.log_received(clean_text)
-                
+
                 # Track last non-empty line for prompt learning and advisor trigger
                 lines = clean_text.strip().split('\n')
                 for line in reversed(lines):
@@ -1107,11 +1107,11 @@ class MUDClient:
                 # Handle autologin (use clean text without ANSI codes)
                 if self.autologin_pending and self.current_profile:
                     self.handle_autologin(clean_text)
-                
+
                 # Handle quit sequence (use clean text without ANSI codes)
                 if self.quit_pending and self.current_profile:
                     self.handle_quit_sequence(clean_text)
-                
+
                 # Handle custom auto-responses (use clean text without ANSI codes)
                 # Don't process custom responses during quit sequence
                 if self.current_profile and not self.quit_pending:
@@ -1124,31 +1124,31 @@ class MUDClient:
                 # Send to queue for display
                 self.message_queue.put(("data", buffer))
                 buffer = []
-                
+
             except socket.timeout:
                 continue
             except Exception as e:
                 if self.connected:
                     self.message_queue.put(("error", f"Error receiving data: {str(e)}\n"))
                 break
-    
+
     def handle_autologin(self, text):
         """Handle autologin sequence based on received text"""
         if not self.current_profile or self.current_profile not in self.profiles:
             return
-        
+
         profile = self.profiles[self.current_profile]
         character = profile.get('character', '')
         password = profile.get('password', '')
         login_prompt = profile.get('login_prompt', '').lower()
         password_prompt = profile.get('password_prompt', '').lower()
-        
+
         if not character or not password or not login_prompt or not password_prompt:
             return
-        
+
         # Check each line to see if prompt is at the start
         lines = text.split('\n')
-        
+
         # Stage 0: Wait for name/login prompt
         if self.autologin_stage == 0:
             for line in lines:
@@ -1163,7 +1163,7 @@ class MUDClient:
                         self.message_queue.put(("error", f"Autologin failed: {e}\n"))
                         self.autologin_pending = False
                     break
-        
+
         # Stage 1: Wait for password prompt
         elif self.autologin_stage == 1:
             for line in lines:
@@ -1213,7 +1213,7 @@ class MUDClient:
                 if line_lower.rstrip().endswith('>') and ('h ' in line_lower or 'hp' in line_lower):
                     self._complete_autologin()
                     break
-    
+
     def _apply_font_size(self):
         """Update all font objects and persist the size to settings."""
         self._font_main.configure(size=self._font_size)
@@ -1362,24 +1362,24 @@ class MUDClient:
         """Handle custom learned prompt-response pairs"""
         if not self.current_profile or self.current_profile not in self.profiles:
             return
-        
+
         profile = self.profiles[self.current_profile]
         custom_responses = profile.get('custom_responses', {})
-        
+
         if not custom_responses:
             return
-        
+
         # Check each line to see if it matches a learned prompt
         lines = text.split('\n')
-        
+
         for line in lines:
             line_lower = line.strip().lower()
             line_normalized = self.normalize_prompt(line_lower)
-            
+
             # Check if this line starts with any learned prompt
             for prompt, response_data in custom_responses.items():
                 prompt_normalized = self.normalize_prompt(prompt)
-                
+
                 if line_normalized.startswith(prompt_normalized):
                     # Handle both old format (string) and new format (dict)
                     if isinstance(response_data, str):
@@ -1388,31 +1388,31 @@ class MUDClient:
                     else:
                         response = response_data.get('response', '')
                         run_once = response_data.get('run_once', False)
-                    
+
                     # Check if this is a run_once response that has already fired
                     if run_once and prompt_normalized in self.triggered_once_responses:
                         continue  # Skip this response
-                    
+
                     try:
                         time.sleep(0.3)  # Small delay
                         self.ssl_socket.sendall((response + "\n").encode('utf-8'))
                         self.message_queue.put(("system", f"[Auto-response] Sent: {response}\n"))
-                        
+
                         # Mark as triggered if run_once
                         if run_once:
                             self.triggered_once_responses.add(prompt_normalized)
                     except Exception as e:
                         self.message_queue.put(("error", f"Auto-response failed: {e}\n"))
                     break  # Only respond once per line
-    
+
     def start_quit_sequence(self):
         """Start the quit sequence"""
         if not self.connected or not self.current_profile:
             return
-        
+
         profile = self.profiles.get(self.current_profile, {})
         quit_sequence = profile.get('quit_sequence', [])
-        
+
         self.quit_pending = True
         self.quit_stage = 0
         self.quit_prompts_seen = []
@@ -1439,19 +1439,19 @@ class MUDClient:
         else:
             self.append_text("[Quit sequence started - learning mode (manually respond to each prompt)]\n", "system")
             self.append_text("[The quit sequence will be complete when connection closes]\n", "system")
-    
+
     def handle_quit_sequence(self, text):
         """Handle quit sequence by auto-responding to learned prompts"""
         if not self.current_profile or self.current_profile not in self.profiles:
             return
-        
+
         profile = self.profiles[self.current_profile]
         quit_sequence = profile.get('quit_sequence', [])
-        
+
         if not quit_sequence:
             # Learning mode - just track prompts, user will respond manually
             return
-        
+
         # Check each line to see if it matches a remaining prompt in sequence.
         # We scan forward from the current stage rather than requiring strict
         # sequential order — this handles cases where earlier prompts are skipped
@@ -1491,23 +1491,23 @@ class MUDClient:
                         self.message_queue.put(("error", f"Quit sequence failed: {e}\n"))
                         self.quit_pending = False
                     break
-    
+
     def learn_quit_response(self, prompt, response):
         """Learn a prompt-response pair as part of the quit sequence"""
         if not self.current_profile or self.current_profile not in self.profiles:
             return
-        
+
         # Normalize prompt to handle varying stats (e.g., "24H 100M >" becomes "#H #M >")
         prompt_normalized = self.normalize_prompt(prompt.lower())
-        
+
         # Don't learn if we already responded to this prompt in this quit sequence
         if prompt_normalized in self.quit_prompts_seen:
             return
-        
+
         # Initialize quit_sequence if it doesn't exist
         if 'quit_sequence' not in self.profiles[self.current_profile]:
             self.profiles[self.current_profile]['quit_sequence'] = []
-        
+
         # Add this prompt-response to the quit sequence (store normalized version)
         self.profiles[self.current_profile]['quit_sequence'].append({
             'prompt': prompt_normalized,
@@ -1515,11 +1515,11 @@ class MUDClient:
         })
         self.quit_prompts_seen.append(prompt_normalized)
         self.quit_stage += 1
-        
+
         self.save_profiles()
         seq_len = len(self.profiles[self.current_profile]['quit_sequence'])
         self.append_text(f"[Learned quit step {seq_len}: '{prompt}' -> '{response}']\n", "system")
-    
+
     def toggle_room_tracking(self):
         """Toggle room tracking feature"""
         self.room_tracking_enabled = self.room_tracking_var.get()
@@ -1953,13 +1953,6 @@ class MUDClient:
             self._start_tick_countdown()
             return
 
-        rounded = round(self._tick_count / 5) * 5
-        if rounded > 0 and (self._tick_interval is None or rounded < self._tick_interval):
-            self._tick_interval = rounded
-            if self.current_profile and self.current_profile in self.profiles:
-                self.profiles[self.current_profile]['tick_interval'] = rounded
-                self.save_profiles()
-
         self._tick_count = 0
         self._start_tick_countdown()
 
@@ -2178,12 +2171,12 @@ class MUDClient:
             if color.lower() in ['#2472c8', '#3b8eea', '#11a8cd', '#29b8db']:  # Blues and cyans
                 if text.strip() and not text.strip().startswith('['):  # Not just whitespace or exit bracket
                     bluish_colors.append(color)
-        
+
         # Return the most common bluish color found
         if bluish_colors:
             return max(set(bluish_colors), key=bluish_colors.count)
         return None
-    
+
     def parse_room_data(self, segments):
         """Parse room data from colored text segments.
 
@@ -2208,18 +2201,18 @@ class MUDClient:
             if detected:
                 self.room_color = detected
                 self.append_text(f"[Room color detected: {self.room_color}]\n", "system")
-                
+
                 # Save room color to profile
                 if self.current_profile and self.current_profile in self.profiles:
                     self.profiles[self.current_profile]['room_color'] = self.room_color
                     self.save_profiles()
-                
+
                 if self.room_tracking_enabled:
                     self._update_status_bar()
-        
+
         if not self.room_color:
             return None
-        
+
         # Extract room name (first line with room color)
         room_name = ""
         description_parts = []
@@ -2265,9 +2258,9 @@ class MUDClient:
                 'exits': exits,
                 'objects': object_parts,
             }
-        
+
         return None
-    
+
     def _parse_and_queue_stats(self, text):
         """Parse stat/combat data from MUD text and queue a status panel update.
         Called from the receive thread — must not touch UI directly."""
@@ -2325,10 +2318,10 @@ class MUDClient:
         """Process and store room data"""
         if not self.room_tracking_enabled or not self.expecting_room_data:
             return
-        
+
         if not self.current_profile or self.current_profile not in self.profiles:
             return
-        
+
         # Parse room data
         room_data = self.parse_room_data(segments)
 
@@ -2351,17 +2344,17 @@ class MUDClient:
             # Create hash of room data using normalized description for stability
             room_string = f"{room_data['name']}|{room_data['normalized_description']}|{room_data['exits']}"
             room_hash = hashlib.sha256(room_string.encode()).hexdigest()
-            
+
             # Initialize rooms dict if needed
             if 'rooms' not in self.profiles[self.current_profile]:
                 self.profiles[self.current_profile]['rooms'] = {}
             if 'room_links' not in self.profiles[self.current_profile]:
                 self.profiles[self.current_profile]['room_links'] = {}
-            
+
             # Store or update room data
             rooms = self.profiles[self.current_profile]['rooms']
             is_new_room = room_hash not in rooms
-            
+
             if is_new_room:
                 # Store room data (without the normalized version - we only need that for hashing)
                 rooms[room_hash] = {
@@ -2379,7 +2372,7 @@ class MUDClient:
                 rooms[room_hash]['objects'] = room_data['objects']
             elif 'objects' in rooms[room_hash]:
                 rooms[room_hash]['objects'] = []
-            
+
             # Handle entry room detection
             if self.detect_entry_room:
                 self.profiles[self.current_profile]['entry_room'] = room_hash
@@ -2389,23 +2382,23 @@ class MUDClient:
                 self.current_room_hash = room_hash
                 if self.llm_advisor:
                     self.llm_advisor.send_initial_context()
-            
+
             # Handle directional links (if we moved from another room)
             elif self.previous_room_hash and self.last_movement_direction:
                 # Create link from previous room to current room
                 room_links = self.profiles[self.current_profile]['room_links']
-                
+
                 # Initialize previous room's links if needed
                 if self.previous_room_hash not in room_links:
                     room_links[self.previous_room_hash] = {}
-                
+
                 # Store the directional link
                 direction = self.last_movement_direction
                 room_links[self.previous_room_hash][direction] = room_hash
-                
+
                 # Update current room
                 self.current_room_hash = room_hash
-                
+
                 if is_new_room:
                     self.save_profiles()
                     self._update_status_bar()
@@ -2424,7 +2417,7 @@ class MUDClient:
                     self.save_profiles()
                     self._update_status_bar()
                     self.append_text(f"[New room mapped: {room_data['name']} (Total: {len(rooms)})]\n", "system")
-            
+
             self.expecting_room_data = False
 
             # Survival hook — fountain fill and buy-food walk progression
@@ -2438,7 +2431,7 @@ class MUDClient:
         try:
             while True:
                 msg_type, msg_data = self.message_queue.get_nowait()
-                
+
                 if msg_type == "data":
                     # Detect teleport/summon — set expecting_room_data so the
                     # incoming room is parsed and on_room_entered fires normally.
@@ -2470,7 +2463,7 @@ class MUDClient:
                     # Process room data if we're expecting it
                     if self.room_tracking_enabled and self.expecting_room_data:
                         self.process_room_data(msg_data)
-                    
+
                     filtered = self._filter_display_segments(msg_data)
                     if filtered:
                         self.append_text(filtered, "mud_colored")
@@ -2528,17 +2521,17 @@ class MUDClient:
                 elif msg_type == "disconnect":
                     self.append_text(msg_data, "system")
                     self.disconnect()
-                    
+
         except queue.Empty:
             pass
         finally:
             self.master.after(100, self.process_queue)
-    
+
     def send_message(self, event=None):
         """Send message to MUD server"""
         if not self.connected:
             return
-        
+
         message = self.input_entry.get()
         if not message:
             return
@@ -2618,7 +2611,7 @@ class MUDClient:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to send message: {str(e)}")
             self.disconnect()
-    
+
     def send_ai_command(self, command):
         """Send a command programmatically from the AI agent."""
         if not self.connected:
@@ -3319,89 +3312,89 @@ class MUDClient:
         """Send character name and learn the login prompt"""
         if not self.connected:
             return
-        
+
         if not self.current_profile or self.current_profile not in self.profiles:
             messagebox.showwarning("Warning", "Please select a profile with character name")
             return
-        
+
         profile = self.profiles[self.current_profile]
         character = profile.get('character', '')
-        
+
         if not character:
             messagebox.showwarning("Warning", "No character name set in profile")
             return
-        
+
         try:
             # Save the last line as the login prompt
             if self.last_line:
                 self.profiles[self.current_profile]['login_prompt'] = self.last_line.lower()
                 self.save_profiles()
                 self.append_text(f"[Learned login prompt: {self.last_line}]\n", "system")
-            
+
             # Send character name
             self.ssl_socket.sendall((character + "\n").encode('utf-8'))
             self.append_text(f"> {character}\n", "user")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to send character name: {str(e)}")
             self.disconnect()
-    
+
     def send_password(self):
         """Send password and learn the password prompt"""
         if not self.connected:
             return
-        
+
         if not self.current_profile or self.current_profile not in self.profiles:
             messagebox.showwarning("Warning", "Please select a profile with password")
             return
-        
+
         profile = self.profiles[self.current_profile]
         password = profile.get('password', '')
-        
+
         if not password:
             messagebox.showwarning("Warning", "No password set in profile")
             return
-        
+
         try:
             # Save the last line as the password prompt
             if self.last_line:
                 self.profiles[self.current_profile]['password_prompt'] = self.last_line.lower()
                 self.save_profiles()
                 self.append_text(f"[Learned password prompt: {self.last_line}]\n", "system")
-            
+
             # Send password
             self.ssl_socket.sendall((password + "\n").encode('utf-8'))
             self.append_text("> [password hidden]\n", "user")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to send password: {str(e)}")
             self.disconnect()
-    
+
     def send_and_remember(self):
         """Send message and remember the prompt-response pair"""
         if not self.connected:
             return
-        
+
         if not self.current_profile or self.current_profile not in self.profiles:
             messagebox.showwarning("Warning", "Please select a profile")
             return
-        
+
         message = self.input_entry.get()
         if not message:
             messagebox.showwarning("Warning", "Please enter a response to send")
             return
-        
+
         # Ask user if this should run once or always
         dialog = RunOnceDialog(self.master)
         if dialog.result is None:
             return  # User closed dialog without choosing
         run_once = dialog.result
-        
+
         try:
             # Save the last line as a prompt with this response
             if self.last_line:
                 # Initialize custom_responses if it doesn't exist
                 if 'custom_responses' not in self.profiles[self.current_profile]:
                     self.profiles[self.current_profile]['custom_responses'] = {}
-                
+
                 # Normalize prompt to handle varying stats (e.g., "24H 100M >" becomes "#H #M >")
                 prompt_normalized = self.normalize_prompt(self.last_line.lower())
                 self.profiles[self.current_profile]['custom_responses'][prompt_normalized] = {
@@ -3409,10 +3402,10 @@ class MUDClient:
                     'run_once': run_once
                 }
                 self.save_profiles()
-                
+
                 frequency = "once per connection" if run_once else "every time"
                 self.append_text(f"[Learned: '{self.last_line}' -> '{message}' ({frequency})]\n", "system")
-            
+
             # Send message
             self.ssl_socket.sendall((message + "\n").encode('utf-8'))
             self.session_logger.log_command(message)
@@ -3421,12 +3414,12 @@ class MUDClient:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to send message: {str(e)}")
             self.disconnect()
-    
+
     def append_text(self, text, msg_type="mud"):
         """Append text to the display area"""
         self.session_logger.log_append(text, msg_type)
         self.text_area.config(state=tk.NORMAL)
-        
+
         # Apply color tags based on message type
         if msg_type == "system":
             self.text_area.insert(tk.END, text, "system")
@@ -3445,22 +3438,22 @@ class MUDClient:
                 self.text_area.tag_config(tag_name, foreground=color)
         else:
             self.text_area.insert(tk.END, text)
-        
+
         self.text_area.see(tk.END)
         self.text_area.config(state=tk.DISABLED)
-        
+
         # Configure tags for colors
         self.text_area.tag_config("system", foreground="#4ec9b0")
         self.text_area.tag_config("error", foreground="#f48771")
         self.text_area.tag_config("user", foreground="#dcdcaa")
         self.text_area.tag_config("telnet", foreground="#ce9178")
-    
+
     def clear_output(self):
         """Clear the output text area"""
         self.text_area.config(state=tk.NORMAL)
         self.text_area.delete(1.0, tk.END)
         self.text_area.config(state=tk.DISABLED)
-    
+
     def on_closing(self):
         """Handle window closing"""
         if self.connected:
@@ -3480,34 +3473,34 @@ class RunOnceDialog:
     """Dialog for choosing if response runs once or always"""
     def __init__(self, parent):
         self.result = None
-        
+
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Response Frequency")
         self.dialog.geometry("350x150")
         self.dialog.transient(parent)
         self.dialog.grab_set()
-        
+
         # Message
-        message = ttk.Label(self.dialog, 
+        message = ttk.Label(self.dialog,
                            text="How often should this response be sent?",
                            wraplength=300)
         message.pack(pady=20)
-        
+
         # Buttons
         button_frame = ttk.Frame(self.dialog)
         button_frame.pack(pady=10)
-        
-        ttk.Button(button_frame, text="Once Per Connection", 
+
+        ttk.Button(button_frame, text="Once Per Connection",
                   command=self.once_clicked, width=20).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Always", 
+        ttk.Button(button_frame, text="Always",
                   command=self.always_clicked, width=20).pack(side=tk.LEFT, padx=5)
-        
+
         self.dialog.wait_window()
-    
+
     def once_clicked(self):
         self.result = True  # run_once = True
         self.dialog.destroy()
-    
+
     def always_clicked(self):
         self.result = False  # run_once = False
         self.dialog.destroy()
@@ -3720,64 +3713,64 @@ class ProfileDialog:
     """Dialog for creating/editing profiles"""
     def __init__(self, parent, title, name="", host="", port="4000", character="", password=""):
         self.result = None
-        
+
         self.dialog = tk.Toplevel(parent)
         self.dialog.title(title)
         self.dialog.geometry("450x340")
         self.dialog.transient(parent)
         self.dialog.grab_set()
-        
+
         # Profile name
         ttk.Label(self.dialog, text="Profile Name:").grid(row=0, column=0, sticky=tk.W, padx=10, pady=8)
         self.name_entry = ttk.Entry(self.dialog, width=30)
         self.name_entry.grid(row=0, column=1, padx=10, pady=8)
         self.name_entry.insert(0, name)
-        
+
         # Host
         ttk.Label(self.dialog, text="Host:").grid(row=1, column=0, sticky=tk.W, padx=10, pady=8)
         self.host_entry = ttk.Entry(self.dialog, width=30)
         self.host_entry.grid(row=1, column=1, padx=10, pady=8)
         self.host_entry.insert(0, host)
-        
+
         # Port
         ttk.Label(self.dialog, text="Port:").grid(row=2, column=0, sticky=tk.W, padx=10, pady=8)
         self.port_entry = ttk.Entry(self.dialog, width=30)
         self.port_entry.grid(row=2, column=1, padx=10, pady=8)
         self.port_entry.insert(0, port)
-        
+
         # Character name
         ttk.Label(self.dialog, text="Character Name:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=8)
         self.character_entry = ttk.Entry(self.dialog, width=30)
         self.character_entry.grid(row=3, column=1, padx=10, pady=8)
         self.character_entry.insert(0, character)
-        
+
         # Password
         ttk.Label(self.dialog, text="Password:").grid(row=4, column=0, sticky=tk.W, padx=10, pady=8)
         self.password_entry = ttk.Entry(self.dialog, width=30, show="*")
         self.password_entry.grid(row=4, column=1, padx=10, pady=8)
         self.password_entry.insert(0, password)
-        
+
         # Note about prompts
         note = ttk.Label(self.dialog, text="Note: Use Connection > 'Send Character Name' and 'Send Password'\nto automatically learn login prompts",
                         foreground="gray", font=("TkDefaultFont", 8))
         note.grid(row=5, column=0, columnspan=2, pady=8)
-        
+
         # Buttons
         button_frame = ttk.Frame(self.dialog)
         button_frame.grid(row=6, column=0, columnspan=2, pady=20)
-        
+
         ttk.Button(button_frame, text="OK", command=self.ok_clicked).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Cancel", command=self.cancel_clicked).pack(side=tk.LEFT, padx=5)
-        
+
         self.dialog.wait_window()
-    
+
     def ok_clicked(self):
         name = self.name_entry.get().strip()
         host = self.host_entry.get().strip()
         port = self.port_entry.get().strip()
         character = self.character_entry.get().strip()
         password = self.password_entry.get()
-        
+
         if not name:
             messagebox.showerror("Error", "Profile name is required")
             return
@@ -3787,10 +3780,10 @@ class ProfileDialog:
         if not port:
             messagebox.showerror("Error", "Port is required")
             return
-        
+
         self.result = (name, host, port, character, password)
         self.dialog.destroy()
-    
+
     def cancel_clicked(self):
         self.dialog.destroy()
 
