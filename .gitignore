@@ -3,6 +3,7 @@ __pycache__/
 
 # Profile data — contains passwords, API keys, and character data
 *.json
+!EXAMPLE_*.json
 *.profiles
 
 # Session logs — contain gameplay data, not source

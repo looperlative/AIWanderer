@@ -45,23 +45,22 @@
     "skills": {},
     "skill_templates": {
       "kill_target_from_otto": {
-        "instructions": "Target: {{mob_name}}.\n{{mob_overview}}\nRoom description of target: {{mob_appearance}}.\n\nOtto's services (tell commands, usable only while in Otto's room):\n  tell otto heal      — heals you\n  tell otto bless     — applies bless buff\n  tell otto armor     — applies armor buff\n  tell otto sanctuary — applies sanctuary buff\n  tell otto summon    — teleports you to Otto's room (also the rescue command)\n\nSpeedwalk from Otto's room to the target square: {{speedwalk}}\nSend as ONE command per turn: [\"{{speedwalk}}\"] — never split into individual letters.\nA speedwalk halts automatically on combat interruption.\n\nNon-target interruption detection: if attack verb lines or the `opp` stat name a mob other than {{mob_name}}, you are fighting the wrong mob. Escape via 'tell otto summon', heal, then retry.\n\nFollow the SKILL PLAN steps listed in each turn's user message. The current step is authoritative.",
-        "plan": "- [ ] pre_flight: In Otto's room: send 'score' and check the SPL list. For each of bless, sanctuary, armor that is missing send 'tell otto <buff>' — one per turn. Advance when all three appear active in SPL.\n- [ ] approach: Send '{{speedwalk}}' as ONE command (never split into letters). When you see {{mob_appearance}} in the room description, immediately send 'kill {{mob_kill_keyword}}' AND set plan_step to combat in the SAME turn — do not wait for the next turn. A mob appearing in the room during travel is NOT combat — only react to actual attack verbs against you.\n- [ ] combat: Send empty command during auto-attack. Advance to post_kill ONLY when you see explicit kill text in the MUD output: '{{mob_name}} is DEAD!!' or XP gain naming {{mob_name}}. Do NOT advance based on opp=0%, tank=0%, or combat target=none in the stats — these can lag the actual MUD prompt and are unreliable mid-combat. Non-target attacking you? Send 'tell otto summon', return to pre_flight. Harness rescue also resets to pre_flight.\n- [ ] post_kill: Send 'get all corpse', then 'tell otto summon'. Advance when MUD confirms you are back in Otto's room.\n- [ ] done: Back in Otto's room after confirmed kill. Set complete: true.",
-        "rescue_restart_step": "pre_flight",
+        "instructions": "Target: {{mob_name}}.\n{{mob_overview}}\nRoom description of target: {{mob_appearance}}.\n\nOtto\u2019s services (tell commands, usable only while in Otto\u2019s room):\n  tell otto heal      \u2014 heals you\n  tell otto bless     \u2014 applies bless buff\n  tell otto armor     \u2014 applies armor buff\n  tell otto sanctuary \u2014 applies sanctuary buff\n  tell otto summon    \u2014 teleports you to Otto\u2019s room (also the rescue command)\n  score               - gives you current status including spell affects, hit points, etc.\n\nSpeedwalk from Otto\u2019s room to the target square: {{speedwalk}}\nSend as ONE command per turn: [\"{{speedwalk}}\"] \u2014 never split into individual letters.\nA speedwalk halts automatically on combat interruption.\n\nNon-target interruption detection: if attack verb lines or the `opp` stat name a mob other than {{mob_name}}, you are fighting the wrong mob. Escape via 'tell otto summon', heal, then retry.\n\nFollow the SKILL PLAN steps listed in each turn\u2019s user message. The current step is authoritative.",
         "watch_stats": [
           "hp",
           "max_hp",
           "tank",
           "opp"
         ],
-        "reminders": "",
         "placeholders": [
           "mob_name",
           "mob_kill_keyword",
           "mob_overview",
           "mob_appearance",
           "speedwalk"
-        ]
+        ],
+        "plan": "- [ ] pre_flight: In Otto's room: send 'score' and check the SPL list. For each of bless, sanctuary, armor that is missing send 'tell otto <buff>' \u2014 one per turn. Advance when all three appear active in SPL.\n- [ ] heal: In Otto's room: send 'tell otto heal' if hp < max_hp, one per turn. Stay on this step and repeat each turn until hp == max_hp. If hp is already at max_hp when this step starts, advance immediately to approach.\n- [ ] approach: Send '{{speedwalk}}' as ONE command (never split into letters). LEDGER GUARD: if the command ledger already shows '{{speedwalk}}' dispatched (count >= 1), do NOT send it again \u2014 send empty commands and wait. When you see {{mob_appearance}} in the room description, immediately send 'kill {{mob_kill_keyword}}' AND set plan_step to combat in the SAME turn \u2014 do not wait for the next turn. A mob appearing in the room during travel is NOT combat \u2014 only react to actual attack verbs against you.\n- [ ] combat: Send empty command during auto-attack. Advance to post_kill ONLY when you see explicit kill text in the MUD output: '{{mob_name}} is DEAD!!' or XP gain naming {{mob_name}}. Do NOT advance based on opp=0%, tank=0%, or combat target=none in the stats \u2014 these can lag the actual MUD prompt and are unreliable mid-combat. Non-target attacking you? Send 'tell otto summon', return to pre_flight. Harness rescue also resets to pre_flight.\n- [ ] post_kill: Send 'get all corpse', then 'tell otto summon'. Advance when MUD confirms you are back in Otto's room.\n- [ ] done: Back in Otto's room after confirmed kill. Set complete: true.",
+        "rescue_restart_step": "pre_flight"
       }
     },
     "skill_targets": {
@@ -73,6 +72,16 @@
           "mob_overview": "An aggressive chess-piece mob that stands on a square of the Great Chessboard of Midgaard. Max damage per hit ~13, grants ~58k xp per kill.",
           "mob_appearance": "a stone castle on wheels",
           "speedwalk": "5n3w4s"
+        }
+      },
+      "white rook 2": {
+        "template": "kill_target_from_otto",
+        "params": {
+          "mob_name": "a white rook",
+          "mob_kill_keyword": "rook",
+          "mob_overview": "An aggressive chess-piece mob that stands on a square of the Great Chessboard of Midgaard. Max damage per hit ~13, grants ~58k xp per kill.",
+          "mob_appearance": "a stone castle on wheels",
+          "speedwalk": "5n10w4s"
         }
       },
       "black rook": {
