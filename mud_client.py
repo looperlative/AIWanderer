@@ -2960,6 +2960,7 @@ class MUDClient:
         rescue_flag = self._skill_rescue_flag
         self._skill_rescue_flag = False
         target_killed = self._skill_target_killed
+        self._skill_target_killed = False
         engine.on_prompt(mud_lines, stats, combat_mob, rescue_flag,
                          self._on_skill_result, target_killed=target_killed)
 
