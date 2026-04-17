@@ -1,10 +1,10 @@
 # AIWanderer — Capabilities & Roadmap
 
-> Last updated: 2026-03-15
+> Last updated: 2026-04-17
 
 ## Overview
 
-AIWanderer is an AI-powered MUD (Multi-User Dungeon) client that combines a traditional graphical client with an autonomous exploration agent. The application connects to MUD servers, provides a real-time GUI for manual play, and includes an AI agent capable of exploring the game world with minimal human intervention.
+AIWanderer is an AI-powered MUD (Multi-User Dungeon) client combining a traditional graphical client with an LLM-driven skill engine. The application connects to MUD servers, provides a real-time GUI for manual play, and lets the user delegate named tasks ("skills") to an LLM agent that monitors MUD output and issues commands autonomously until the task is complete.
 
 ---
 
@@ -26,12 +26,14 @@ AIWanderer is an AI-powered MUD (Multi-User Dungeon) client that combines a trad
   - White — raw MUD server output
 - Real-time scrolling text display
 - Manual command input with Enter-to-send
+- Skills menu — start/stop named skills and manage skill definitions
 
-### Profile Management
-- Named connection profiles stored in `~/.mud_client_profiles.json`
-- Per-profile: host, port, SSL mode, character name, password
+### Configuration (Split-File Design)
+- **Shared profiles** (`mud_client_profiles.json`, e.g. in Dropbox) — connection details, room map, skills, skill templates, skill targets
+- **Host-local LLM config** (`mud_client_llm_local.json`) — LLM backend, endpoint, model, API key (not shared; machine-specific)
+- **Host-local UI config** (`mud_client_ui_local.json`) — window geometry and display state (not shared)
+- Named connection profiles: host, port, SSL mode, character name, password
 - Auto-login sequences with learned prompt-response pairs
-- "Run once" vs. "always" trigger modes for automation
 - Prompt normalization — replaces numeric stat values with wildcards so prompts match across sessions
 - Last-used profile auto-selection on startup
 
@@ -41,6 +43,7 @@ AIWanderer is an AI-powered MUD (Multi-User Dungeon) client that combines a trad
 - Exit detection from room description text
 - Bidirectional room link graph stored per-profile
 - Collision zone detection — distinguishes physically different rooms that share identical descriptions using (x, y, z) coordinate tracking
+- BFS pathfinding to any known room in the graph (`PathFinder.bfs_path`)
 - Persistent map data survives across sessions
 
 ### Session Logging
@@ -48,53 +51,94 @@ AIWanderer is an AI-powered MUD (Multi-User Dungeon) client that combines a trad
 - Separate log categories: MUD output, player commands, AI commands, AI reasoning, system events, errors
 - ANSI escape code stripping for clean, readable logs
 
-### Autonomous Exploration Agent
-- Breadth-first search (BFS) over the room graph to systematically visit unmapped areas
-- Tick-based event loop integrated with the tkinter main thread (no threading race conditions)
-- Character stat monitoring parsed from MUD prompts: HP, MP, MV (and their maximums)
-- SCORE command parsing: level, class, race, XP, gold, alignment
+### Skill System (Primary AI Feature)
 
-**Survival logic (prioritized over exploration):**
-- Low HP detection → rest or flee
-- Hunger/thirst detection → seek food and water
-- Dark room detection → avoid or seek a light source
-- Dangerous room tracking — marks and avoids rooms where the agent was harmed
+A **skill** is a named, LLM-driven task the user delegates to the agent. The agent runs the skill to completion, issuing MUD commands each turn based on the skill's instructions and a stream of watched stats and recent MUD output.
 
-**Situational awareness:**
-- Combat detection (start, rounds, flee prompts)
-- Death detection with automatic respawn wait and exploration resume
-- NPC/mob name extraction
-- Dead-end and loop detection
+**Skill types:**
+- **Named skills** (`profile["skills"]`) — standalone skills with fixed instructions (e.g. `group_tank`)
+- **Skill templates** (`profile["skill_templates"]`) — parameterized instruction sets with `{{placeholder}}` fields (e.g. `kill_target_from_otto`)
+- **Skill targets** (`profile["skill_targets"]`) — named bindings of a template to a specific set of params (e.g. `white rook`, `black queen`)
 
-### LLM Integration (Two-Tier Decision Making)
-- **Tier 1 (rule-based):** BFS exploration handles all standard movement decisions
-- **Tier 2 (LLM-based):** Called when BFS is exhausted or for situations requiring judgment (NPC dialogue, locked doors, puzzles, navigation choices)
+**Multi-step plans:**
+- Skills can declare a markdown plan (checklist of named steps)
+- The harness tracks the current step, renders the plan with checkboxes each turn, and validates step names returned by the LLM
+- Rescue events automatically reset the plan to a configurable `rescue_restart_step`
 
-**Supported LLM backends:**
-- **Ollama** (local) — OpenAI-compatible REST API, default endpoint `http://localhost:11434`, configurable model (default: `llama3.1:8b`), no API key required
-- **Claude** (Anthropic) — configurable model (default: `claude-haiku-4-5-20251001`), requires API key in profile config
+**Turn structure:**
+- Each turn delivers: skill instructions, SKILL PLAN with current step marked, recent MUD output (compressed during combat), watched stat values, current combat target, rescue/kill flags, and a command ledger
+- The LLM replies with a JSON object: `{commands, complete, plan_step, note}`
+- Empty `commands` means "wait and re-evaluate"; `complete: true` stops the skill
 
-**Context sent to the LLM:**
-- Current room name, description, available exits (reported vs. mapped)
-- Character stats (HP/MP/MV with max values, level, class, XP, gold, alignment)
-- Survival state (hunger, thirst)
-- Recent action history (last 6 actions)
-- Recent MUD text (last 20 lines)
-- Map progress statistics
+**Combat compression:**
+- Repetitive attack-verb lines against the current target are collapsed into a summary (`[combat: N hits on X, M hits from X, K misses]`)
+- Lines involving known group members are always preserved verbatim so the LLM can see ally-attack events and trigger rescues
 
-**Rate limiting:** minimum 8-second interval between LLM calls; non-blocking background thread with callback prevents UI freezes.
+**Group battle snapshots:**
+- Every 5 turns during combat, a summary is injected: `[Group battle snapshot: mobs attacked: ...; PCs attacked: ...]`
+- Tracks which mobs and which PCs are being attacked, using WHO-list and group-membership data to distinguish PCs from mobs
+
+**Command ledger:**
+- Full per-command dispatch counts and last-N commands are included every turn
+- Acts as the authoritative record of what has been sent (guards against duplicate speedwalks, duplicate buffs, etc.)
+
+**Rolling conversation history:**
+- Last 3 user+assistant turn pairs are kept in the LLM conversation
+- Older turns are dropped to bound context growth; the command ledger carries durable state
+
+**Lifecycle management:**
+- Skill engine is non-blocking: LLM I/O runs in a background thread; results are delivered on the Tk main thread
+- Pending-turn queuing: if a prompt arrives while a prior LLM call is in flight, it is queued and fired once (with mud_lines accumulated, and sticky flags OR-merged)
+- After a rescue, the command ledger and conversation history are cleared to prevent stale state from confusing the LLM on retry
+
+### Rescue System
+- Configurable per-profile: rescue command, HP threshold (fixed), and damage multiplier (relative to observed max single hit from the opponent)
+- Auto-fires when HP drops below the threshold during combat; sends the rescue command once per combat encounter
+- Sets `rescue_just_fired` flag consumed by the skill engine on the next turn
+- Rescue settings UI dialog
+
+### Group Awareness
+- Tracks group membership in real time by parsing join/leave messages from MUD output
+- `group_members` set (lowercase PC names) shared with the skill engine
+- WHO-list cache updated from `WHO` command output; used to distinguish player characters from mobs in combat output
+- `group_tank` skill — waits for a group invite, joins with `follow <player>`, then performs continuous tank duty (rescue allies, request heals, communicate)
+
+### AI State Tracking
+- Character stat monitoring parsed from MUD prompts: HP, MP, MV (and their maximums), tank%, opp%
+- SCORE command parsing: level, class, race, XP, gold, alignment, hunger, thirst
+- WHO list parsing: player name, level, class; used by skill engine to distinguish PCs from mobs
+- Room graph and exploration state persisted to `profile["ai_state"]`
+- Danger-room detection: marks rooms where HP dropped on entry
+
+### LLM Integration
+**Supported backends (configured per-host in `mud_client_llm_local.json`):**
+- **Ollama** (local) — OpenAI-compatible REST API, configurable endpoint and model
+- **Claude** (Anthropic) — configurable model and API key
+
+**Skill engine context sent to the LLM each turn:**
+- Skill instructions and SKILL PLAN with current step
+- Recent MUD output (compressed during combat)
+- Watched stat values (HP, max HP, tank%, opp%, etc.)
+- Combat target and rescue/kill event flags
+- Command ledger (counts + last-N dispatched commands)
+- Group battle snapshot (every 5 combat turns)
+
+### Skill Editor UI
+- Accessible via **Settings → Skills → Manage Skills...**
+- Tabbed dialog with separate lists for Skills, Templates, and Targets
+- New / Edit / Delete on each tab; double-click to edit
+- `SkillEditDialog` — in-app form for creating and editing skill definitions, including instructions, watched stats, and plan text
 
 ### Utility Tools
 - `clear_room_data.py` — interactive script to reset map data for one or all profiles, with automatic backup before clearing
+- `export_skill_template.py` — print a skill template as human-readable text; optionally render it with a target's params to preview the exact prompt the LLM will receive
 
 ---
 
-## Known Limitations (as of 2026-03-15)
+## Known Limitations (as of 2026-04-17)
 
-- Agent cannot yet reliably navigate from an arbitrary room to a known destination (pathfinding beyond BFS frontier is incomplete)
+- Generic LLM advisor (exploration mode) is disabled to avoid interference with skill completion; autonomous BFS exploration is not active
 - No handling of inventory management (picking up items, using equipment)
-- No spell or skill usage by the AI agent
-- LLM context does not include inventory or equipment state
 - Collision zone resolution is heuristic and can drift over long sessions
 - No multi-server or multi-character session support
 
@@ -104,25 +148,20 @@ AIWanderer is an AI-powered MUD (Multi-User Dungeon) client that combines a trad
 
 ### Near-Term
 
-- [ ] **Pathfinding to known rooms** — A* or Dijkstra over the existing room graph so the agent can navigate to previously visited locations (e.g., shops, healers)
-- [ ] **Inventory & equipment tracking** — parse `inventory` and `equipment` output; expose to LLM context
-- [ ] **Spell/skill usage** — agent aware of available abilities and mana cost; use them in combat or for exploration (e.g., `cast fly` to access otherwise unreachable exits)
-- [ ] **Improved survival logic** — identify and pathfind to healers, food sources, and water sources rather than wandering
-- [ ] **Better combat decisions** — flee threshold tuning, target selection, attack command variety
+- [ ] **Inventory & equipment tracking** — parse `inventory` and `equipment` output; expose to skill engine context
+- [ ] **Improved survival logic** — identify and pathfind to healers, food sources, and water sources
 
 ### Medium-Term
 
 - [ ] **Visual map display** — render the room graph as a 2D map in a side panel
 - [ ] **Quest / objective tracking** — agent can accept, track, and pursue in-game quests
 - [ ] **NPC dialogue trees** — structured handling of multi-turn NPC conversations
-- [ ] **Configurable AI personality / goals** — user-settable objectives (explore, grind XP, accumulate gold, etc.)
 - [ ] **Multi-profile comparison** — overlay maps from different characters to build a fuller world model
 
 ### Long-Term
 
-- [ ] **Full LLM-driven agent mode** — replace the BFS tier with a fully LLM-driven planner for complex, open-ended play
-- [ ] **Memory-augmented LLM** — give the LLM access to a persistent knowledge base about the game world (NPCs, lore, item locations)
-- [ ] **Multi-agent support** — run multiple characters simultaneously, coordinating actions
+- [ ] **Memory-augmented LLM** — give the skill engine access to a persistent knowledge base about the game world (NPCs, lore, item locations)
+- [ ] **Multi-agent support** — run multiple characters simultaneously, coordinating actions via shared skill state
 - [ ] **Plugin / scripting system** — allow users to add custom triggers, aliases, and automation scripts
 - [ ] **Web or headless mode** — run the agent without the GUI for server-side or cloud deployments
 
@@ -136,7 +175,7 @@ AIWanderer is an AI-powered MUD (Multi-User Dungeon) client that combines a trad
 | GUI | tkinter (stdlib) |
 | Networking | socket, ssl, http.client (stdlib) |
 | Threading | threading, queue (stdlib) |
-| Data persistence | JSON (`~/.mud_client_profiles.json`) |
+| Data persistence | JSON (profiles, LLM config, UI config) |
 | Local LLM | Ollama (OpenAI-compatible API) |
 | Cloud LLM | Anthropic Claude API |
 | External dependencies | None required for core features |
@@ -147,12 +186,14 @@ AIWanderer is an AI-powered MUD (Multi-User Dungeon) client that combines a trad
 
 ```
 AIWanderer/
-├── mud_client.py        Main GUI application and connection management
-├── ai_agent.py          Autonomous exploration agent (BFS + survival logic)
-├── llm_advisor.py       LLM backend integration (Ollama & Claude)
-├── mud_parser.py        Stateless text parsing utilities
-├── session_logger.py    Session log file management
-├── clear_room_data.py   Utility: reset room/map data in profiles
-├── requirements.txt     Python dependencies
-└── README.md            Setup and usage documentation
+├── mud_client.py              Main GUI application and connection management
+├── ai_agent.py                AI state tracker: room graph, stats, WHO list, danger rooms
+├── skill_engine.py            LLM-driven skill execution engine
+├── llm_advisor.py             LLM backend integration (Ollama & Claude)
+├── mud_parser.py              Stateless text parsing utilities
+├── session_logger.py          Session log file management
+├── clear_room_data.py         Utility: reset room/map data in profiles
+├── export_skill_template.py   Utility: print a skill template as human-readable text
+├── requirements.txt           Python dependencies
+└── README.md                  Setup and usage documentation
 ```
