@@ -148,6 +148,9 @@ class MUDClient:
         self._survival_buy_count = 0      # Buy commands still to issue
         self._survival_inv_text = ''      # Buffered inventory output
 
+        # Group member tracking (receive-thread state; used by skill engine)
+        self.group_members = set()         # Lowercase names of PCs currently in our group
+
         # Mob combat stat tracking (receive-thread state)
         self._combat_mob = None           # Normalised mob name currently fighting us
         self._rescue_sent = False         # True after rescue command sent this combat
@@ -1092,6 +1095,9 @@ class MUDClient:
                 # Per-mob combat stat tracking
                 self._update_mob_combat_stats(clean_text)
 
+                # Group membership tracking (used by skill engine PC detection)
+                self._update_group_members(clean_text)
+
                 # Survival automation (inventory collection)
                 self._survival_handle_text(clean_text)
 
@@ -1278,6 +1284,7 @@ class MUDClient:
         self._kill_cmd_pending = False
         self._combat_mob = None
         self._last_killed_mob = None
+        self.group_members = set()
 
         # Seed tick interval from saved profile value (keeps limit across sessions)
         saved_tick = (self.profiles.get(self.current_profile, {})
@@ -2020,6 +2027,34 @@ class MUDClient:
             self.append_text(f"[Autoloot] {cmd}\n", "system")
         except Exception:
             pass
+
+    # Group join pattern: "Cotu is now a member of Cotu's group."
+    _GROUP_JOIN_RE = re.compile(
+        r'^([A-Z][a-z]+)\s+is\s+now\s+a\s+member\s+of\s+\S+\s+group',
+        re.IGNORECASE
+    )
+    # Group leave pattern: "Cotu has left the group."
+    _GROUP_LEAVE_RE = re.compile(
+        r'^([A-Z][a-z]+)\s+has\s+left\s+(?:the\s+)?group',
+        re.IGNORECASE
+    )
+
+    def _update_group_members(self, text):
+        """Parse group join/leave events and maintain self.group_members.
+        Called from the receive thread — must not touch UI directly."""
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = self._GROUP_JOIN_RE.match(line)
+            if m:
+                name = m.group(1).lower()
+                if name != 'you':
+                    self.group_members.add(name)
+                continue
+            m = self._GROUP_LEAVE_RE.match(line)
+            if m:
+                self.group_members.discard(m.group(1).lower())
 
     def _update_mob_combat_stats(self, text):
         """Track per-mob hit/miss/damage/room/aggression stats.

@@ -531,29 +531,38 @@ class SkillEngine:
         parts.append("Reply with the JSON object now.")
         return "\n".join(parts)
 
-    def _scan_battle_targets(self, lines):
-        """Scan raw mud_lines for attacked entities using combat-verb patterns.
+    def _known_pcs(self):
+        """Return the set of lowercase PC names known to be in the group.
 
-        Updates _battle_attacked_mobs (mobs that were hit) and
-        _battle_attacked_pcs (PCs that were hit) based on who_list membership.
+        Combines the WHO-list cache (populated by WHO command output) with
+        group_members tracked live from join/leave messages in mud_client.
         """
         agent = self.client.ai_agent
         who_list = set()
         if agent and getattr(agent, 'state', None):
             who_list = {e['name'].lower() for e in (agent.state.who_list or [])}
+        return who_list | getattr(self.client, 'group_members', set())
+
+    def _scan_battle_targets(self, lines):
+        """Scan raw mud_lines for attacked entities using combat-verb patterns.
+
+        Updates _battle_attacked_mobs (mobs that were hit) and
+        _battle_attacked_pcs (PCs that were hit) based on known PC membership.
+        """
+        known_pcs = self._known_pcs()
 
         for raw in lines:
             line = raw.rstrip()
             low = line.lower().lstrip()
             if not _COMBAT_VERB_RE.search(low):
                 continue
-            # PC attacked: a who_list name appears in the line NOT at the start
-            for pc in who_list:
+            # PC targeted: a known PC name appears in the line NOT at the start
+            for pc in known_pcs:
                 if pc in low and not low.startswith(pc):
                     self._battle_attacked_pcs.add(pc)
             # Mob attacked: "you <verb> … the <name>" or "<pc> <verb> … the <name>"
             is_player_attacker = low.startswith('you ') or any(
-                low.startswith(pc + ' ') for pc in who_list)
+                low.startswith(pc + ' ') for pc in known_pcs)
             if not is_player_attacker:
                 continue
             # Skip miss lines: "try to <verb>" and "jumps out of the way" patterns
@@ -564,18 +573,20 @@ class SkillEngine:
             m = _MOB_THE_RE.search(low)
             if m:
                 target = _MOB_INTENSITY_RE.sub('', m.group(1)).strip()
-                if target and target not in who_list:
+                if target and target not in known_pcs:
                     self._battle_attacked_mobs.add(target)
 
     def _compress_combat(self, lines, combat_mob):
         """
         Collapse repetitive attack-verb lines against the current combat_mob
         into a single summary. Preserve anything that could carry new signal:
-        HP changes, kill/xp lines, tells, room titles, non-target mob mentions.
+        HP changes, kill/xp lines, tells, room titles, non-target mob mentions,
+        and any line that mentions a known group member (ally-attack lines).
         """
         if not lines:
             return list(lines)
         mob = (combat_mob or "").lower().strip()
+        known_pcs = self._known_pcs()
         out = []
         hits_on = hits_from = misses = 0
 
@@ -596,7 +607,13 @@ class SkillEngine:
                 continue
             # Only collapse lines that are pure attack verbs AND mention the
             # target mob (so pawn/knight interrupt lines fall through).
+            # Never collapse lines that also mention a known group member —
+            # the LLM must see ally-attack lines verbatim to trigger rescues.
             if mob and mob in low and _COMBAT_VERB_RE.search(low):
+                if known_pcs and any(pc in low for pc in known_pcs):
+                    flush()
+                    out.append(line)
+                    continue
                 # Heuristic direction: "you <verb> ... <mob>" vs "<mob> <verb> ... you"
                 if low.lstrip().startswith("you "):
                     if re.search(r'\bmiss(?:es)?\b', low):
