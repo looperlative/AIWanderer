@@ -42,7 +42,17 @@
       "rescue_hp_threshold": 30,
       "rescue_damage_multiplier": 2.0
     },
-    "skills": {},
+    "skills": {
+      "group_tank": {
+        "instructions": "You are the tank for a player group in a MUD. You start alone and wait to be invited into someone's group. You must not initiate combat, explore, or wander. Wait patiently, then when invited, join and fulfil tank duties.\n\nJoining a group: the user may say 'follow me', invite you, or otherwise signal they want you to group with them. When you recognise such intent from a tell, say, or gsay, send `follow <player_name>`. Follow the player whose tell/say triggered the invite \u2014 never guess a name.\n\nTank duties once grouped:\n  - Protect group members. When you see a mob attacking a group member (raw attack lines in the MUD output such as `<mob> hits <ally>` or the `[Group battle snapshot: ...]` summary listing PCs being attacked), send `rescue <ally_name>` to pull threat.\n  - Monitor your own HP. The `hp` and `max_hp` watched stats are reported each turn. If hp drops below 70% of max_hp, send `gsay heal` exactly once per drop \u2014 do not spam. Only re-request if hp rises above 70% and then falls below again, or if no hp recovery is observed after 3 turns regardless of ledger count.\n  - Use `group` occasionally (not every turn) to refresh your mental model of who is in the party. Consult the command ledger before issuing another `group` \u2014 once every 20+ turns is plenty.\n  - Communicate. Reply to tells directed at you (`tell <sender> <reply>`), to says in the room (`say <reply>`), or to gsays from group members (`gsay <reply>`) when a response seems warranted. Silence is fine \u2014 only speak if the message invites a reply or coordination requires it.\n\nCommands you may issue:\n  follow <player>     \u2014 attach yourself to <player>; use to join a group\n  rescue <ally>       \u2014 take threat from whoever is attacking <ally>\n  group               \u2014 list group members (use sparingly)\n  gsay <text>         \u2014 speak to the group (use `gsay heal` as the HP<70% signal)\n  tell <name> <text>  \u2014 private reply\n  say <text>          \u2014 speak in the current room\n  kill <mob>          \u2014 only if the group leader explicitly asks you to engage\n  score               \u2014 check your own stats if uncertain\n\nHard rules:\n  - Never wander, explore, or attack unprompted. If not grouped, send empty commands and wait.\n  - Never send `follow` to a player you haven't just heard from with an invite-like intent.\n  - Never mark the skill complete \u2014 return `complete: false` every turn. This is an ongoing duty loop; the user stops it manually.\n  - Every turn, set `plan_step` to the single string `on_duty` (there are no other steps).",
+        "watch_stats": [
+          "hp",
+          "max_hp",
+          "tank",
+          "opp"
+        ]
+      }
+    },
     "skill_templates": {
       "kill_target_from_otto": {
         "instructions": "Target: {{mob_name}}.\n{{mob_overview}}\nRoom description of target: {{mob_appearance}}.\n\nOtto\u2019s services (tell commands, usable only while in Otto\u2019s room):\n  tell otto heal      \u2014 heals you\n  tell otto bless     \u2014 applies bless buff\n  tell otto armor     \u2014 applies armor buff\n  tell otto sanctuary \u2014 applies sanctuary buff\n  tell otto summon    \u2014 teleports you to Otto\u2019s room (also the rescue command)\n  score               - gives you current status including spell affects, hit points, etc.\n\nSpeedwalk from Otto\u2019s room to the target square: {{speedwalk}}\nSend as ONE command per turn: [\"{{speedwalk}}\"] \u2014 never split into individual letters.\nA speedwalk halts automatically on combat interruption.\n\nNon-target interruption detection: if attack verb lines or the `opp` stat name a mob other than {{mob_name}}, you are fighting the wrong mob. Escape via 'tell otto summon', heal, then retry.\n\nFollow the SKILL PLAN steps listed in each turn\u2019s user message. The current step is authoritative.",
@@ -64,6 +74,16 @@
       }
     },
     "skill_targets": {
+      "white queen": {
+        "template": "kill_target_from_otto",
+        "params": {
+          "mob_name": "the white queen",
+          "mob_kill_keyword": "queen",
+          "mob_overview": "An aggressive chess-piece mob that stands on a square of the Great Chessboard of Midgaard. Max damage per hit ~18, grants ~140k xp per kill.",
+          "mob_appearance": "the white queen",
+          "speedwalk": "5n3w4w4s"
+        }
+      },
       "white rook": {
         "template": "kill_target_from_otto",
         "params": {
@@ -82,6 +102,16 @@
           "mob_overview": "An aggressive chess-piece mob that stands on a square of the Great Chessboard of Midgaard. Max damage per hit ~13, grants ~58k xp per kill.",
           "mob_appearance": "a stone castle on wheels",
           "speedwalk": "5n10w4s"
+        }
+      },
+      "black queen": {
+        "template": "kill_target_from_otto",
+        "params": {
+          "mob_name": "the black queen",
+          "mob_kill_keyword": "queen",
+          "mob_overview": "An aggressive chess-piece mob that stands on a square of the Great Chessboard of Midgaard. Max damage per hit ~18, grants ~140k xp per kill.",
+          "mob_appearance": "the black queen",
+          "speedwalk": "5n3w4w3n"
         }
       },
       "black rook": {
