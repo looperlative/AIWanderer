@@ -268,6 +268,9 @@ class LLMAdvisor:
         if not self.client.current_profile:
             return prompt
         profile = self.client.profiles.get(self.client.current_profile, {})
+        char_name = profile.get("character", "")
+        if char_name:
+            prompt += f"\n\nThe player's character name is {char_name}. When another character addresses {char_name} directly in the MUD output, note that the player is being spoken to."
         ctx = profile.get('advisor_context', {})
         summary = ctx.get('session_summary', '')
         if not summary:

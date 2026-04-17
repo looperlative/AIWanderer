@@ -21,6 +21,26 @@ from collections import deque
 from mud_parser import MUDTextParser
 
 
+DEFAULT_SKILL_CFG = {
+    "instructions": (
+        "You are running as the default ambient agent for this character.\n"
+        "You have no fixed plan — use your judgment each turn based on the MUD output and stats.\n\n"
+        "Priorities (in order):\n"
+        "1. If a character addresses you by name in a tell or say, respond appropriately and\n"
+        "   carry out any reasonable request they make.\n"
+        "2. If a user instruction is provided (prefixed [User instruction:]), follow it.\n"
+        "3. If thirst is high (>= 8) or hunger is high (>= 8), find and consume food or water.\n"
+        "4. If HP is below 80% of max and you are not in combat, seek healing (e.g. tell otto heal,\n"
+        "   or use a healing skill/item).\n"
+        "5. If you are not in town and not in combat, return to town (use the appropriate speedwalk\n"
+        "   or 'recall' command if available).\n"
+        "6. If everything is fine, do nothing — return an empty commands list.\n\n"
+        "Never set complete to true. This skill runs indefinitely until the user starts another skill."
+    ),
+    "watch_stats": ["hp", "max_hp", "hunger", "thirst"],
+}
+
+
 class MUDClient:
     def __init__(self, master):
         self.master = master
@@ -107,9 +127,6 @@ class MUDClient:
         self._skill_target_killed = False  # set when a kill line fires during active skill
         self._pending_command = None   # last human command sent (awaiting MUD response)
         self._response_buffer = []     # MUD lines received since last command
-        self._advisor_active = True    # LLM advisor on/off
-        self._advisor_busy = False     # True while an LLM call is in flight
-        self._advisor_queue = []       # events queued while LLM is busy: list of {'command','mud_lines'}
         self._advisor_streamed = False # True if current response was already streamed to UI
         self._advisor_stream_start = None  # text index where streaming body began
 
@@ -474,13 +491,9 @@ class MUDClient:
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Settings", menu=settings_menu)
         self.room_tracking_var = tk.BooleanVar(value=False)
-        self._advisor_var = tk.BooleanVar(value=True)
         settings_menu.add_checkbutton(label="Room Tracking",
                                       variable=self.room_tracking_var,
                                       command=self.toggle_room_tracking)
-        settings_menu.add_checkbutton(label="LLM Advisor",
-                                      variable=self._advisor_var,
-                                      command=self.toggle_advisor)
         settings_menu.add_separator()
 
         # Autoloot submenu
@@ -952,7 +965,6 @@ class MUDClient:
             if not self.llm_advisor:
                 self.llm_advisor = LLMAdvisor(self)
             self.llm_advisor.reset_history()
-
             # Save this as the last connected profile
             if self.current_profile:
                 self.save_last_profile(self.current_profile)
@@ -962,6 +974,9 @@ class MUDClient:
                 self.autologin_pending = True
                 self.autologin_stage = 0
                 self.append_text("Autologin enabled for this profile\n", "system")
+            else:
+                # No autologin — start default skill after a short delay
+                self.master.after(500, self._start_default_skill)
 
             # Start receiving thread
             self.receive_thread = threading.Thread(target=self.receive_data, daemon=True)
@@ -1006,8 +1021,6 @@ class MUDClient:
         self.quit_prompts_seen = []
         self._pending_command = None
         self._response_buffer = []
-        self._advisor_busy = False
-        self._advisor_queue.clear()
         self.triggered_once_responses.clear()  # Reset run-once tracking
         self.append_text("Disconnected from server\n", "system")
 
@@ -1293,6 +1306,7 @@ class MUDClient:
             self._tick_interval = int(saved_tick)
         self._tick_count = None
         self.message_queue.put(("system", "[Autologin] Login sequence completed\n"))
+        self.master.after(500, self._start_default_skill)
         if self.room_tracking_enabled:
             self.detect_entry_room = True
             self.expecting_room_data = True
@@ -1564,12 +1578,6 @@ class MUDClient:
                 text=f"Rooms: {room_count}", foreground="green")
         else:
             self._status_rooms_label.config(text="", foreground="gray")
-
-    def toggle_advisor(self):
-        """Toggle the LLM advisor on/off from the Settings menu."""
-        self._advisor_active = self._advisor_var.get()
-        state = "enabled" if self._advisor_active else "disabled"
-        self.append_text(f"[LLM Advisor {state}]\n", "system")
 
     # ------------------------------------------------------------------
     # Command frequency / quick-commands menu
@@ -2573,7 +2581,17 @@ class MUDClient:
         # Direct LLM prompt — starts with \
         if message.startswith('\\'):
             self.input_entry.delete(0, tk.END)
-            self._send_direct_llm_prompt(message[1:].strip())
+            text = message[1:].strip()
+            if not text:
+                return
+            self.append_text(f"\\ {text}\n", "user")
+            self.session_logger.log_command(f"\\ {text}")
+            engine = self._ensure_skill_engine()
+            if engine.is_active():
+                engine.inject_user_message(text)
+            else:
+                self._start_default_skill()
+                self.master.after(100, lambda t=text: self.skill_engine.inject_user_message(t))
             return
 
         try:
@@ -2665,35 +2683,8 @@ class MUDClient:
             return False
 
     # ------------------------------------------------------------------
-    # LLM Advisor
+    # LLM Advisor (streaming UI helpers used by llm_advisor.py backend)
     # ------------------------------------------------------------------
-
-    def _trigger_advisor(self):
-        """Called on the main thread when a MUD prompt is detected after a command."""
-        if not self._pending_command or not self.llm_advisor:
-            return
-        command = self._pending_command
-        lines = list(self._response_buffer)
-        self._pending_command = None
-        self._response_buffer = []
-
-        event = {'command': command, 'mud_lines': lines}
-
-        if self._advisor_busy:
-            # LLM still processing — queue this event for the next call
-            self._advisor_queue.append(event)
-            return
-
-        self._advisor_busy = True
-        self._fire_advisor([event])
-
-    def _fire_advisor(self, events):
-        """Start an LLM advisor call for the given list of events."""
-        room_data = None
-        if self.current_room_hash and self.current_profile:
-            rooms = self.profiles.get(self.current_profile, {}).get('rooms', {})
-            room_data = rooms.get(self.current_room_hash)
-        self.llm_advisor.request_advice(events, room_data, self._on_advisor_result)
 
     def begin_advisor_stream(self):
         """Open a new streaming advisor entry in the advisor pane."""
@@ -2734,54 +2725,12 @@ class MUDClient:
         self.advisor_area.config(state=tk.DISABLED)
 
     def _on_advisor_result(self, advice):
-        """Called on the main thread when the LLM advisor responds."""
+        """Called on the main thread when the LLM advisor streams a response."""
         if advice:
             if not self._advisor_streamed:
                 self.append_advisor_text(advice)
             self.session_logger.log_advisor(advice)
         self._advisor_streamed = False
-
-        if self._advisor_queue:
-            queued = list(self._advisor_queue)
-            self._advisor_queue.clear()
-            # Split into leading MUD events and everything else.
-            # Process the first contiguous run of MUD events as one batch,
-            # then re-queue the remainder (which may start with a direct prompt).
-            mud_events = []
-            remainder = []
-            hit_direct = False
-            for item in queued:
-                if not hit_direct and item.get('direct_prompt') is None:
-                    mud_events.append(item)
-                else:
-                    hit_direct = True
-                    remainder.append(item)
-            self._advisor_queue.extend(remainder)
-            if mud_events:
-                self._fire_advisor(mud_events)
-            else:
-                # First item is a direct prompt
-                direct = self._advisor_queue.pop(0)
-                self.llm_advisor.request_direct(
-                    direct['direct_prompt'], self._on_advisor_result)
-        else:
-            # Nothing queued — go idle; next prompt will re-arm naturally
-            self._advisor_busy = False
-
-    def _send_direct_llm_prompt(self, prompt):
-        """Send a freeform prompt directly to the LLM advisor."""
-        if not prompt:
-            return
-        if not self.llm_advisor or not self.llm_advisor.is_available():
-            self.append_advisor_text("[No LLM configured]")
-            return
-        self.append_text(f"\\ {prompt}\n", "user")
-        self.session_logger.log_command(f"\\ {prompt}")
-        if self._advisor_busy:
-            self._advisor_queue.append({'direct_prompt': prompt})
-            return
-        self._advisor_busy = True
-        self.llm_advisor.request_direct(prompt, self._on_advisor_result)
 
     # ------------------------------------------------------------------
     # LLM Skills
@@ -2792,6 +2741,21 @@ class MUDClient:
             from skill_engine import SkillEngine
             self.skill_engine = SkillEngine(self)
         return self.skill_engine
+
+    def _start_default_skill(self):
+        """Start the default ambient skill if no other skill is running."""
+        if not self.connected:
+            return
+        if not self.llm_advisor or not self.llm_advisor.is_available():
+            return
+        if self.skill_engine and self.skill_engine.is_active():
+            return
+        profile = self.profiles.get(self.current_profile, {})
+        skills = profile.setdefault("skills", {})
+        if "_default" not in skills:
+            skills["_default"] = DEFAULT_SKILL_CFG
+            self.save_profiles()
+        self._start_skill_core("_default", skills["_default"])
 
     def _current_skills(self):
         """Return the skills dict for the current profile (creating it if needed)."""
@@ -2910,6 +2874,8 @@ class MUDClient:
             self.skill_engine.stop()
             self.append_text(f"[Skill] stopped: {name}\n", "system")
             self.session_logger.log_command(f"[Skill stop] {name}")
+            if name != "_default":
+                self.master.after(100, self._start_default_skill)
 
     _SPEEDWALK_RE = re.compile(r'^\s*(?:\d*[nsewudNSEWUD]\s*)+$')
     _SPEEDWALK_STEP_RE = re.compile(r'(\d*)([nsewudNSEWUD])')
@@ -2973,6 +2939,8 @@ class MUDClient:
             self.append_text("[Skill] LLM reply could not be parsed; stopping skill.\n",
                              "error")
             engine.stop()
+            if skill_name != "_default":
+                self.master.after(100, self._start_default_skill)
             return
         note = result.get("note", "")
         if note:
@@ -3001,10 +2969,26 @@ class MUDClient:
                 self.send_ai_command(dispatch[idx])
                 self.master.after(300, lambda: send_at(idx + 1))
             send_at(0)
+        switch_to = result.get("switch_skill")
+        if switch_to:
+            engine.stop()
+            self.append_text(f"[Skill] switching: {skill_name} \u2192 {switch_to}\n", "system")
+            self.session_logger.log_command(f"[Skill switch] {skill_name} -> {switch_to}")
+            skills = self._current_skills()
+            if switch_to in skills:
+                self._start_skill_core(switch_to, skills[switch_to])
+            elif switch_to in self._current_skill_targets():
+                self._start_skill_target(switch_to)
+            else:
+                self.append_text(f"[Skill] switch_skill '{switch_to}' not found; resuming default.\n", "error")
+                self.master.after(100, self._start_default_skill)
+            return
         if result.get("complete"):
             self.append_text(f"[Skill] complete: {skill_name} — {note}\n", "system")
             self.session_logger.log_command(f"[Skill complete] {skill_name}")
             engine.stop()
+            if skill_name != "_default":
+                self.master.after(100, self._start_default_skill)
 
     def _on_session_summary(self, summary):
         """Called on the main thread when the end-of-session summary is ready."""
@@ -4071,13 +4055,14 @@ class SkillsDialog:
 
 
 class SkillEditDialog:
-    """Edit one skill: name, instructions, watched stats."""
+    """Edit one skill: name, instructions, plan, rescue_restart_step, watched stats."""
 
     def __init__(self, parent, name, cfg, available_stats):
         self.result = None
+        self._original_cfg = dict(cfg or {})
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Edit Skill" if name else "New Skill")
-        self.dialog.geometry("620x520")
+        self.dialog.geometry("620x780")
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
@@ -4090,13 +4075,24 @@ class SkillEditDialog:
 
         ttk.Label(self.dialog, text="Instructions\n(what, where, how,\nrescue recovery)") \
             .grid(row=1, column=0, sticky=tk.NW, **pad)
-        self.instructions_text = tk.Text(self.dialog, width=60, height=16, wrap=tk.WORD)
+        self.instructions_text = tk.Text(self.dialog, width=60, height=12, wrap=tk.WORD)
         self.instructions_text.insert("1.0", cfg.get("instructions", ""))
         self.instructions_text.grid(row=1, column=1, sticky=tk.NSEW, **pad)
 
-        ttk.Label(self.dialog, text="Watched stats:").grid(row=2, column=0, sticky=tk.NW, **pad)
+        ttk.Label(self.dialog, text="Plan\n(- [ ] step_id: desc\none per line)") \
+            .grid(row=2, column=0, sticky=tk.NW, **pad)
+        self.plan_text = tk.Text(self.dialog, width=60, height=10, wrap=tk.WORD)
+        self.plan_text.insert("1.0", cfg.get("plan", ""))
+        self.plan_text.grid(row=2, column=1, sticky=tk.NSEW, **pad)
+
+        ttk.Label(self.dialog, text="Rescue restart\nstep ID:").grid(row=3, column=0, sticky=tk.W, **pad)
+        self.rescue_entry = ttk.Entry(self.dialog, width=40)
+        self.rescue_entry.insert(0, cfg.get("rescue_restart_step", ""))
+        self.rescue_entry.grid(row=3, column=1, sticky=tk.W, **pad)
+
+        ttk.Label(self.dialog, text="Watched stats:").grid(row=4, column=0, sticky=tk.NW, **pad)
         stats_frame = ttk.Frame(self.dialog)
-        stats_frame.grid(row=2, column=1, sticky=tk.W, **pad)
+        stats_frame.grid(row=4, column=1, sticky=tk.W, **pad)
         selected = set(cfg.get("watch_stats", []))
         self._stat_vars = {}
         for i, key in enumerate(available_stats):
@@ -4106,12 +4102,13 @@ class SkillEditDialog:
                 row=i // 4, column=i % 4, sticky=tk.W, padx=4, pady=2)
 
         btns = ttk.Frame(self.dialog)
-        btns.grid(row=3, column=0, columnspan=2, pady=12)
+        btns.grid(row=5, column=0, columnspan=2, pady=12)
         ttk.Button(btns, text="Save", command=self._save).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Cancel", command=self.dialog.destroy).pack(side=tk.LEFT, padx=4)
 
         self.dialog.columnconfigure(1, weight=1)
         self.dialog.rowconfigure(1, weight=1)
+        self.dialog.rowconfigure(2, weight=1)
         self.dialog.wait_window()
 
     def _save(self):
@@ -4120,8 +4117,21 @@ class SkillEditDialog:
             messagebox.showwarning("Skill", "Name is required.")
             return
         instructions = self.instructions_text.get("1.0", tk.END).strip()
+        plan = self.plan_text.get("1.0", tk.END).strip()
+        rescue = self.rescue_entry.get().strip()
         watch = [k for k, v in self._stat_vars.items() if v.get()]
-        self.result = (name, {"instructions": instructions, "watch_stats": watch})
+        cfg = dict(self._original_cfg)
+        cfg["instructions"] = instructions
+        cfg["watch_stats"] = watch
+        if plan:
+            cfg["plan"] = plan
+        elif "plan" in cfg:
+            del cfg["plan"]
+        if rescue:
+            cfg["rescue_restart_step"] = rescue
+        elif "rescue_restart_step" in cfg:
+            del cfg["rescue_restart_step"]
+        self.result = (name, cfg)
         self.dialog.destroy()
 
 

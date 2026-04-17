@@ -20,6 +20,7 @@ profile["ai_config"] so there is one place to configure.
 """
 
 import json
+import random
 import re
 import threading
 
@@ -58,6 +59,7 @@ You must reply with a single JSON object and NOTHING ELSE. Schema:
   {
     "commands": ["mud command 1", "mud command 2", ...],
     "complete": false,
+    "switch_skill": null,
     "plan_step": "the identifier of the step you are now executing",
     "note": "one short sentence about what you're doing"
   }
@@ -69,6 +71,12 @@ Rules:
     "n", "tell otto heal"). Do not include prose, quotes, numbering, or prefixes.
   - Set `complete` to true ONLY when the plan's "done" step is reached: all
     prior steps completed. Follow the SKILL PLAN in the user message.
+  - `switch_skill`: set to the exact name of another available skill to stop
+    this skill and immediately start that one. Set to null (the default) to
+    continue running. Use this when a fundamentally different task is needed
+    (e.g. the default skill detects hunger and switches to `acquire_food`).
+    The new skill starts fresh. `switch_skill` and `complete` are mutually
+    exclusive — if `switch_skill` is set, `complete` is ignored.
   - `plan_step`: set to the EXACT identifier string of the step you are
     currently executing, copied verbatim from the SKILL PLAN in the user
     message. Do NOT invent, abbreviate, or paraphrase step names — only the
@@ -78,8 +86,9 @@ Rules:
     reset your plan step to the rescue_restart_step. Read the current plan step
     from the SKILL PLAN section and follow it.
   - `note` is a short status string shown in the UI; keep it under 80 chars.
-  - Respond with valid JSON only. No markdown, no code fences, no commentary
-    outside the JSON object.
+  - CRITICAL: Respond with the raw JSON object and NOTHING ELSE. No markdown,
+    no ```json fences, no commentary. The first character of your reply must
+    be '{' and the last must be '}'.
 
 Movement:
   - When a skill's instructions give you a speedwalk string (e.g. "5n4w4s"),
@@ -200,6 +209,7 @@ class SkillEngine:
         self._battle_attacked_pcs  = set()           # PC names hit since last snapshot
         self._battle_turns_since_snap = 0
         self._battle_snapshot_inflight = False       # True while a snapshot is in an undelivered LLM call
+        self._injected_user_message = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -227,6 +237,7 @@ class SkillEngine:
         self._battle_attacked_pcs  = set()
         self._battle_turns_since_snap = 0
         self._battle_snapshot_inflight = False
+        self._injected_user_message = None
 
     def stop(self):
         """Cancel the active skill. In-flight LLM replies are discarded."""
@@ -243,6 +254,11 @@ class SkillEngine:
         self._battle_attacked_pcs  = set()
         self._battle_turns_since_snap = 0
         self._battle_snapshot_inflight = False
+        self._injected_user_message = None
+
+    def inject_user_message(self, text: str):
+        """Queue a freeform user instruction to prepend to the next skill turn."""
+        self._injected_user_message = text
 
     def record_dispatched(self, commands):
         """Called by the client after it sends commands returned by a turn."""
@@ -332,7 +348,7 @@ class SkillEngine:
         raw = None
         error = None
         try:
-            raw = self._call_llm(system_prompt, msgs, max_tokens=1024)
+            raw = self._call_llm(system_prompt, msgs, max_tokens=2048)
             logger.log_llm_response(raw or "")
             result = self._parse(raw)
         except Exception as e:
@@ -406,11 +422,23 @@ class SkillEngine:
         instr = (self._skill_cfg or {}).get("instructions", "").strip()
         watch = (self._skill_cfg or {}).get("watch_stats", [])
         parts = [SKILL_SYSTEM_PROMPT]
+        profile = self.client.profiles.get(self.client.current_profile, {})
+        char_name = profile.get("character", "")
+        if char_name:
+            parts.append(f"\nYour character's name is {char_name}. When another character addresses {char_name} directly, recognize that you are being spoken to.")
         parts.append(f"\n=== Skill: {self._skill_name} ===")
         if instr:
             parts.append("\nInstructions from the user:\n" + instr)
         if watch:
             parts.append("\nWatched stats (reported each turn): " + ", ".join(watch))
+        skills = self.client._current_skills()
+        targets = self.client._current_skill_targets()
+        available = sorted(
+            [s for s in skills if not s.startswith("_")] + list(targets.keys())
+        )
+        if available:
+            parts.append("\nAvailable skills you can switch to (use exact name in switch_skill): "
+                         + ", ".join(available))
         return "\n".join(parts)
 
     def _render_plan(self):
@@ -444,6 +472,10 @@ class SkillEngine:
     def _build_user_message(self, mud_lines, stats, combat_mob, rescue_just_fired,
                             target_killed=False):
         parts = []
+        if self._injected_user_message:
+            parts.append(f"[User instruction: {self._injected_user_message}]")
+            parts.append("")
+            self._injected_user_message = None
         reminders = (self._skill_cfg or {}).get("reminders", "").strip()
         if reminders:
             parts.append("REMINDERS (re-read each turn):")
@@ -474,6 +506,7 @@ class SkillEngine:
             self._battle_attacked_pcs.clear()
             self._battle_turns_since_snap = 0
             self._battle_snapshot_inflight = True
+        parts.append(f"Turn random (0-99): {random.randint(0, 99)}")
         parts.append("")
         parts.append("Watched stats:")
         watch = (self._skill_cfg or {}).get("watch_stats", [])
@@ -680,9 +713,13 @@ class SkillEngine:
         plan_step_val = obj.get("plan_step")
         if plan_step_val is not None:
             plan_step_val = str(plan_step_val).strip() or None
+        switch = obj.get("switch_skill")
+        if switch is not None:
+            switch = str(switch).strip() or None
         return {
             "commands": cmds,
             "complete": bool(obj.get("complete", False)),
+            "switch_skill": switch,
             "plan_step": plan_step_val,
             "note": str(obj.get("note", ""))[:200],
         }
