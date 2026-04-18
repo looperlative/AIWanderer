@@ -167,6 +167,7 @@ class MUDClient:
 
         # Group member tracking (receive-thread state; used by skill engine)
         self.group_members = set()         # Lowercase names of PCs currently in our group
+        self._group_leader = None          # Lowercase name of the PC who leads our group
 
         # Mob combat stat tracking (receive-thread state)
         self._combat_mob = None           # Normalised mob name currently fighting us
@@ -1298,6 +1299,7 @@ class MUDClient:
         self._combat_mob = None
         self._last_killed_mob = None
         self.group_members = set()
+        self._group_leader = None
 
         # Seed tick interval from saved profile value (keeps limit across sessions)
         saved_tick = (self.profiles.get(self.current_profile, {})
@@ -2036,33 +2038,66 @@ class MUDClient:
         except Exception:
             pass
 
-    # Group join pattern: "Cotu is now a member of Cotu's group."
+    # Group join: "Cotu is now a member of Bob's group."
     _GROUP_JOIN_RE = re.compile(
-        r'^([A-Z][a-z]+)\s+is\s+now\s+a\s+member\s+of\s+\S+\s+group',
+        r'^([A-Z][a-z]+)\s+is\s+now\s+a\s+member\s+of\s+([A-Z][a-z]+)(?:\'s)?\s+group',
         re.IGNORECASE
     )
-    # Group leave pattern: "Cotu has left the group."
+    # Group leave: "Cotu has left the group."
     _GROUP_LEAVE_RE = re.compile(
         r'^([A-Z][a-z]+)\s+has\s+left\s+(?:the\s+)?group',
+        re.IGNORECASE
+    )
+    # Group disbanded: "Your group has been disbanded."
+    _GROUP_DISBAND_RE = re.compile(
+        r'your\s+group\s+has\s+been\s+disbanded',
+        re.IGNORECASE
+    )
+    # Player quit: "Cotu has left the game."
+    _PLAYER_QUIT_RE = re.compile(
+        r'^([A-Z][a-z]+)\s+has\s+left\s+the\s+game',
         re.IGNORECASE
     )
 
     def _update_group_members(self, text):
         """Parse group join/leave events and maintain self.group_members.
         Called from the receive thread — must not touch UI directly."""
+        char_name = (self.profiles.get(self.current_profile, {})
+                     .get('character', '')).lower()
         for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
             m = self._GROUP_JOIN_RE.match(line)
             if m:
-                name = m.group(1).lower()
-                if name != 'you':
-                    self.group_members.add(name)
+                joiner = m.group(1).lower()
+                leader = m.group(2).lower()
+                if joiner not in ('you', char_name):
+                    self.group_members.add(joiner)
+                if self._group_leader is None:
+                    self._group_leader = leader
                 continue
             m = self._GROUP_LEAVE_RE.match(line)
             if m:
-                self.group_members.discard(m.group(1).lower())
+                name = m.group(1).lower()
+                self.group_members.discard(name)
+                if self._group_leader and name == self._group_leader:
+                    self.message_queue.put(("group_event", "disbanded"))
+                    self._group_leader = None
+                    self.group_members.clear()
+                continue
+            if self._GROUP_DISBAND_RE.search(line):
+                self.message_queue.put(("group_event", "disbanded"))
+                self._group_leader = None
+                self.group_members.clear()
+                continue
+            m = self._PLAYER_QUIT_RE.match(line)
+            if m:
+                name = m.group(1).lower()
+                if self._group_leader and name == self._group_leader:
+                    self.message_queue.put(("group_event", "disbanded"))
+                    self._group_leader = None
+                    self.group_members.clear()
 
     def _update_mob_combat_stats(self, text):
         """Track per-mob hit/miss/damage/room/aggression stats.
@@ -2552,6 +2587,15 @@ class MUDClient:
                                 self.append_text(
                                     f"[Survival] Only {count} {food_item} left in "
                                     "inventory.\n", "system")
+                elif msg_type == "group_event":
+                    if msg_data == "disbanded":
+                        if (self.skill_engine and
+                                self.skill_engine.is_active() and
+                                self.skill_engine.active_name() == "group_tank"):
+                            self.skill_engine.stop()
+                            self.append_text(
+                                "[Skill] Group disbanded; returning to _default.\n", "system")
+                            self.master.after(100, self._start_default_skill)
                 elif msg_type == "tick_event":
                     self._on_tick_event()
                 elif msg_type == "disconnect":

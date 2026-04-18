@@ -436,6 +436,8 @@ class SkillEngine:
         available = sorted(
             [s for s in skills if not s.startswith("_")] + list(targets.keys())
         )
+        if self._skill_name != "_default" and "_default" in skills:
+            available = ["_default"] + available
         if available:
             parts.append("\nAvailable skills you can switch to (use exact name in switch_skill): "
                          + ", ".join(available))
@@ -561,6 +563,12 @@ class SkillEngine:
         parts.append("")
         parts.append(self._format_cmd_history())
         parts.append("")
+        group_leader = getattr(self.client, '_group_leader', None)
+        group_members = getattr(self.client, 'group_members', set())
+        if group_leader or group_members:
+            members_str = ", ".join(sorted(group_members)) if group_members else "(none yet)"
+            parts.append(f"Current group: leader={group_leader or 'unknown'}, members={members_str}")
+            parts.append("")
         parts.append("Reply with the JSON object now.")
         return "\n".join(parts)
 
