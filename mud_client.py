@@ -2855,10 +2855,14 @@ class MUDClient:
             return
         engine = self._ensure_skill_engine()
         if engine.is_active():
-            messagebox.showwarning("Skills",
-                                   f"A skill is already active: {engine.active_name()}.\n"
-                                   "Stop it first.")
-            return
+            if engine.active_name() == "_default":
+                engine.stop()
+                self.append_text("[Skill] _default stopped; starting new skill.\n", "system")
+            else:
+                messagebox.showwarning("Skills",
+                                       f"A skill is already active: {engine.active_name()}.\n"
+                                       "Stop it first.")
+                return
         engine.start(name, cfg)
         self._skill_rescue_flag = False
         self._skill_target_killed = False
@@ -4064,6 +4068,7 @@ class SkillEditDialog:
         self.dialog.title("Edit Skill" if name else "New Skill")
         self.dialog.geometry("620x780")
         self.dialog.transient(parent)
+        self.dialog.update_idletasks()
         self.dialog.grab_set()
 
         pad = {"padx": 10, "pady": 6}
@@ -4146,6 +4151,7 @@ class TemplateEditDialog:
         self.dialog.title("Edit Template" if name else "New Template")
         self.dialog.geometry("680x820")
         self.dialog.transient(parent)
+        self.dialog.update_idletasks()
         self.dialog.grab_set()
 
         pad = {"padx": 10, "pady": 4}
@@ -4250,6 +4256,7 @@ class TargetEditDialog:
         self.dialog.title("Edit Target" if name else "New Target")
         self.dialog.geometry("620x500")
         self.dialog.transient(parent)
+        self.dialog.update_idletasks()
         self.dialog.grab_set()
 
         pad = {"padx": 10, "pady": 6}
