@@ -2984,15 +2984,14 @@ class MUDClient:
         if not engine or engine.active_name() != skill_name:
             return  # user stopped or swapped skills mid-flight
         if result is None:
-            self.append_text("[Skill] LLM reply could not be parsed; stopping skill.\n",
+            self.append_text("[Skill] LLM reply could not be parsed; starting default skill.\n",
                              "error")
             engine.stop()
-            if skill_name != "_default":
-                self.master.after(100, self._start_default_skill)
+            self.master.after(100, self._start_default_skill)
             return
         note = result.get("note", "")
         if note:
-            self.append_text(f"[Skill] {note}\n", "system")
+            self.append_advisor_text(note)
         commands = result.get("commands", [])
         if commands:
             # Record what the LLM emitted (speedwalk strings stay intact in the
@@ -3055,7 +3054,7 @@ class MUDClient:
         """Display advisor text in the advisor pane."""
         self.advisor_area.config(state=tk.NORMAL)
         self.advisor_area.insert(tk.END, "[Advisor] ", "advisor_prefix")
-        self.advisor_area.insert(tk.END, text.strip() + "\n\n", "advisor_body")
+        self.advisor_area.insert(tk.END, text.strip() + "\n", "advisor_body")
         self.advisor_area.tag_config("advisor_prefix", foreground="#89d185",
                                      font=("Courier", 10, "bold"))
         self.advisor_area.tag_config("advisor_body", foreground="#c8c8c8")
@@ -3068,7 +3067,7 @@ class MUDClient:
         self.advisor_area.insert(tk.END, "[Battle] ", "battle_prefix")
         self.advisor_area.tag_config("battle_prefix", foreground="#ce9178",
                                      font=("Courier", 10, "bold"))
-        self.advisor_area.insert(tk.END, text.strip() + "\n\n", "advisor_body")
+        self.advisor_area.insert(tk.END, text.strip() + "\n", "advisor_body")
         self.advisor_area.see(tk.END)
         self.advisor_area.config(state=tk.DISABLED)
 
