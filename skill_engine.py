@@ -572,7 +572,7 @@ class SkillEngine:
         parts.append(f"Harness target_killed flag: {bool(target_killed)}")
         if self._idle_since is not None:
             idle_secs = int(time.time() - self._idle_since)
-            parts.append(f"Idle time: {idle_secs}s (no commands sent, not fighting, no skill switch)")
+            parts.append(f"special_timer: {idle_secs}")
         if rescue_just_fired:
             parts.append(
                 "RESCUE FIRED: you were summoned/teleported out of combat to the "
