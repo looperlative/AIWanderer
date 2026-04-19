@@ -23,6 +23,7 @@ import json
 import random
 import re
 import threading
+import time
 
 from llm_advisor import LLMAdvisor
 
@@ -210,6 +211,7 @@ class SkillEngine:
         self._battle_turns_since_snap = 0
         self._battle_snapshot_inflight = False       # True while a snapshot is in an undelivered LLM call
         self._injected_user_message = None
+        self._idle_since = None             # timestamp when idle began; None while active
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -238,6 +240,7 @@ class SkillEngine:
         self._battle_turns_since_snap = 0
         self._battle_snapshot_inflight = False
         self._injected_user_message = None
+        self._idle_since = None
 
     def stop(self):
         """Cancel the active skill. In-flight LLM replies are discarded."""
@@ -255,6 +258,7 @@ class SkillEngine:
         self._battle_turns_since_snap = 0
         self._battle_snapshot_inflight = False
         self._injected_user_message = None
+        self._idle_since = None
 
     def inject_user_message(self, text: str):
         """Queue a freeform user instruction to prepend to the next skill turn."""
@@ -344,6 +348,10 @@ class SkillEngine:
             f"[user]\n{msgs[-1]['content']}"
         )
 
+        # Throttle _default skill when idle to avoid spamming the LLM.
+        if skill_at_fire == "_default" and self._idle_since is not None:
+            time.sleep(5)
+
         result = None
         raw = None
         error = None
@@ -372,6 +380,15 @@ class SkillEngine:
             if error:
                 self.client.append_text(f"[Skill error: {error}]\n", "error")
             on_result(result, skill_at_fire)
+            # Update idle tracking: idle = no commands, no switch_skill, not fighting.
+            if result is not None:
+                has_cmds = bool(result.get("commands"))
+                has_switch = bool(result.get("switch_skill"))
+                is_fighting = bool(self.client._combat_mob)
+                if has_cmds or has_switch or is_fighting:
+                    self._idle_since = None
+                elif self._idle_since is None:
+                    self._idle_since = time.time()
             # Update plan step from LLM's reply (before chaining any pending turn).
             if result is not None and self._skill_name == skill_at_fire:
                 new_step = result.get("plan_step")
@@ -553,6 +570,9 @@ class SkillEngine:
             combat_display = "none"
         parts.append(f"Current combat target: {combat_display}")
         parts.append(f"Harness target_killed flag: {bool(target_killed)}")
+        if self._idle_since is not None:
+            idle_secs = int(time.time() - self._idle_since)
+            parts.append(f"Idle time: {idle_secs}s (no commands sent, not fighting, no skill switch)")
         if rescue_just_fired:
             parts.append(
                 "RESCUE FIRED: you were summoned/teleported out of combat to the "
