@@ -350,7 +350,9 @@ class SkillEngine:
 
         # Throttle _default skill when idle to avoid spamming the LLM.
         if skill_at_fire == "_default" and self._idle_since is not None:
-            time.sleep(5)
+            idle_secs = int(time.time() - self._idle_since)
+            if idle_secs > 15:
+                time.sleep(10)
 
         result = None
         raw = None
