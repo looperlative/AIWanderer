@@ -2250,6 +2250,35 @@ class MUDClient:
             return max(set(bluish_colors), key=bluish_colors.count)
         return None
 
+    _SPELL_KEYWORDS = re.compile(r'\b(armor|bless|sanctuary)\b', re.IGNORECASE)
+    _STAT_OUTPUT    = re.compile(
+        r'\b(HITROLL|SAVING_SPELL|SAVING_PARA|SAVING_ROD|SAVING_PETRI|SAVING_BREATH)\b'
+    )
+    _ABILITY_SCORES = re.compile(r'\d+/?\d*(?:\s+\d+){4,}')
+    _CORRUPT_EXITS  = re.compile(r'Int:|Str:|Dex:|Con:|Wis:|Cha:')
+    _MUD_PROMPT     = re.compile(r'^\d+[Hh]\w*\s+\d+[Mm]\w*.*[>$]', re.IGNORECASE)
+
+    def _is_valid_room_data(self, room_data):
+        """Return (True, None) for legitimate rooms; (False, reason) for corrupt ones."""
+        name  = room_data.get('name', '')
+        desc  = room_data.get('description', '')
+        exits = room_data.get('exits', '')
+
+        words = name.split()
+        if words and all(w.lower() in ('armor', 'bless', 'sanctuary') for w in words):
+            return False, 'spell-buff name'
+
+        if self._STAT_OUTPUT.search(desc) or self._STAT_OUTPUT.search(name):
+            return False, 'stat output in description'
+
+        if self._ABILITY_SCORES.search(name):
+            return False, 'ability scores in name'
+
+        if self._CORRUPT_EXITS.search(exits):
+            return False, 'stat labels in exits field'
+
+        return True, None
+
     def parse_room_data(self, segments):
         """Parse room data from colored text segments.
 
@@ -2315,7 +2344,8 @@ class MUDClient:
                         description_parts.append(text_stripped)
                     else:
                         # After exits line: objects / mobs on the ground
-                        object_parts.append(text_stripped)
+                        if not self._MUD_PROMPT.match(text_stripped):
+                            object_parts.append(text_stripped)
 
         description = ' '.join(description_parts)
 
@@ -2414,6 +2444,13 @@ class MUDClient:
                 self.expecting_room_data = False
 
         if room_data:
+            valid, reason = self._is_valid_room_data(room_data)
+            if not valid:
+                self.append_text(
+                    f"[Room rejected ({reason}): {room_data.get('name', '')!r}]\n", "system")
+                self.expecting_room_data = False
+                return
+
             # Create hash of room data using normalized description for stability
             room_string = f"{room_data['name']}|{room_data['normalized_description']}|{room_data['exits']}"
             room_hash = hashlib.sha256(room_string.encode()).hexdigest()
