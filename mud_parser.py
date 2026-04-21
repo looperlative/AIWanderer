@@ -829,6 +829,7 @@ class MUDTextParser:
         mob_lines = []
         exits = ""
         past_exits = False
+        pre_exit_unassigned = []  # unassigned lines before exits, for positional fallback
 
         for text, color in segments:
             stripped = text.strip()
@@ -863,9 +864,24 @@ class MUDTextParser:
                 if not past_exits:
                     if title_parts:
                         desc_parts.append(stripped)
-                    # else: pre-title noise, ignore
+                    else:
+                        pre_exit_unassigned.append(stripped)
                 else:
                     object_lines.append(stripped)
+
+        if not title_parts and exits and pre_exit_unassigned:
+            # Positional fallback: the room title lost its color (e.g. ANSI reset
+            # caused by a preceding system message).  Scan the unassigned pre-exit
+            # lines for the first "title-like" line — short, no sentence-ending
+            # punctuation — and treat everything after it as description.
+            title_idx = None
+            for i, line in enumerate(pre_exit_unassigned):
+                if not line.endswith(('.', '!', '?')) and len(line) <= 60:
+                    title_idx = i
+                    break
+            if title_idx is not None:
+                title_parts = [pre_exit_unassigned[title_idx]]
+                desc_parts = pre_exit_unassigned[title_idx + 1:] + desc_parts
 
         if not title_parts:
             return None

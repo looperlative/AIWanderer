@@ -577,8 +577,13 @@ class MUDClient:
         self.text_area.config(state=tk.DISABLED)
         paned.add(self.text_area, stretch="always", minsize=80)
 
+        # ── Bottom pane: advisor (left) + navigation (right) ─────────
+        bottom_paned = tk.PanedWindow(paned, orient=tk.HORIZONTAL, sashrelief=tk.RAISED,
+                                      sashwidth=5, bg="#3c3c3c")
+        paned.add(bottom_paned, stretch="always", minsize=60)
+
         self.advisor_area = scrolledtext.ScrolledText(
-            paned,
+            bottom_paned,
             wrap=tk.WORD,
             font=self._font_main,
             bg="#1a1a2e",
@@ -586,11 +591,16 @@ class MUDClient:
             insertbackground="white"
         )
         self.advisor_area.config(state=tk.DISABLED)
-        paned.add(self.advisor_area, stretch="always", minsize=60)
+        bottom_paned.add(self.advisor_area, stretch="always", minsize=60)
 
-        # Set initial sash position after window draws
+        nav_frame = tk.Frame(bottom_paned, bg="#1a1a1a")
+        bottom_paned.add(nav_frame, stretch="always", minsize=80)
+        self._build_nav_panel(nav_frame)
+
+        # Set initial sash positions after window draws
         self.master.after(100, lambda: paned.sash_place(0, 0,
             int(self.master.winfo_height() * 0.70)))
+        self.master.after(150, self._init_nav_sash)
 
         # ── Right-hand column: tick timer (top) + status panel (bottom) ──
         right_col = tk.Frame(content_frame, bg="#1a1a1a", width=190)
@@ -779,6 +789,100 @@ class MUDClient:
             tk.Label(self._spells_frame, text="none", bg="#1a1a1a", fg=DIM,
                      font=self._font_status, anchor='w').pack(fill=tk.X)
 
+
+    # ── Navigation panel ─────────────────────────────────────────────────
+
+    def _build_nav_panel(self, parent):
+        BG     = "#1a1a1a"
+        HDR_FG = "#4ec9b0"
+        self._nav_parent = parent
+
+        tk.Label(parent, text="─ NAVIGATION ─", bg=BG, fg=HDR_FG,
+                 font=self._font_status_hdr, anchor='w').pack(fill=tk.X, padx=4, pady=(4, 2))
+
+        self._nav_room_var = tk.StringVar(value="")
+        self._nav_room_label = tk.Label(parent, textvariable=self._nav_room_var, bg=BG, fg="#dcdcaa",
+                 font=self._font_status, anchor='w')
+        self._nav_room_label.pack(fill=tk.X, padx=6, pady=(0, 4))
+        parent.bind('<Configure>', self._on_nav_resize)
+
+        tk.Frame(parent, bg="#3a3a3a", height=1).pack(fill=tk.X, pady=(0, 3))
+
+        self._nav_exits_frame = tk.Frame(parent, bg=BG)
+        self._nav_exits_frame.pack(fill=tk.BOTH, expand=True, padx=4)
+
+        self._update_nav_panel()
+
+    def _on_nav_resize(self, event):
+        self._nav_room_label.config(wraplength=event.width - 12)
+
+    def _init_nav_sash(self):
+        """Set the initial sash for the bottom horizontal pane after the window is drawn."""
+        try:
+            w = self.advisor_area.winfo_width() + self._nav_parent.winfo_width()
+            if w > 10:
+                half = w // 2
+                self.advisor_area.master.sash_place(0, half, 0)
+        except Exception:
+            pass
+
+    def _update_nav_panel(self):
+        """Refresh the navigation panel with current room name and exits."""
+        BG      = "#1a1a1a"
+        DIR_FG  = "#9cdcfe"
+        ROOM_FG = "#d4d4d4"
+        UNK_FG  = "#666666"
+        F       = self._font_status
+
+        if not hasattr(self, '_nav_room_var'):
+            return
+
+        profile = self.profiles.get(self.current_profile, {}) if self.current_profile else {}
+        rooms      = profile.get('rooms', {})
+        room_links = profile.get('room_links', {})
+        room_hash  = self.current_room_hash
+
+        if room_hash and room_hash in rooms:
+            room = rooms[room_hash]
+            self._nav_room_var.set(room.get('name', ''))
+            exits_str = room.get('exits', '')
+            # Exits are stored as the raw MUD line, e.g. "[ Exits: n e s w u ]"
+            # or "[North, South, East]".  Strip brackets, drop "Exits:" label,
+            # then split on whitespace and commas.
+            exits_str = exits_str.strip().lstrip('[').rstrip(']').strip()
+            if exits_str.lower().startswith('exits:'):
+                exits_str = exits_str[6:].strip()
+            tokens = [t.strip(',.') for t in exits_str.replace(',', ' ').split() if t.strip(',.')]
+            # Expand abbreviations to full direction names (keys used in room_links)
+            full_dirs = [self.direction_map.get(t.lower(), t.lower()) for t in tokens
+                         if t.lower() in self.direction_map and
+                            self.direction_map.get(t.lower()) != 'look']
+        else:
+            self._nav_room_var.set('(unknown)')
+            full_dirs = []
+
+        links = room_links.get(room_hash, {}) if room_hash else {}
+
+        for w in self._nav_exits_frame.winfo_children():
+            w.destroy()
+
+        for direction in full_dirs:
+            row = tk.Frame(self._nav_exits_frame, bg=BG)
+            row.pack(fill=tk.X, pady=1)
+            tk.Label(row, text=direction.capitalize(), bg=BG, fg=DIR_FG, font=F,
+                     anchor='w', width=6).pack(side=tk.LEFT)
+            neighbor_hash = links.get(direction)
+            if neighbor_hash and neighbor_hash in rooms:
+                dest = rooms[neighbor_hash].get('name', neighbor_hash[:8])
+                tk.Label(row, text=dest, bg=BG, fg=ROOM_FG, font=F,
+                         anchor='w').pack(side=tk.LEFT, fill=tk.X, expand=True)
+            else:
+                tk.Label(row, text="(unknown)", bg=BG, fg=UNK_FG, font=F,
+                         anchor='w').pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        if not full_dirs:
+            tk.Label(self._nav_exits_frame, text="No exits", bg=BG, fg=UNK_FG,
+                     font=F, anchor='w').pack(fill=tk.X)
 
     def update_profile_list(self):
         """Update the profile list and rebuild the profile menu"""
@@ -2434,14 +2538,20 @@ class MUDClient:
                 # etc.).  Stay armed so the actual entry room is caught when it arrives.
                 pass
             else:
-                # Log why parsing failed so aidebug can show it
-                colors_seen = list(dict.fromkeys(c for _, c in segments if _.strip()))
-                self.append_text(
-                    f"[Room parse failed] room_color={self.room_color!r} "
-                    f"colors_in_segments={colors_seen}\n", "system")
-                # Clear the flag so subsequent colored text (e.g. guard messages)
-                # doesn't keep re-triggering the parser.
-                self.expecting_room_data = False
+                # Only give up if the batch contains both a MUD prompt AND an exits
+                # bracket.  A prompt alone (no exits) means a pager page finished or
+                # some other intermediate text arrived — keep armed so the actual room
+                # block that follows is still caught.  An exits bracket signals the
+                # server genuinely tried to send room data that we failed to parse.
+                batch_plain = ' '.join(t for t, _ in segments)
+                has_prompt = self.mud_parser.parse_prompt_stats(batch_plain) is not None
+                has_exits  = any('[' in t and ']' in t for t, _ in segments)
+                if has_prompt and has_exits:
+                    colors_seen = list(dict.fromkeys(c for _, c in segments if _.strip()))
+                    self.append_text(
+                        f"[Room parse failed] room_color={self.room_color!r} "
+                        f"colors_in_segments={colors_seen}\n", "system")
+                    self.expecting_room_data = False
 
         if room_data:
             valid, reason = self._is_valid_room_data(room_data)
@@ -2530,6 +2640,7 @@ class MUDClient:
 
             # Survival hook — fountain fill and buy-food walk progression
             self._survival_on_room_entered(self.current_room_hash)
+            self._update_nav_panel()
 
             if self.ai_agent and self.ai_agent.is_running:
                 self.ai_agent.on_room_entered(self.current_room_hash, room_data)
