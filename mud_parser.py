@@ -836,6 +836,10 @@ class MUDTextParser:
             if not stripped:
                 continue
 
+            # Skip MUD prompt lines (e.g. "442H 100M 142V 0%T 0%O >")
+            if self.parse_prompt_stats(stripped) is not None:
+                continue
+
             # Exits bracket [N S E W] — detect by content regardless of color.
             # This must come before the color check because exits and title share
             # the same color on this MUD.
