@@ -18,6 +18,20 @@ import os
 import time
 import hashlib
 from collections import deque
+
+
+def _link_dest(val):
+    """Return (dest_hash, assumed) from a room_link value (str or dict)."""
+    if isinstance(val, dict):
+        return val.get('dest'), val.get('assumed', False)
+    return val, False  # legacy plain-string → treat as confirmed
+
+_REVERSE_DIR = {
+    'north': 'south', 'south': 'north',
+    'east':  'west',  'west':  'east',
+    'up':    'down',  'down':  'up',
+}
+
 from mud_parser import MUDTextParser
 
 
@@ -828,10 +842,11 @@ class MUDClient:
 
     def _update_nav_panel(self):
         """Refresh the navigation panel with current room name and exits."""
-        BG      = "#1a1a1a"
-        DIR_FG  = "#9cdcfe"
-        ROOM_FG = "#d4d4d4"
-        UNK_FG  = "#666666"
+        BG         = "#1a1a1a"
+        DIR_FG     = "#9cdcfe"
+        ROOM_FG    = "#d4d4d4"
+        UNK_FG     = "#666666"
+        ASSUMED_FG = "#888888"
         F       = self._font_status
 
         if not hasattr(self, '_nav_room_var'):
@@ -871,10 +886,17 @@ class MUDClient:
             row.pack(fill=tk.X, pady=1)
             tk.Label(row, text=direction.capitalize(), bg=BG, fg=DIR_FG, font=F,
                      anchor='w', width=6).pack(side=tk.LEFT)
-            neighbor_hash = links.get(direction)
+            link_val = links.get(direction)
+            neighbor_hash, is_assumed = _link_dest(link_val)
             if neighbor_hash and neighbor_hash in rooms:
-                dest = rooms[neighbor_hash].get('name', neighbor_hash[:8])
-                tk.Label(row, text=dest, bg=BG, fg=ROOM_FG, font=F,
+                dest_name = rooms[neighbor_hash].get('name', neighbor_hash[:8])
+                if is_assumed:
+                    label_text = dest_name + " (assumed)"
+                    label_fg   = ASSUMED_FG
+                else:
+                    label_text = dest_name
+                    label_fg   = ROOM_FG
+                tk.Label(row, text=label_text, bg=BG, fg=label_fg, font=F,
                          anchor='w').pack(side=tk.LEFT, fill=tk.X, expand=True)
             else:
                 tk.Label(row, text="(unknown)", bg=BG, fg=UNK_FG, font=F,
@@ -1822,7 +1844,10 @@ class MUDClient:
         visited = {from_hash}
         while queue:
             room, path = queue.popleft()
-            for direction, neighbor in links.get(room, {}).items():
+            for direction, link_val in links.get(room, {}).items():
+                neighbor, _ = _link_dest(link_val)
+                if neighbor is None:
+                    continue
                 abbrev = self._DIR_ABBREV.get(direction, direction)
                 new_path = path + [abbrev]
                 if neighbor == to_hash:
@@ -2610,9 +2635,21 @@ class MUDClient:
                 if self.previous_room_hash not in room_links:
                     room_links[self.previous_room_hash] = {}
 
-                # Store the directional link
+                # Store the directional link (confirm it; promote assumed→confirmed)
                 direction = self.last_movement_direction
-                room_links[self.previous_room_hash][direction] = room_hash
+                existing = room_links[self.previous_room_hash].get(direction)
+                _, assumed = _link_dest(existing)
+                if existing is None or assumed:
+                    room_links[self.previous_room_hash][direction] = {"dest": room_hash, "assumed": False}
+
+                # Create assumed reverse link so nav pane can show it immediately
+                rev = _REVERSE_DIR.get(direction)
+                if rev:
+                    rev_links = room_links.setdefault(room_hash, {})
+                    rev_existing = rev_links.get(rev)
+                    _, rev_assumed = _link_dest(rev_existing)
+                    if rev_existing is None or rev_assumed:
+                        rev_links[rev] = {"dest": self.previous_room_hash, "assumed": True}
 
                 # Update current room
                 self.current_room_hash = room_hash

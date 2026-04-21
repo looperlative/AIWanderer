@@ -22,6 +22,13 @@ CORRUPT_EXITS  = re.compile(r'Int:|Str:|Dex:|Con:|Wis:|Cha:')
 MUD_PROMPT     = re.compile(r'^\d+[Hh]\w*\s+\d+[Mm]\w*.*[>$]', re.IGNORECASE)
 
 
+def _link_dest(val):
+    """Return (dest_hash, assumed) from a room_link value (str or dict)."""
+    if isinstance(val, dict):
+        return val.get('dest'), val.get('assumed', False)
+    return val, False  # legacy plain-string → treat as confirmed
+
+
 def is_corrupt_room(room):
     name  = room.get('name', '')
     desc  = room.get('description', '')
@@ -91,7 +98,8 @@ def clean_profile(profile_data):
             continue
         links = room_links[src]
         for direction in list(links.keys()):
-            if links[direction] not in valid_rooms:
+            dest, _ = _link_dest(links[direction])
+            if dest not in valid_rooms:
                 del links[direction]
                 dangling_removed += 1
         if not links:

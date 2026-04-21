@@ -52,6 +52,13 @@ REVERSE_DIRECTION = {
 }
 
 
+def _link_dest(val):
+    """Return (dest_hash, assumed) from a room_link value (str or dict)."""
+    if isinstance(val, dict):
+        return val.get('dest'), val.get('assumed', False)
+    return val, False  # legacy plain-string → treat as confirmed
+
+
 # ---------------------------------------------------------------------------
 # ExplorationState — pure data, serialized to profile["ai_state"]
 # ---------------------------------------------------------------------------
@@ -155,7 +162,8 @@ class PathFinder:
         queue = deque([(start, [])])
         while queue:
             current, path = queue.popleft()
-            for direction, dest in room_links.get(current, {}).items():
+            for direction, link_val in room_links.get(current, {}).items():
+                dest, _ = _link_dest(link_val)
                 if dest is None:
                     continue
                 if dest == goal:
@@ -168,7 +176,8 @@ class PathFinder:
     def get_unvisited_neighbors(self, room_hash, room_links, visited):
         """Return [(direction, dest_hash), ...] for mapped but unvisited neighbors."""
         result = []
-        for direction, dest in room_links.get(room_hash, {}).items():
+        for direction, link_val in room_links.get(room_hash, {}).items():
+            dest, _ = _link_dest(link_val)
             if dest is not None and dest not in visited:
                 result.append((direction, dest))
         return result
@@ -182,7 +191,8 @@ class PathFinder:
         queue = deque([start])
         while queue:
             current = queue.popleft()
-            for dest in room_links.get(current, {}).values():
+            for link_val in room_links.get(current, {}).values():
+                dest, _ = _link_dest(link_val)
                 if dest is None:
                     continue
                 if dest in frontier_set:
@@ -285,7 +295,10 @@ class ExplorationAgent:
             if rev and prev_hash and room_hash and self.client.current_profile:
                 profile = self.client.profiles.get(self.client.current_profile, {})
                 room_links = profile.get('room_links', {})
-                room_links.setdefault(room_hash, {})[rev] = prev_hash
+                existing = room_links.get(room_hash, {}).get(rev)
+                _, is_assumed = _link_dest(existing)
+                if existing is None or is_assumed:
+                    room_links.setdefault(room_hash, {})[rev] = {"dest": prev_hash, "assumed": True}
                 self.state.dead_ends.get(room_hash, set()).discard(rev)
 
         self._pos_visited.add(self._pos)
@@ -393,7 +406,8 @@ class ExplorationAgent:
             return
         profile = self.client.profiles.get(self.client.current_profile, {})
         room_links = profile.get('room_links', {})
-        for direction, dest in room_links.get(room_hash, {}).items():
+        for direction, link_val in room_links.get(room_hash, {}).items():
+            dest, _ = _link_dest(link_val)
             if dest is not None and dest not in self.state.visited:
                 if dest not in self.state.frontier:
                     self.state.frontier.append(dest)
