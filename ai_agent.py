@@ -67,7 +67,6 @@ class ExplorationState:
     """Persisted state for the exploration agent (human-play mode)."""
 
     def __init__(self):
-        self.visited = set()          # room hashes confirmed visited
         self.frontier = deque()       # BFS queue: room hashes to visit
         self.came_from = {}           # hash -> {"from": hash, "direction": str}
         self.danger_rooms = {}        # hash -> {"reason": str, "time": str}
@@ -96,7 +95,6 @@ class ExplorationState:
 
     def to_dict(self):
         return {
-            "visited": list(self.visited),
             "frontier": list(self.frontier),
             "came_from": self.came_from,
             "danger_rooms": self.danger_rooms,
@@ -122,7 +120,6 @@ class ExplorationState:
     @classmethod
     def from_dict(cls, data):
         s = cls()
-        s.visited = set(data.get("visited", []))
         s.frontier = deque(data.get("frontier", []))
         s.came_from = data.get("came_from", {})
         s.danger_rooms = data.get("danger_rooms", {})
@@ -172,15 +169,6 @@ class PathFinder:
                     visited.add(dest)
                     queue.append((dest, path + [direction]))
         return []
-
-    def get_unvisited_neighbors(self, room_hash, room_links, visited):
-        """Return [(direction, dest_hash), ...] for mapped but unvisited neighbors."""
-        result = []
-        for direction, link_val in room_links.get(room_hash, {}).items():
-            dest, _ = _link_dest(link_val)
-            if dest is not None and dest not in visited:
-                result.append((direction, dest))
-        return result
 
     def find_nearest_frontier(self, start, room_links, frontier_set):
         """BFS from start to find the nearest room in frontier_set.
@@ -319,8 +307,8 @@ class ExplorationAgent:
         # Record HP at entry for next comparison
         self.state.hp_at_room_entry = self.state.current_hp
 
-        if room_hash and room_hash not in self.state.visited:
-            self.state.visited.add(room_hash)
+        if room_hash and room_hash not in self.client.profiles.get(
+                self.client.current_profile, {}).get('rooms', {}):
             self._enqueue_unvisited_neighbors(room_hash)
 
         # Remove from frontier if present
@@ -405,10 +393,11 @@ class ExplorationAgent:
         if not self.client.current_profile:
             return
         profile = self.client.profiles.get(self.client.current_profile, {})
+        rooms = profile.get('rooms', {})
         room_links = profile.get('room_links', {})
         for direction, link_val in room_links.get(room_hash, {}).items():
             dest, _ = _link_dest(link_val)
-            if dest is not None and dest not in self.state.visited:
+            if dest is not None and dest not in rooms:
                 if dest not in self.state.frontier:
                     self.state.frontier.append(dest)
                     self.state.came_from.setdefault(dest, {
