@@ -116,6 +116,7 @@ class MUDClient:
         self.current_room_hash = None  # Hash of the current room
         self.previous_room_hash = None  # Hash of the previous room
         self.detect_entry_room = False  # Flag to detect entry room after login
+        self.gmcp_active = False  # True after IAC WILL GMCP / IAC DO GMCP handshake
         self.movement_commands = ['n', 'north', 's', 'south', 'e', 'east',
                                    'w', 'west', 'u', 'up', 'd', 'down', 'l', 'look']
         # Map short commands to directions
@@ -355,6 +356,7 @@ class MUDClient:
         DONT = 0xFE
         SB = 0xFA  # Subnegotiation Begin
         SE = 0xF0  # Subnegotiation End
+        GMCP = 0xC9  # GMCP option (201)
 
         telnet_commands = {
             0xFB: "WILL",
@@ -389,6 +391,7 @@ class MUDClient:
             85: "COMPRESS",
             86: "COMPRESS2",
             200: "MCCP",
+            201: "GMCP",
         }
 
         result = bytearray()
@@ -408,9 +411,25 @@ class MUDClient:
                         end += 1
 
                     option = data[i + 2] if i + 2 < len(data) else 0
-                    option_name = telnet_options.get(option, f"UNKNOWN({option})")
                     sb_data = data[i+3:end]
-                    self.message_queue.put(("telnet", f"TELNET: Subnegotiation for {option_name} (data length: {len(sb_data)})"))
+
+                    if option == GMCP:
+                        # Parse GMCP: "<Module.Name> <JSON>"
+                        try:
+                            payload = sb_data.decode('utf-8', errors='replace')
+                            sp = payload.find(' ')
+                            if sp != -1:
+                                module = payload[:sp].strip()
+                                json_str = payload[sp+1:].strip()
+                            else:
+                                module = payload.strip()
+                                json_str = '{}'
+                            self._handle_gmcp_packet(module, json_str)
+                        except Exception as e:
+                            self.message_queue.put(("telnet", f"GMCP parse error: {e}"))
+                    else:
+                        option_name = telnet_options.get(option, f"UNKNOWN({option})")
+                        self.message_queue.put(("telnet", f"TELNET: Subnegotiation for {option_name} (data length: {len(sb_data)})"))
                     i = end + 2
                     continue
 
@@ -420,6 +439,14 @@ class MUDClient:
                     cmd_name = telnet_commands.get(cmd, f"UNKNOWN({cmd})")
                     option_name = telnet_options.get(option, f"UNKNOWN({option})")
                     self.message_queue.put(("telnet", f"TELNET: {cmd_name} {option_name}"))
+                    # GMCP negotiation: server offers GMCP, we accept
+                    if cmd == WILL and option == GMCP:
+                        try:
+                            self.ssl_socket.sendall(bytes([IAC, DO, GMCP]))
+                            self.gmcp_active = True
+                            self.message_queue.put(("telnet", "[GMCP] Negotiated"))
+                        except Exception as e:
+                            self.message_queue.put(("telnet", f"[GMCP] Negotiate error: {e}"))
                     i += 3
                     continue
 
@@ -433,6 +460,85 @@ class MUDClient:
                 i += 1
 
         return bytes(result)
+
+    def _handle_gmcp_packet(self, module, json_str):
+        """Dispatch an incoming GMCP packet (called from receive thread).
+
+        Handles Room.Info, Char.Vitals, and Char.Status.  All other modules
+        are silently ignored — they are already stripped from the display stream.
+        """
+        try:
+            data = json.loads(json_str)
+        except Exception:
+            return
+
+        if module == "Room.Info":
+            # Convert exits dict {"n": true, "s": false, ...} to "[ Exits: n s ]"
+            exits_dict = data.get("exits", {})
+            open_dirs = [d for d, open_ in exits_dict.items() if open_]
+            exits_str = "[ Exits: " + " ".join(open_dirs) + " ]" if open_dirs else "[ Exits: none ]"
+            room_info = {
+                "num":     data.get("num"),
+                "name":    data.get("name", ""),
+                "zone":    data.get("zone", ""),
+                "terrain": data.get("terrain", ""),
+                "exits":   exits_str,
+            }
+            self.message_queue.put(("gmcp_room", room_info))
+
+        elif module == "Char.Vitals":
+            updates = {}
+            for gmcp_key, stat_key in (
+                ("hp",    "hp"),
+                ("hpmax", "max_hp"),
+                ("mp",    "mp"),
+                ("mpmax", "max_mp"),
+                ("mv",    "mv"),
+                ("mvmax", "max_mv"),
+            ):
+                if gmcp_key in data:
+                    try:
+                        updates[stat_key] = int(data[gmcp_key])
+                    except (TypeError, ValueError):
+                        pass
+            if updates:
+                self.message_queue.put(("stats", updates))
+
+        elif module == "Char.Status":
+            updates = {}
+            if "level" in data:
+                try:
+                    updates["level"] = int(data["level"])
+                except (TypeError, ValueError):
+                    pass
+            if "class" in data:
+                updates["class_name"] = data["class"]
+            if "align" in data:
+                updates["alignment"] = data["align"]
+            if updates:
+                self.message_queue.put(("stats", updates))
+
+        elif module == "Char.Defences.List":
+            # Full snapshot of active spell affects at login/reconnect.
+            # data is a list; each element has "name" and "remaining" (mud hours, -1=permanent).
+            if isinstance(data, list):
+                spells = {e["name"]: e.get("remaining", 0)
+                          for e in data if isinstance(e, dict) and "name" in e}
+                self.message_queue.put(("stats", {"spells": spells}))
+
+        elif module == "Char.Defences.Add":
+            # Single spell just applied (first instance of that spell type).
+            if isinstance(data, dict) and "name" in data:
+                self.message_queue.put(("stats", {
+                    "spells_add": {data["name"]: data.get("remaining", 0)}
+                }))
+
+        elif module == "Char.Defences.Remove":
+            # Spell removed — payload is a plain JSON string (e.g. "armor").
+            if isinstance(data, str) and data:
+                self.message_queue.put(("stats", {"spells_expired": [data]}))
+
+        # Core.Hello, Char.StatusVars, Char.Items.*, Comm.Channel.Text — ignored
 
     def load_profiles(self):
         """Load profiles from JSON file"""
@@ -797,7 +903,8 @@ class MUDClient:
                 row.pack(fill=tk.X)
                 tk.Label(row, text=spell, bg="#1a1a1a", fg=OK_FG,
                          font=self._font_status, anchor='w', width=10).pack(side=tk.LEFT)
-                tk.Label(row, text=f"{ticks}t", bg="#1a1a1a", fg=BLUE,
+                tick_str = "perm" if ticks == -1 else f"{ticks}t"
+                tk.Label(row, text=tick_str, bg="#1a1a1a", fg=BLUE,
                          font=self._font_status, anchor='e').pack(side=tk.RIGHT)
         else:
             tk.Label(self._spells_frame, text="none", bg="#1a1a1a", fg=DIM,
@@ -1443,7 +1550,13 @@ class MUDClient:
         self.master.after(1500, self._send_auto_score)
 
     def _send_auto_score(self):
-        """Send score command silently and reschedule."""
+        """Send score command silently and reschedule.
+
+        When GMCP Defences are active the score is only needed for fields GMCP
+        does not provide (XP, gold, AC, hunger, thirst), so the interval is
+        stretched to 5 minutes.  Without GMCP the original 60-second cadence is
+        used so buff durations stay current via text parsing.
+        """
         if not self.connected:
             self._auto_score_job = None
             return
@@ -1454,7 +1567,8 @@ class MUDClient:
             self.master.after(5000, self._clear_score_suppression)
         except Exception:
             self._suppress_score_output = False
-        self._auto_score_job = self.master.after(60000, self._send_auto_score)
+        interval = 300_000 if self.gmcp_active else 60_000
+        self._auto_score_job = self.master.after(interval, self._send_auto_score)
 
     def _clear_score_suppression(self):
         self._suppress_score_output = False
@@ -2521,20 +2635,26 @@ class MUDClient:
                 # Score always gives a definitive hunger/thirst state (OK if absent)
                 updates['hunger'] = score.get('hunger', 'OK')
                 updates['thirst'] = score.get('thirst', 'OK')
-            spells = self.mud_parser.parse_spell_affects(text)
-            updates['spells'] = spells  # replace entirely from score output
+            # When GMCP Defences are active, let GMCP own the spells dict — score's
+            # SPL lines are less accurate and would overwrite real-time GMCP data.
+            if not self.gmcp_active:
+                spells = self.mud_parser.parse_spell_affects(text)
+                updates['spells'] = spells  # replace entirely from score output
         else:
             # Not a score block — check for spontaneous "You are thirsty/hungry"
             # messages the MUD sends between auto-score calls.
             ht = self.mud_parser.detect_hunger_thirst(text)
             updates.update(ht)
 
-        # Buff application and expiration messages
-        buff_events = self.mud_parser.detect_buff_events(text)
-        if buff_events['applied']:
-            updates['spells_applied'] = buff_events['applied']
-        if buff_events['expired']:
-            updates['spells_expired'] = buff_events['expired']
+        # Buff application and expiration messages (text-based).
+        # Skip when GMCP Defences are active: Char.Defences.Add/Remove provide
+        # accurate durations; text heuristics would apply wrong default tick counts.
+        if not self.gmcp_active:
+            buff_events = self.mud_parser.detect_buff_events(text)
+            if buff_events['applied']:
+                updates['spells_applied'] = buff_events['applied']
+            if buff_events['expired']:
+                updates['spells_expired'] = buff_events['expired']
 
         # Combat end detection
         if re.search(r'\b(?:is dead|has fled|you flee|you stop fighting)\b',
@@ -2546,10 +2666,158 @@ class MUDClient:
         if updates:
             self.message_queue.put(("stats", updates))
 
+    def _migrate_room_to_vnum(self, vnum_key, name):
+        """Re-key a hash-keyed room to vnum_key when exactly one name match is found.
+
+        Scans profile rooms for hash-keyed entries (keys not starting with 'vnum:')
+        whose stored name matches the given name.  If exactly one such entry exists,
+        it is moved to vnum_key and every room_link destination pointing to the old
+        hash is updated to point to vnum_key instead.
+        """
+        if not self.current_profile or self.current_profile not in self.profiles:
+            return
+        profile = self.profiles[self.current_profile]
+        rooms = profile.get('rooms', {})
+        room_links = profile.get('room_links', {})
+
+        # Find hash-keyed rooms with matching name
+        matches = [k for k, v in rooms.items()
+                   if not k.startswith('vnum:') and v.get('name') == name]
+        if len(matches) != 1:
+            return  # ambiguous or no match — leave unchanged
+
+        old_key = matches[0]
+        # Move room record
+        rooms[vnum_key] = rooms.pop(old_key)
+        # Move link record for this room (outgoing links from old_key)
+        if old_key in room_links:
+            room_links[vnum_key] = room_links.pop(old_key)
+        # Update all incoming links (destinations) pointing to old_key
+        for src_links in room_links.values():
+            for direction, val in list(src_links.items()):
+                dest, assumed = _link_dest(val)
+                if dest == old_key:
+                    src_links[direction] = {"dest": vnum_key, "assumed": assumed}
+        # Update entry_room pointer if it pointed to the old hash
+        if profile.get('entry_room') == old_key:
+            profile['entry_room'] = vnum_key
+        self.append_text(f"[GMCP] Migrated room '{name}' from hash to {vnum_key}\n", "system")
+
+    def _process_gmcp_room(self, room_info):
+        """Handle a GMCP Room.Info packet (called from process_queue, main thread).
+
+        Uses vnum as the room key (format 'vnum:N').  Mirrors the room-entry
+        logic in process_room_data but uses GMCP data as the authoritative source.
+        """
+        if not self.room_tracking_enabled:
+            return
+        if not self.current_profile or self.current_profile not in self.profiles:
+            return
+
+        vnum = room_info.get('num')
+        if vnum is None:
+            return
+        vnum_key = f"vnum:{vnum}"
+        name    = room_info.get('name', '')
+        exits   = room_info.get('exits', '')
+        zone    = room_info.get('zone', '')
+        terrain = room_info.get('terrain', '')
+
+        profile = self.profiles[self.current_profile]
+        if 'rooms' not in profile:
+            profile['rooms'] = {}
+        if 'room_links' not in profile:
+            profile['room_links'] = {}
+
+        rooms      = profile['rooms']
+        room_links = profile['room_links']
+
+        is_new_room = vnum_key not in rooms
+        if is_new_room:
+            # Attempt to migrate an existing hash-keyed room with the same name
+            self._migrate_room_to_vnum(vnum_key, name)
+            is_new_room = vnum_key not in rooms  # re-check after migration
+            if is_new_room:
+                rooms[vnum_key] = {
+                    'name':    name,
+                    'exits':   exits,
+                    'zone':    zone,
+                    'terrain': terrain,
+                }
+        else:
+            # Update exits/zone/terrain in case they changed
+            rooms[vnum_key]['exits']   = exits
+            rooms[vnum_key]['zone']    = zone
+            rooms[vnum_key]['terrain'] = terrain
+
+        # Handle entry room detection (first room seen after login/reconnect)
+        if self.detect_entry_room:
+            profile['entry_room'] = vnum_key
+            self.save_profiles()
+            self.append_text(f"[GMCP] Entry room: {name} ({vnum_key})\n", "system")
+            self.detect_entry_room = False
+            self.current_room_hash = vnum_key
+
+        # Handle directional links when we moved from another room
+        elif self.previous_room_hash and self.last_movement_direction:
+            direction = self.last_movement_direction
+            if self.previous_room_hash not in room_links:
+                room_links[self.previous_room_hash] = {}
+
+            existing = room_links[self.previous_room_hash].get(direction)
+            _, assumed = _link_dest(existing)
+            if existing is None or assumed:
+                room_links[self.previous_room_hash][direction] = {"dest": vnum_key, "assumed": False}
+
+            rev = _REVERSE_DIR.get(direction)
+            if rev:
+                rev_links = room_links.setdefault(vnum_key, {})
+                rev_existing = rev_links.get(rev)
+                _, rev_assumed = _link_dest(rev_existing)
+                if rev_existing is None or rev_assumed:
+                    rev_links[rev] = {"dest": self.previous_room_hash, "assumed": True}
+
+            self.current_room_hash = vnum_key
+
+            if is_new_room:
+                self.save_profiles()
+                self._update_status_bar()
+                self.append_text(
+                    f"[GMCP] New room: {name} ({vnum_key}, Total: {len(rooms)})\n", "system")
+            else:
+                self.save_profiles()
+                self.append_text(f"[GMCP] Moved {direction} to: {name} ({vnum_key})\n", "system")
+
+            self.last_movement_direction = None
+
+        else:
+            # Look or teleport — update current room but don't create a directional link
+            self.current_room_hash = vnum_key
+            if is_new_room:
+                self.save_profiles()
+                self._update_status_bar()
+                self.append_text(
+                    f"[GMCP] New room: {name} ({vnum_key}, Total: {len(rooms)})\n", "system")
+
+        self.expecting_room_data = False
+
+        self._survival_on_room_entered(self.current_room_hash)
+        self._update_nav_panel()
+
+        if self.ai_agent and self.ai_agent.is_running:
+            self.ai_agent.on_room_entered(self.current_room_hash, {
+                'name':    name,
+                'exits':   exits,
+                'zone':    zone,
+                'terrain': terrain,
+            })
+
     def process_room_data(self, segments):
         """Process and store room data"""
         if not self.room_tracking_enabled or not self.expecting_room_data:
             return
+        if self.gmcp_active:
+            return  # GMCP Room.Info is the primary source; skip text parsing
 
         if not self.current_profile or self.current_profile not in self.profiles:
             return
@@ -2728,17 +2996,23 @@ class MUDClient:
                         self.ai_agent.on_text_received(msg_data)
                 elif msg_type == "telnet":
                     self.append_text(msg_data + "\n", "telnet")
+                elif msg_type == "gmcp_room":
+                    self._process_gmcp_room(msg_data)
                 elif msg_type == "error":
                     self.append_text(msg_data, "error")
                     self.disconnect()
                 elif msg_type == "stats":
-                    applied = msg_data.pop('spells_applied', [])
-                    expired = msg_data.pop('spells_expired', [])
+                    applied     = msg_data.pop('spells_applied', [])
+                    expired     = msg_data.pop('spells_expired', [])
+                    spells_add  = msg_data.pop('spells_add', {})
                     self.char_stats.update(msg_data)
                     if applied:
                         spells = self.char_stats.setdefault('spells', {})
                         for s in applied:
                             spells[s] = self.mud_parser.BUFF_DEFAULT_TICKS.get(s, 4)
+                    if spells_add:
+                        spells = self.char_stats.setdefault('spells', {})
+                        spells.update(spells_add)
                     if expired:
                         spells = self.char_stats.get('spells', {})
                         for s in expired:
