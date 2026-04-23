@@ -117,6 +117,7 @@ class MUDClient:
         self.previous_room_hash = None  # Hash of the previous room
         self.detect_entry_room = False  # Flag to detect entry room after login
         self.gmcp_active = False  # True after IAC WILL GMCP / IAC DO GMCP handshake
+        self._telnet_recv_buf = bytearray()  # incomplete telnet sequences carried across recv() calls
         self.movement_commands = ['n', 'north', 's', 'south', 'e', 'east',
                                    'w', 'west', 'u', 'up', 'd', 'down', 'l', 'look']
         # Map short commands to directions
@@ -348,6 +349,11 @@ class MUDClient:
 
     def filter_telnet_sequences(self, data):
         """Filter TELNET protocol sequences and log them"""
+        # Prepend any bytes left over from a split sequence in the previous chunk
+        if self._telnet_recv_buf:
+            data = bytes(self._telnet_recv_buf) + data
+            self._telnet_recv_buf.clear()
+
         # TELNET commands start with IAC (0xFF)
         IAC = 0xFF  # Interpret As Command
         WILL = 0xFB
@@ -398,17 +404,34 @@ class MUDClient:
         i = 0
 
         while i < len(data):
+            if data[i] == IAC and i + 1 >= len(data):
+                # IAC is the very last byte — save it and wait for the next chunk
+                self._telnet_recv_buf.extend(data[i:])
+                break
+
             if data[i] == IAC and i + 1 < len(data):
                 cmd = data[i + 1]
 
                 # Handle subnegotiation
+                if cmd == SB and i + 2 >= len(data):
+                    # SB without option byte yet — save and wait
+                    self._telnet_recv_buf.extend(data[i:])
+                    break
+
                 if cmd == SB and i + 2 < len(data):
                     # Find the end of subnegotiation (IAC SE)
                     end = i + 2
+                    found_se = False
                     while end < len(data) - 1:
                         if data[end] == IAC and data[end + 1] == SE:
+                            found_se = True
                             break
                         end += 1
+
+                    if not found_se:
+                        # Packet is split — save from IAC SB onward and wait for next chunk
+                        self._telnet_recv_buf.extend(data[i:])
+                        break
 
                     option = data[i + 2] if i + 2 < len(data) else 0
                     sb_data = data[i+3:end]
@@ -434,6 +457,10 @@ class MUDClient:
                     continue
 
                 # Handle 3-byte commands (WILL, WONT, DO, DONT)
+                if cmd in [WILL, WONT, DO, DONT] and i + 2 >= len(data):
+                    self._telnet_recv_buf.extend(data[i:])
+                    break
+
                 if cmd in [WILL, WONT, DO, DONT] and i + 2 < len(data):
                     option = data[i + 2]
                     cmd_name = telnet_commands.get(cmd, f"UNKNOWN({cmd})")
@@ -530,6 +557,9 @@ class MUDClient:
                         updates[stat_key] = int(data[gmcp_key])
                     except (TypeError, ValueError):
                         pass
+            # GMCP xp_next is the total XP threshold; convert to additional XP needed
+            if "xp_next" in updates and "xp" in updates:
+                updates["xp_next"] = max(0, updates["xp_next"] - updates["xp"])
             if "class" in data:
                 updates["class_name"] = data["class"]
             if "align" in data:
