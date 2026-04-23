@@ -557,6 +557,9 @@ class SkillEngine:
                 label = stat_labels.get(key, key)
                 if key in ("tank", "opp") and val is not None:
                     parts.append(f"  {label} = {val}%  (percentage of max HP)")
+                elif key == "spells":
+                    names = ", ".join(sorted(val.keys())) if val else "none"
+                    parts.append(f"  active_spells = {names}")
                 else:
                     parts.append(f"  {label} = {val}")
         else:

@@ -495,22 +495,41 @@ class MUDClient:
                 ("mpmax", "max_mp"),
                 ("mv",    "mv"),
                 ("mvmax", "max_mv"),
+                ("gold",  "gold"),
             ):
                 if gmcp_key in data:
                     try:
                         updates[stat_key] = int(data[gmcp_key])
                     except (TypeError, ValueError):
                         pass
+            if "hungry" in data:
+                try:
+                    v = int(data["hungry"])
+                    updates["hunger"] = 'OK' if v >= 8 else ('starving' if v == 0 else 'hungry')
+                except (TypeError, ValueError):
+                    pass
+            if "thirsty" in data:
+                try:
+                    v = int(data["thirsty"])
+                    updates["thirst"] = 'OK' if v >= 8 else ('parched' if v == 0 else 'thirsty')
+                except (TypeError, ValueError):
+                    pass
             if updates:
                 self.message_queue.put(("stats", updates))
 
         elif module == "Char.Status":
             updates = {}
-            if "level" in data:
-                try:
-                    updates["level"] = int(data["level"])
-                except (TypeError, ValueError):
-                    pass
+            for gmcp_key, stat_key in (
+                ("level",   "level"),
+                ("xp",      "xp"),
+                ("xp_next", "xp_next"),
+                ("ac",      "ac"),
+            ):
+                if gmcp_key in data:
+                    try:
+                        updates[stat_key] = int(data[gmcp_key])
+                    except (TypeError, ValueError):
+                        pass
             if "class" in data:
                 updates["class_name"] = data["class"]
             if "align" in data:
@@ -1546,18 +1565,18 @@ class MUDClient:
             self.detect_entry_room = True
             self.expecting_room_data = True
             self.message_queue.put(("system", "[Room tracking] Detecting entry room...\n"))
-        # Issue first score fetch after a short settle delay, then every 60 s
+        # Issue first score fetch after a short settle delay (no-op if GMCP is active)
         self.master.after(1500, self._send_auto_score)
 
     def _send_auto_score(self):
         """Send score command silently and reschedule.
 
-        When GMCP Defences are active the score is only needed for fields GMCP
-        does not provide (XP, gold, AC, hunger, thirst), so the interval is
-        stretched to 5 minutes.  Without GMCP the original 60-second cadence is
-        used so buff durations stay current via text parsing.
+        Not used when GMCP is active — all fields previously requiring score
+        (XP, xp_next, AC, gold, hunger, thirst) are now provided by GMCP.
+        Without GMCP the 60-second cadence keeps buff durations current via
+        text parsing.
         """
-        if not self.connected:
+        if not self.connected or self.gmcp_active:
             self._auto_score_job = None
             return
         try:
@@ -1567,8 +1586,7 @@ class MUDClient:
             self.master.after(5000, self._clear_score_suppression)
         except Exception:
             self._suppress_score_output = False
-        interval = 300_000 if self.gmcp_active else 60_000
-        self._auto_score_job = self.master.after(interval, self._send_auto_score)
+        self._auto_score_job = self.master.after(60_000, self._send_auto_score)
 
     def _clear_score_suppression(self):
         self._suppress_score_output = False
