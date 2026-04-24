@@ -565,6 +565,8 @@ class MUDClient:
                 updates["class_name"] = data["class"]
             if "align" in data:
                 updates["alignment"] = data["align"]
+            if "alignnum" in data:
+                updates["alignment_num"] = data["alignnum"]
             if updates:
                 self.message_queue.put(("stats", updates))
 
@@ -915,7 +917,9 @@ class MUDClient:
         # Character
         self._sv_level.set(str(s.get('level', '?')))
         self._sv_ac.set(str(s.get('ac', '?')))
-        self._sv_align.set(str(s.get('alignment', '?')))
+        align_text = str(s.get('alignment', '?'))
+        align_num = s.get('alignment_num')
+        self._sv_align.set(f"{align_text} ({align_num})" if align_num is not None else align_text)
         xp = s.get('xp')
         self._sv_xp.set(f"{xp:,}" if xp is not None else "?")
         xp_next = s.get('xp_next')
