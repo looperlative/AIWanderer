@@ -91,15 +91,6 @@ Rules:
     no ```json fences, no commentary. The first character of your reply must
     be '{' and the last must be '}'.
 
-Movement:
-  - When a skill's instructions give you a speedwalk string (e.g. "5n4w4s"),
-    send the whole string as ONE command in a single turn. Speedwalks are
-    executed atomically by the MUD and halt automatically on combat, so you
-    do not need to step by step.
-  - Only fall back to per-step movement when the instructions explicitly
-    tell you to, or when recovering from an interruption where a speedwalk
-    is not appropriate.
-
 Goto (navigate to a known location):
   - Use goto:<target> to move somewhere without knowing the exact path.
     goto:vnum:123       — room by number
