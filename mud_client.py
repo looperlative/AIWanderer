@@ -26,6 +26,12 @@ def _link_dest(val):
         return val.get('dest'), val.get('assumed', False)
     return val, False  # legacy plain-string → treat as confirmed
 
+def _death_trap_key(from_room, direction):
+    """Canonical key for a death-trap link stored in profile['death_trap_links']."""
+    return f"{from_room}:{direction}"
+
+_EXIT_DIR_RE = re.compile(r'\[ Exits: (.*?) \]')
+
 _REVERSE_DIR = {
     'north': 'south', 'south': 'north',
     'east':  'west',  'west':  'east',
@@ -144,6 +150,7 @@ class MUDClient:
         self._pending_command = None   # last human command sent (awaiting MUD response)
         self._response_buffer = []     # MUD lines received since last command
         self._active_goto = None       # {"target": str, "dest": room_key} while navigating
+        self._active_explore = None    # {"dest": room_key, "exit_info": dict} while exploring
         self._advisor_streamed = False # True if current response was already streamed to UI
         self._advisor_stream_start = None  # text index where streaming body began
 
@@ -2001,17 +2008,24 @@ class MUDClient:
 
     # ── Pathfinding ───────────────────────────────────────────────────
 
-    def _survival_find_path(self, from_hash, to_hash):
-        """BFS through room_links; returns list of short direction strings or None."""
+    def _survival_find_path(self, from_hash, to_hash, death_traps=None):
+        """BFS through room_links; returns list of short direction strings or None.
+
+        death_traps is profile['death_trap_links'] (optional); matching links are skipped.
+        """
         if from_hash == to_hash:
             return []
         profile = self.profiles.get(self.current_profile, {})
         links = profile.get('room_links', {})
+        if death_traps is None:
+            death_traps = profile.get('death_trap_links', {})
         queue = deque([(from_hash, [])])
         visited = {from_hash}
         while queue:
             room, path = queue.popleft()
             for direction, link_val in links.get(room, {}).items():
+                if _death_trap_key(room, direction) in death_traps:
+                    continue
                 neighbor, _ = _link_dest(link_val)
                 if neighbor is None:
                     continue
@@ -2023,6 +2037,60 @@ class MUDClient:
                     visited.add(neighbor)
                     queue.append((neighbor, new_path))
         return None   # no path found
+
+    def _classify_room_exits(self, room_key):
+        """Return {"known": {dir: dest}, "assumed": {dir: dest}, "unknown": [dir]} for a room."""
+        profile = self.profiles.get(self.current_profile, {})
+        rooms    = profile.get('rooms', {})
+        links    = profile.get('room_links', {})
+        room     = rooms.get(room_key, {})
+        exits_str = room.get('exits', '')
+        m = _EXIT_DIR_RE.search(exits_str)
+        listed_dirs = m.group(1).split() if m and m.group(1) != 'none' else []
+        room_links = links.get(room_key, {})
+        result = {"known": {}, "assumed": {}, "unknown": []}
+        for d in listed_dirs:
+            link_val = room_links.get(d)
+            if link_val is None:
+                result["unknown"].append(d)
+            else:
+                dest, assumed = _link_dest(link_val)
+                dest_name = rooms.get(dest, {}).get('name', dest) if dest else '?'
+                if assumed:
+                    result["assumed"][d] = dest_name
+                else:
+                    result["known"][d] = dest_name
+        return result
+
+    def _find_nearest_explore_target(self):
+        """BFS to find the nearest room with unknown (unlisted) exits.
+
+        Returns (path, room_key, exit_info) or None if all mapped exits are confirmed.
+        exit_info is {"known": {dir: name}, "assumed": {dir: name}, "unknown": [dir]}.
+        """
+        if not self.current_room_hash or not self.current_profile:
+            return None
+        profile     = self.profiles.get(self.current_profile, {})
+        rooms       = profile.get('rooms', {})
+        links       = profile.get('room_links', {})
+        death_traps = profile.get('death_trap_links', {})
+
+        bfs = deque([(self.current_room_hash, [])])
+        visited = {self.current_room_hash}
+        while bfs:
+            room_key, path = bfs.popleft()
+            ei = self._classify_room_exits(room_key)
+            if ei["unknown"]:
+                return path, room_key, ei
+            for direction, link_val in links.get(room_key, {}).items():
+                if _death_trap_key(room_key, direction) in death_traps:
+                    continue
+                neighbor, _ = _link_dest(link_val)
+                if neighbor and neighbor not in visited and neighbor in rooms:
+                    visited.add(neighbor)
+                    abbrev = self._DIR_ABBREV.get(direction, direction)
+                    bfs.append((neighbor, path + [abbrev]))
+        return None
 
     def _resolve_goto(self, target: str):
         """Resolve a goto:<target> string to a direction list via BFS, or None."""
@@ -2090,6 +2158,25 @@ class MUDClient:
         room_name = profile.get('rooms', {}).get(self.current_room_hash, {}).get('name', self.current_room_hash)
         self.append_text(f"[Landmark] '{name}' → {room_name} ({self.current_room_hash})\n", "system")
         self.save_profiles()
+
+    # ── Death trap handling ───────────────────────────────────────────
+
+    def _handle_player_death(self):
+        """Record the link that led to death as a death trap and halt navigation."""
+        if not self.current_profile:
+            return
+        profile = self.profiles.get(self.current_profile, {})
+        rooms   = profile.get('rooms', {})
+        if self.previous_room_hash and self.last_movement_direction:
+            key = _death_trap_key(self.previous_room_hash, self.last_movement_direction)
+            profile.setdefault('death_trap_links', {})[key] = True
+            self.save_profiles()
+            prev_name = rooms.get(self.previous_room_hash, {}).get('name', self.previous_room_hash)
+            self.append_text(
+                f"[Harness: death trap recorded — {self.last_movement_direction} from {prev_name}]\n",
+                "system")
+        self._active_goto    = None
+        self._active_explore = None
 
     # ── Core survival commands ────────────────────────────────────────
 
@@ -2783,6 +2870,10 @@ class MUDClient:
             updates.setdefault('tank', None)
             updates.setdefault('opp', None)
 
+        # Death detection — queue separate event so main thread can record the trap
+        if re.search(r'\byou are dead\b', text, re.IGNORECASE):
+            self.message_queue.put(("player_died", None))
+
         if updates:
             self.message_queue.put(("stats", updates))
 
@@ -3166,6 +3257,8 @@ class MUDClient:
                                 self.append_text(
                                     f"[Survival] Only {count} {food_item} left in "
                                     "inventory.\n", "system")
+                elif msg_type == "player_died":
+                    self._handle_player_death()
                 elif msg_type == "group_event":
                     if msg_data == "disbanded":
                         if (self.skill_engine and
@@ -3559,6 +3652,34 @@ class MUDClient:
                 self._active_goto = None
             else:
                 mud_lines.insert(0, f"[Harness: goto:{target} in progress]")
+
+        # Annotate explore: state and per-turn room exit summary.
+        if self.current_room_hash and self.current_profile:
+            profile   = self.profiles.get(self.current_profile, {})
+            rooms     = profile.get('rooms', {})
+            room_name = rooms.get(self.current_room_hash, {}).get('name', self.current_room_hash)
+            ei        = self._classify_room_exits(self.current_room_hash)
+            parts     = []
+            if ei["known"]:
+                parts.append("known: " + ", ".join(f"{d}→{n}" for d, n in ei["known"].items()))
+            if ei["assumed"]:
+                parts.append("assumed: " + ", ".join(f"{d}→{n}" for d, n in ei["assumed"].items()))
+            if ei["unknown"]:
+                parts.append("unknown: " + ", ".join(ei["unknown"]))
+            exit_summary = "; ".join(parts) if parts else "none"
+            mud_lines.insert(0, f"[Room: {room_name} ({self.current_room_hash}) — {exit_summary}]")
+
+            if self._active_explore:
+                edest = self._active_explore["dest"]
+                if self.current_room_hash == edest:
+                    # Refresh exit info for the destination (now the current room)
+                    ei2 = self._classify_room_exits(edest)
+                    edest_name = rooms.get(edest, {}).get('name', edest)
+                    mud_lines.insert(0, f"[Harness: explore: arrived at {edest_name} — {exit_summary}]")
+                    self._active_explore = None
+                else:
+                    edest_name = rooms.get(edest, {}).get('name', edest)
+                    mud_lines.insert(0, f"[Harness: explore: navigating to {edest_name}]")
         stats = dict(self.char_stats)
         # Overlay with the freshest prompt line in the buffer so hp/mp/mv/tank/opp
         # are current even before the message_queue stats update reaches the main thread.
@@ -3597,12 +3718,16 @@ class MUDClient:
             # Expand any speedwalk commands into their constituent directions
             # for dispatch, since the MUD itself does not understand speedwalks.
             dispatch = []
-            # If the LLM issued commands that don't include a goto:, it has
-            # moved on — clear any pending goto navigation state.
-            if not any(c.lower().startswith('goto:') for c in commands):
+            # If the LLM issued commands that don't include a goto: or explore:,
+            # clear any pending navigation state.
+            cl = [c.lower() for c in commands]
+            if not any(x.startswith('goto:') for x in cl):
                 self._active_goto = None
+            if not any(x in ('explore:', 'explore') for x in cl):
+                self._active_explore = None
             for c in commands:
-                if c.lower().startswith('goto:'):
+                cl_c = c.lower().strip()
+                if cl_c.startswith('goto:'):
                     tgt = c[5:].strip()
                     goto_result = self._resolve_goto(tgt)
                     if goto_result is not None:
@@ -3612,6 +3737,42 @@ class MUDClient:
                     else:
                         self._active_goto = None
                         self.append_text(f"[Skill] goto: no path found for '{tgt}'\n", "error")
+                elif cl_c in ('explore:', 'explore'):
+                    result_ex = self._find_nearest_explore_target()
+                    if result_ex is None:
+                        self._active_explore = None
+                        self.append_text("[Harness: explore: map appears complete — no unmapped exits found]\n", "system")
+                    else:
+                        ex_path, ex_dest, ex_ei = result_ex
+                        self._active_explore = {"dest": ex_dest, "exit_info": ex_ei}
+                        dispatch.extend(ex_path)
+                elif cl_c.startswith('setlandmark:'):
+                    lm_name = c[len('setlandmark:'):].strip().lower()
+                    if lm_name and self.current_room_hash and self.current_profile:
+                        prof = self.profiles.get(self.current_profile, {})
+                        prof.setdefault('landmarks', {})[lm_name] = self.current_room_hash
+                        self.save_profiles()
+                        rn = prof.get('rooms', {}).get(self.current_room_hash, {}).get('name', self.current_room_hash)
+                        self.append_text(f"[Harness: landmark '{lm_name}' set → {rn}]\n", "system")
+                elif cl_c.startswith('unsetlandmark:'):
+                    lm_name = c[len('unsetlandmark:'):].strip().lower()
+                    if lm_name and self.current_profile:
+                        prof = self.profiles.get(self.current_profile, {})
+                        removed = prof.get('landmarks', {}).pop(lm_name, None)
+                        if removed:
+                            self.save_profiles()
+                            self.append_text(f"[Harness: landmark '{lm_name}' removed]\n", "system")
+                elif cl_c in ('markdangerous:', 'markdangerous'):
+                    if self.previous_room_hash and self.last_movement_direction and self.current_profile:
+                        prof = self.profiles.get(self.current_profile, {})
+                        key  = _death_trap_key(self.previous_room_hash, self.last_movement_direction)
+                        prof.setdefault('death_trap_links', {})[key] = True
+                        self.save_profiles()
+                        rooms_d = prof.get('rooms', {})
+                        prev_n  = rooms_d.get(self.previous_room_hash, {}).get('name', self.previous_room_hash)
+                        self.append_text(
+                            f"[Harness: marked {self.last_movement_direction} from {prev_n} as dangerous]\n",
+                            "system")
                 else:
                     expanded = self._expand_speedwalk(c)
                     if expanded is not None:

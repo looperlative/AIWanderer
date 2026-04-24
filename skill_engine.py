@@ -91,19 +91,40 @@ Rules:
     no ```json fences, no commentary. The first character of your reply must
     be '{' and the last must be '}'.
 
-Goto (navigate to a known location):
-  - Use goto:<target> to move somewhere without knowing the exact path.
+Navigation commands:
+  goto:<target>       Navigate to a known location via BFS pathfinding.
     goto:vnum:123       — room by number
     goto:Otto           — landmark named "Otto" (a configured fixed location)
     goto:mob:white rook — room where that mob was last seen
     goto:Temple Square  — room whose name contains "Temple Square"
-  - The harness resolves the target via BFS and injects the directions
-    automatically. If unreachable, a warning is shown and the command is
-    skipped. Combine freely: ["goto:Otto", "tell otto heal"].
-  - While navigating, each turn's MUD output begins with:
+  The harness resolves the target and injects directions automatically.
+  If unreachable, a warning is shown and the command is skipped.
+  While navigating, each turn's MUD output begins with:
       [Harness: goto:<target> in progress]   — still moving
       [Harness: goto:<target> arrived — <room>]  — destination reached
-    Wait for the "arrived" line before acting on the destination.
+  Wait for the "arrived" line before acting on the destination.
+
+  explore:            Navigate to the nearest room with unknown (unmapped) exits.
+  The harness injects on arrival:
+      [Harness: explore: arrived at <room> — known: dir→dest; assumed: dir→dest; unknown: dir]
+  Stop and choose which unknown exit to try based on the room description.
+  If the whole map is explored you will see:
+      [Harness: explore: map appears complete — no unmapped exits found]
+
+Landmark commands:
+  setlandmark:<name>  Set a named landmark at the current room (replaces any existing).
+                      Example: setlandmark:bank
+  unsetlandmark:<name> Remove a named landmark.
+                      Example: unsetlandmark:bank
+
+Danger commands:
+  markdangerous:      Mark the last direction taken as a death-trap link; it will be
+                      avoided by all future goto: and explore: pathfinding.
+
+Per-turn room annotation (always present):
+  Each turn begins with:
+    [Room: <name> (<key>) — known: dir→dest, ...; assumed: dir→dest; unknown: dir, ...]
+  Use this to decide which exits are safe to traverse and which are unexplored.
 
 Command ledger:
   - Each turn's payload includes "Commands sent this skill session so far"
