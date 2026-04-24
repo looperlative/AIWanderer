@@ -143,6 +143,7 @@ class MUDClient:
         self._skill_target_killed = False  # set when a kill line fires during active skill
         self._pending_command = None   # last human command sent (awaiting MUD response)
         self._response_buffer = []     # MUD lines received since last command
+        self._active_goto = None       # {"target": str, "dest": room_key} while navigating
         self._advisor_streamed = False # True if current response was already streamed to UI
         self._advisor_stream_start = None  # text index where streaming body began
 
@@ -2019,6 +2020,73 @@ class MUDClient:
                     queue.append((neighbor, new_path))
         return None   # no path found
 
+    def _resolve_goto(self, target: str):
+        """Resolve a goto:<target> string to a direction list via BFS, or None."""
+        profile = self.profiles.get(self.current_profile, {})
+        rooms   = profile.get('rooms', {})
+        t       = target.strip()
+        dest    = None
+
+        # 1. Exact vnum (e.g. "vnum:3001")
+        if t.lower().startswith('vnum:'):
+            key = t.lower()
+            if key in rooms:
+                dest = key
+
+        # 2. Landmark lookup (case-insensitive)
+        if dest is None:
+            tl = t.lower()
+            for name, key in profile.get('landmarks', {}).items():
+                if name.lower() == tl:
+                    dest = key
+                    break
+
+        # 3. Mob name — optional "mob:" prefix; search mob_combat_stats then room mob_lines
+        if dest is None:
+            mob_query = t[4:].strip() if t.lower().startswith('mob:') else t
+            q = mob_query.lower()
+            for mob_name, entry in profile.get('mob_combat_stats', {}).items():
+                if q in mob_name.lower():
+                    mob_rooms = entry.get('rooms', [])
+                    if mob_rooms and mob_rooms[-1] in rooms:
+                        dest = mob_rooms[-1]
+                        break
+            if dest is None:
+                for room_key, rdata in rooms.items():
+                    if any(q in line.lower() for line in rdata.get('mob_lines', [])):
+                        dest = room_key
+                        break
+
+        # 4. Room name substring
+        if dest is None:
+            q = t.lower()
+            for room_key, rdata in rooms.items():
+                if q in rdata.get('name', '').lower():
+                    dest = room_key
+                    break
+
+        if dest is None or not self.current_room_hash:
+            return None
+        path = self._survival_find_path(self.current_room_hash, dest)
+        if path is None:
+            return None
+        return path, dest
+
+    def _cmd_setlandmark(self, name: str):
+        """Handle the setlandmark <name> console command."""
+        if not name:
+            self.append_text("[Landmark] Usage: setlandmark <name>\n", "error")
+            return
+        if not self.current_room_hash:
+            self.append_text("[Landmark] No current room known yet.\n", "error")
+            return
+        profile = self.profiles.get(self.current_profile, {})
+        landmarks = profile.setdefault('landmarks', {})
+        landmarks[name] = self.current_room_hash
+        room_name = profile.get('rooms', {}).get(self.current_room_hash, {}).get('name', self.current_room_hash)
+        self.append_text(f"[Landmark] '{name}' → {room_name} ({self.current_room_hash})\n", "system")
+        self.save_profiles()
+
     # ── Core survival commands ────────────────────────────────────────
 
     def _survival_send_cmd(self, cmd):
@@ -3129,6 +3197,12 @@ class MUDClient:
             self._dump_ai_debug()
             return
 
+        # setlandmark <name> — save current room as a named goto: landmark
+        if message.lower().startswith('setlandmark '):
+            self.input_entry.delete(0, tk.END)
+            self._cmd_setlandmark(message[len('setlandmark '):].strip())
+            return
+
         # Direct LLM prompt — starts with \
         if message.startswith('\\'):
             self.input_entry.delete(0, tk.END)
@@ -3469,6 +3543,18 @@ class MUDClient:
         # the stale human command doesn't linger between turns.
         self._response_buffer = []
         self._pending_command = None
+        # Annotate goto: navigation state so the LLM knows whether it's
+        # still in transit or has arrived.
+        if self._active_goto:
+            dest   = self._active_goto["dest"]
+            target = self._active_goto["target"]
+            if self.current_room_hash == dest:
+                room_name = (self.profiles.get(self.current_profile, {})
+                             .get('rooms', {}).get(dest, {}).get('name', dest))
+                mud_lines.insert(0, f"[Harness: goto:{target} arrived — {room_name}]")
+                self._active_goto = None
+            else:
+                mud_lines.insert(0, f"[Harness: goto:{target} in progress]")
         stats = dict(self.char_stats)
         # Overlay with the freshest prompt line in the buffer so hp/mp/mv/tank/opp
         # are current even before the message_queue stats update reaches the main thread.
@@ -3507,12 +3593,27 @@ class MUDClient:
             # Expand any speedwalk commands into their constituent directions
             # for dispatch, since the MUD itself does not understand speedwalks.
             dispatch = []
+            # If the LLM issued commands that don't include a goto:, it has
+            # moved on — clear any pending goto navigation state.
+            if not any(c.lower().startswith('goto:') for c in commands):
+                self._active_goto = None
             for c in commands:
-                expanded = self._expand_speedwalk(c)
-                if expanded is not None:
-                    dispatch.extend(expanded)
+                if c.lower().startswith('goto:'):
+                    tgt = c[5:].strip()
+                    goto_result = self._resolve_goto(tgt)
+                    if goto_result is not None:
+                        path, dest_room = goto_result
+                        self._active_goto = {"target": tgt, "dest": dest_room}
+                        dispatch.extend(path)
+                    else:
+                        self._active_goto = None
+                        self.append_text(f"[Skill] goto: no path found for '{tgt}'\n", "error")
                 else:
-                    dispatch.append(c)
+                    expanded = self._expand_speedwalk(c)
+                    if expanded is not None:
+                        dispatch.extend(expanded)
+                    else:
+                        dispatch.append(c)
             # Send sequentially with a small stagger so the MUD has time to
             # respond between steps.
             def send_at(idx):

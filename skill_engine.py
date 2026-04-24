@@ -100,6 +100,20 @@ Movement:
     tell you to, or when recovering from an interruption where a speedwalk
     is not appropriate.
 
+Goto (navigate to a known location):
+  - Use goto:<target> to move somewhere without knowing the exact path.
+    goto:vnum:123       — room by number
+    goto:Otto           — landmark named "Otto" (a configured fixed location)
+    goto:mob:white rook — room where that mob was last seen
+    goto:Temple Square  — room whose name contains "Temple Square"
+  - The harness resolves the target via BFS and injects the directions
+    automatically. If unreachable, a warning is shown and the command is
+    skipped. Combine freely: ["goto:Otto", "tell otto heal"].
+  - While navigating, each turn's MUD output begins with:
+      [Harness: goto:<target> in progress]   — still moving
+      [Harness: goto:<target> arrived — <room>]  — destination reached
+    Wait for the "arrived" line before acting on the destination.
+
 Command ledger:
   - Each turn's payload includes "Commands sent this skill session so far"
     with per-command counts and the last several commands. This is the
@@ -445,6 +459,9 @@ class SkillEngine:
         char_name = profile.get("character", "")
         if char_name:
             parts.append(f"\nYour character's name is {char_name}. When another character addresses {char_name} directly, recognize that you are being spoken to.")
+        landmarks = profile.get("landmarks", {})
+        if landmarks:
+            parts.append("\nKnown goto: landmarks: " + ", ".join(landmarks.keys()))
         parts.append(f"\n=== Skill: {self._skill_name} ===")
         if instr:
             parts.append("\nInstructions from the user:\n" + instr)
