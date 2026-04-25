@@ -2092,17 +2092,25 @@ class MUDClient:
     def _survival_find_path(self, from_hash, to_hash):
         """BFS through room_links; returns list of short direction strings or None.
 
-        Links marked death_trap or blocked are skipped.
+        Links marked death_trap or blocked are skipped.  Only directions that
+        appear in the room's actual MUD exits string are traversed — assumed
+        reverse-links that aren't physically listed are ignored.
         """
         if from_hash == to_hash:
             return []
         profile = self.profiles.get(self.current_profile, {})
+        rooms = profile.get('rooms', {})
         links = profile.get('room_links', {})
         queue = deque([(from_hash, [])])
         visited = {from_hash}
         while queue:
             room, path = queue.popleft()
+            m = _EXIT_DIR_RE.search(rooms.get(room, {}).get('exits', ''))
+            raw = m.group(1).split() if m and m.group(1) != 'none' else []
+            listed_dirs = {self.direction_map.get(d.lower(), d.lower()) for d in raw}
             for direction, link_val in links.get(room, {}).items():
+                if direction not in listed_dirs:
+                    continue
                 if isinstance(link_val, dict) and (link_val.get('death_trap') or link_val.get('blocked')):
                     continue
                 neighbor, _ = _link_dest(link_val)
@@ -2118,7 +2126,12 @@ class MUDClient:
         return None   # no path found
 
     def _classify_room_exits(self, room_key):
-        """Return {"known": {dir: dest}, "assumed": {dir: dest}, "unknown": [dir], "blocked": [dir]} for a room."""
+        """Return exit classification for a room.
+
+        Keys: "known", "assumed", "unknown", "blocked", "dangerous".
+        death_trap exits are placed in "dangerous" (not "known") so the LLM
+        sees them as a distinct category it must never walk.
+        """
         profile = self.profiles.get(self.current_profile, {})
         rooms  = profile.get('rooms', {})
         links  = profile.get('room_links', {})
@@ -2129,11 +2142,13 @@ class MUDClient:
         # Exits are stored as MUD abbreviations (n/e/s/w/u/d); room_links uses full names.
         listed_dirs = [self.direction_map.get(d.lower(), d.lower()) for d in raw_dirs]
         room_links = links.get(room_key, {})
-        result = {"known": {}, "assumed": {}, "unknown": [], "blocked": []}
+        result = {"known": {}, "assumed": {}, "unknown": [], "blocked": [], "dangerous": []}
         for d in listed_dirs:
             link_val = room_links.get(d)
             if link_val is None:
                 result["unknown"].append(d)
+            elif isinstance(link_val, dict) and link_val.get('death_trap'):
+                result["dangerous"].append(d)
             elif isinstance(link_val, dict) and link_val.get('blocked'):
                 result["blocked"].append(d)
             else:
@@ -2146,10 +2161,13 @@ class MUDClient:
         return result
 
     def _find_nearest_explore_target(self):
-        """Find a room with unknown or assumed exits to explore next.
+        """Find the nearest reachable room with unknown or assumed exits.
 
-        Prefers any room in the current zone; falls back to any room in the map.
-        Returns (path, room_key, exit_info) or None if all exits are confirmed/unreachable.
+        Combines target selection and pathfinding in a single BFS so only
+        reachable targets are ever returned.  Prefers rooms in the current
+        zone; falls back to any reachable room in the map.
+        Returns (path, room_key, exit_info) or None if nothing is reachable.
+        path is [] when the current room itself has unexplored exits.
         exit_info is {"known": {dir: name}, "assumed": {dir: name}, "unknown": [dir]}.
         """
         if not self.current_room_hash or not self.current_profile:
@@ -2157,55 +2175,49 @@ class MUDClient:
         profile = self.profiles.get(self.current_profile, {})
         rooms   = profile.get('rooms', {})
         links   = profile.get('room_links', {})
-
         current_zone = rooms.get(self.current_room_hash, {}).get('zone', '')
 
-        def _candidate_ei(room_key):
+        def _unexplored_ei(room_key):
             ei = self._classify_room_exits(room_key)
             return ei if (ei["unknown"] or ei["assumed"]) else None
 
-        # Pick a target: prefer current zone, fall back to any room.
-        target_key = None
-        target_ei  = None
-        for room_key, room_data in rooms.items():
-            if room_data.get('zone', '') == current_zone:
-                ei = _candidate_ei(room_key)
-                if ei is not None:
-                    target_key = room_key
-                    target_ei  = ei
-                    break
-        if target_key is None:
-            for room_key in rooms:
-                ei = _candidate_ei(room_key)
-                if ei is not None:
-                    target_key = room_key
-                    target_ei  = ei
-                    break
-        if target_key is None:
+        # Current room may itself have unexplored exits.
+        ei = _unexplored_ei(self.current_room_hash)
+        if ei is not None:
+            return [], self.current_room_hash, ei
+
+        def _bfs(zone_filter):
+            """BFS outward; return (path, room_key, ei) for the nearest
+            reachable room with unexplored exits in zone_filter, or in any
+            zone when zone_filter is None."""
+            bfs = deque([(self.current_room_hash, [])])
+            visited = {self.current_room_hash}
+            while bfs:
+                room_key, path = bfs.popleft()
+                m = _EXIT_DIR_RE.search(rooms.get(room_key, {}).get('exits', ''))
+                raw = m.group(1).split() if m and m.group(1) != 'none' else []
+                listed_dirs = {self.direction_map.get(d.lower(), d.lower())
+                               for d in raw}
+                for direction, link_val in links.get(room_key, {}).items():
+                    if direction not in listed_dirs:
+                        continue
+                    if isinstance(link_val, dict) and (
+                            link_val.get('death_trap') or link_val.get('blocked')):
+                        continue
+                    neighbor, _ = _link_dest(link_val)
+                    if not neighbor or neighbor not in rooms or neighbor in visited:
+                        continue
+                    visited.add(neighbor)
+                    new_path = path + [self._DIR_ABBREV.get(direction, direction)]
+                    if (zone_filter is None
+                            or rooms.get(neighbor, {}).get('zone', '') == zone_filter):
+                        ei = _unexplored_ei(neighbor)
+                        if ei is not None:
+                            return new_path, neighbor, ei
+                    bfs.append((neighbor, new_path))
             return None
 
-        # Already here — no navigation needed.
-        if target_key == self.current_room_hash:
-            return [], target_key, target_ei
-
-        # BFS to find a path to the chosen target; stops on first hit.
-        bfs = deque([(self.current_room_hash, [])])
-        visited = {self.current_room_hash}
-        while bfs:
-            room_key, path = bfs.popleft()
-            for direction, link_val in links.get(room_key, {}).items():
-                if isinstance(link_val, dict) and (link_val.get('death_trap') or link_val.get('blocked')):
-                    continue
-                neighbor, _ = _link_dest(link_val)
-                if neighbor and neighbor not in visited and neighbor in rooms:
-                    new_path = path + [self._DIR_ABBREV.get(direction, direction)]
-                    if neighbor == target_key:
-                        return new_path, target_key, target_ei
-                    visited.add(neighbor)
-                    bfs.append((neighbor, new_path))
-
-        # Target unreachable from current position; return empty path.
-        return [], target_key, target_ei
+        return _bfs(current_zone) or _bfs(None)
 
     def _resolve_goto(self, target: str):
         """Resolve a goto:<target> string to a direction list via BFS, or None."""
@@ -3302,9 +3314,53 @@ class MUDClient:
                     if self.expecting_room_data:
                         plain = ' '.join(t for t, _ in msg_data)
                         if self.mud_parser.detect_move_fail(plain):
-                            self._refused_direction = self.last_movement_direction
+                            refused = self.last_movement_direction
                             self.expecting_room_data = False
                             self.last_movement_direction = None
+                            # Check whether the refused direction is a phantom
+                            # link (exists in room_links but not in the room's
+                            # actual MUD exits string).  If so, clean it up
+                            # automatically rather than asking the LLM to act.
+                            if (refused and self.current_room_hash
+                                    and self.current_profile):
+                                profile = self.profiles.get(
+                                    self.current_profile, {})
+                                room = (profile.get('rooms', {})
+                                        .get(self.current_room_hash, {}))
+                                m = _EXIT_DIR_RE.search(
+                                    room.get('exits', ''))
+                                raw = (m.group(1).split()
+                                       if m and m.group(1) != 'none' else [])
+                                listed = {self.direction_map.get(
+                                    d.lower(), d.lower()) for d in raw}
+                                if refused not in listed:
+                                    # Direction not in the exits string.
+                                    # Only remove assumed links — a confirmed
+                                    # link to a known room may be a closed door
+                                    # and should be left for the LLM to handle.
+                                    room_links = profile.get('room_links', {})
+                                    link_val = room_links.get(
+                                        self.current_room_hash, {}).get(refused)
+                                    _, is_assumed = _link_dest(link_val) if link_val is not None else (None, True)
+                                    if link_val is not None and is_assumed:
+                                        del room_links[
+                                            self.current_room_hash][refused]
+                                        self.save_profiles()
+                                        room_name = room.get(
+                                            'name', self.current_room_hash)
+                                        self.append_text(
+                                            f"[Harness: removed phantom"
+                                            f" '{refused}' link from"
+                                            f" {room_name}]\n", "system")
+                                        self._active_goto = None
+                                        self._active_explore = None
+                                        self._update_nav_panel()
+                                    else:
+                                        self._refused_direction = refused
+                                else:
+                                    self._refused_direction = refused
+                            else:
+                                self._refused_direction = refused
                             self._fire_deferred_skill()
                         elif self.mud_parser.detect_darkness(plain):
                             # Dark room — we moved here but can't parse it.
@@ -3822,6 +3878,8 @@ class MUDClient:
                 parts.append("unknown: " + ", ".join(ei["unknown"]))
             if ei["blocked"]:
                 parts.append("blocked: " + ", ".join(ei["blocked"]))
+            if ei["dangerous"]:
+                parts.append("DANGEROUS(death-trap): " + ", ".join(ei["dangerous"]))
             exit_summary = "; ".join(parts) if parts else "none"
             mud_lines.insert(0, f"[Room: {room_name} ({self.current_room_hash}) — {exit_summary}]")
 

@@ -58,6 +58,7 @@ class LLMAdvisor:
         self.client = client          # MUDClient instance
         self._call_count = 0
         self._messages = []           # persistent context: init block + direct chat only
+        self._messages_lock = threading.Lock()
         self._advice_call_count = 0   # counts regular advice calls for refresh scheduling
         self._is_first_message = True # send full state on first turn only
         self._last_inventory = None   # track inventory for change detection
@@ -74,7 +75,8 @@ class LLMAdvisor:
 
     def reset_history(self):
         """Clear in-session conversation history. Called at each new connection."""
-        self._messages = []
+        with self._messages_lock:
+            self._messages = []
         self._advice_call_count = 0
         self._is_first_message = True
         self._last_inventory = None
@@ -129,8 +131,9 @@ class LLMAdvisor:
         Fires a one-shot LLM call summarising the advisor's own output from this
         session.  on_result(summary: str | None) is called on the main thread.
         """
-        assistant_turns = [m['content'] for m in self._messages
-                           if m['role'] == 'assistant']
+        with self._messages_lock:
+            assistant_turns = [m['content'] for m in self._messages
+                               if m['role'] == 'assistant']
         if not assistant_turns:
             self.client.master.after(0, lambda: on_result(None))
             return
@@ -164,7 +167,8 @@ class LLMAdvisor:
         user_msg = self._build_advisor_message(context)
 
         # Build per-call message list: persistent context + optional refresh + event
-        msgs = list(self._messages)  # initial world knowledge + any direct chat
+        with self._messages_lock:
+            msgs = list(self._messages)  # initial world knowledge + any direct chat
 
         if self._advice_call_count % self.STATE_REFRESH_INTERVAL == 1:
             # First call and every Nth call: inject a current game-state block
@@ -202,8 +206,9 @@ class LLMAdvisor:
         """Background worker for request_direct()."""
         logger = self.client.session_logger
         system_prompt = self._build_system_prompt()
-        self._messages.append({"role": "user", "content": prompt})
-        self._is_first_message = False
+        with self._messages_lock:
+            self._messages.append({"role": "user", "content": prompt})
+            self._is_first_message = False
         logger.log_llm_prompt(f"[direct]\n[system]\n{system_prompt}\n[user]\n{prompt}")
 
         master = self.client.master
@@ -214,16 +219,20 @@ class LLMAdvisor:
 
         reply = None
         try:
-            reply = self._call_backend(system_prompt, list(self._messages),
+            with self._messages_lock:
+                msgs_snapshot = list(self._messages)
+            reply = self._call_backend(system_prompt, msgs_snapshot,
                                        max_tokens=1024, on_token=on_token)
             logger.log_llm_response(reply)
             if reply:
-                self._messages.append({"role": "assistant", "content": reply})
+                with self._messages_lock:
+                    self._messages.append({"role": "assistant", "content": reply})
             master.after(0, self.client.end_advisor_stream)
         except Exception as e:
-            if self._messages and self._messages[-1]['role'] == 'user':
-                self._messages.pop()
-                self._is_first_message = True
+            with self._messages_lock:
+                if self._messages and self._messages[-1]['role'] == 'user':
+                    self._messages.pop()
+                    self._is_first_message = True
             master.after(0, self.client.cancel_advisor_stream)
             msg = str(e)
             master.after(0, lambda m=msg: self.client.append_advisor_text(f"[Advisor error: {m}]"))
@@ -282,12 +291,6 @@ class LLMAdvisor:
             f"\n\nContext from your last session ({label}):\n{summary}"
         )
         return prompt
-
-    def _trim_history(self):
-        """Drop the oldest turns so the history stays within _history_limit pairs."""
-        cap = self._history_limit * 2
-        if len(self._messages) > cap:
-            self._messages = self._messages[-cap:]
 
     def _build_game_state_block(self):
         """
@@ -386,20 +389,25 @@ class LLMAdvisor:
             "previous sessions. Use this to inform your advice throughout our session.\n\n"
             + world
         )
-        self._messages.append({"role": "user", "content": user_msg})
-        self._is_first_message = False
+        with self._messages_lock:
+            self._messages.append({"role": "user", "content": user_msg})
+            self._is_first_message = False
         logger = self.client.session_logger
         logger.log_llm_prompt(f"[init]\n[system]\n{system_prompt}\n[user]\n{user_msg}")
         try:
-            reply = self._call_backend(system_prompt, list(self._messages), max_tokens=256)
+            with self._messages_lock:
+                msgs_snapshot = list(self._messages)
+            reply = self._call_backend(system_prompt, msgs_snapshot, max_tokens=256)
             if reply:
                 logger.log_llm_response(reply)
-                self._messages.append({"role": "assistant", "content": reply})
+                with self._messages_lock:
+                    self._messages.append({"role": "assistant", "content": reply})
         except Exception:
             # Roll back so the next real message retries as first
-            if self._messages and self._messages[-1]['role'] == 'user':
-                self._messages.pop()
-                self._is_first_message = True
+            with self._messages_lock:
+                if self._messages and self._messages[-1]['role'] == 'user':
+                    self._messages.pop()
+                    self._is_first_message = True
 
     def _build_world_knowledge_block(self, profile, ai_state):
         """
@@ -537,17 +545,6 @@ class LLMAdvisor:
     # ------------------------------------------------------------------
     # Ollama backend  (OpenAI-compatible chat completions)
     # ------------------------------------------------------------------
-
-    def _ollama_conn(self, cfg):
-        """Return (conn, host_str, use_ssl) for the configured Ollama endpoint."""
-        endpoint = cfg.get('llm_endpoint', 'http://localhost:11434')
-        parsed = urllib.parse.urlparse(endpoint)
-        host = parsed.hostname
-        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-        use_ssl = parsed.scheme == 'https'
-        if use_ssl:
-            return http.client.HTTPSConnection(host, port, timeout=180), endpoint, True
-        return http.client.HTTPConnection(host, port, timeout=180), endpoint, False
 
     def _call_ollama(self, cfg, system_prompt, messages, max_tokens=2048, on_token=None):
         endpoint = cfg.get('llm_endpoint', 'http://localhost:11434')
@@ -687,64 +684,6 @@ class LLMAdvisor:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _sanitize(self, text):
-        """
-        Strip the LLM response down to a single clean command.
-        LLMs sometimes wrap their answer in quotes, explanation, or markdown.
-        The prompt asks them to "finish with a single command as the last line",
-        often preceded by "Command:" label.
-        """
-        if not text:
-            return None
-        
-        lines = text.strip().splitlines()
-        if not lines:
-            return None
-        
-        # Look for "Command:" label (case-insensitive), with optional markdown formatting
-        line = None
-        for i, l in enumerate(lines):
-            l_stripped = l.strip()
-            # Check if this line contains "Command:" (possibly with markdown bold ** around it)
-            if re.match(r'^\*{0,2}command\s*:\*{0,2}\s*', l_stripped, re.IGNORECASE):
-                # Check if command is on the same line after the colon
-                remainder = re.sub(r'^\*{0,2}command\s*:\*{0,2}\s*', '', l_stripped, flags=re.IGNORECASE).strip()
-                if remainder:
-                    line = remainder
-                    break
-                # Otherwise, take the next non-empty line
-                for j in range(i + 1, len(lines)):
-                    next_line = lines[j].strip()
-                    if next_line:
-                        line = next_line
-                        break
-                break
-        
-        # If no "Command:" label found, use the last non-empty line
-        if line is None:
-            for l in reversed(lines):
-                l_stripped = l.strip()
-                if l_stripped:
-                    line = l_stripped
-                    break
-        
-        if not line:
-            return None
-        
-        # Remove markdown formatting (bold/italic asterisks)
-        line = re.sub(r'\*+', '', line)
-        # Remove surrounding quotes
-        line = line.strip('"\'`')
-        # Remove common prefixes the model might add
-        line = re.sub(
-            r'^(?:command|action|i (?:would |will |should )?(?:type|enter|say)|>)\s*[:\-]?\s*',
-            '', line, flags=re.IGNORECASE
-        ).strip()
-        # Reject anything too long to be a valid MUD command (>60 chars)
-        if not line or len(line) > 60:
-            return None
-        return line
 
     def _config(self):
         if not self.client.current_profile:

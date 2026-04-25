@@ -430,11 +430,3 @@ class ExplorationAgent:
             self.state = ExplorationState.from_dict(data)
         else:
             self.state = ExplorationState()
-        # Apply previously calibrated MUD time so buff expiry is accurate immediately
-        cal = profile.get('mud_time_calibration', {})
-        mud_hour_secs = cal.get('mud_hour_secs')
-        if mud_hour_secs:
-            self.state.TICK_SECS = mud_hour_secs
-            self.client.append_text(
-                f"[AI] Loaded MUD time calibration: {mud_hour_secs:.1f}s/mud-hour "
-                f"({cal.get('sample_count', '?')} samples)\n", "system")
