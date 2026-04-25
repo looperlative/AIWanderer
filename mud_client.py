@@ -121,6 +121,8 @@ class MUDClient:
         self.last_command = ""
         self.last_movement_direction = None  # Track the direction of movement
         self.expecting_room_data = False
+        self._skill_trigger_pending = False   # defer skill turn until room data lands
+        self._refused_direction: str | None = None  # set when a move direction is rejected
         self.room_color = None  # Will store the detected room name color
         # Rolling buffer of raw decoded text (ANSI codes intact) for the
         # color calibration UI — lets the dialog show actual MUD colors.
@@ -1458,7 +1460,14 @@ class MUDClient:
                     # Skill goes first so it sees _response_buffer before the
                     # advisor consumes and clears it.
                     if self.skill_engine and self.skill_engine.is_active():
-                        self.master.after(0, self._trigger_skill)
+                        if self.expecting_room_data:
+                            # A directional move is in-flight; defer until the
+                            # room description (or a move-fail) arrives so the
+                            # LLM sees the correct room annotation, not the
+                            # stale one from before the move.
+                            self._skill_trigger_pending = True
+                        else:
+                            self.master.after(0, self._trigger_skill)
 
 
                 # Parse character stats and queue status panel update
@@ -3112,6 +3121,7 @@ class MUDClient:
                     f"[GMCP] New room: {name} ({vnum_key}, Total: {len(rooms)})\n", "system")
 
         self.expecting_room_data = False
+        self._fire_deferred_skill()
 
         self._survival_on_room_entered(self.current_room_hash)
         self._update_nav_panel()
@@ -3254,6 +3264,7 @@ class MUDClient:
                     self.append_text(f"[New room mapped: {room_data['name']} (Total: {len(rooms)})]\n", "system")
 
             self.expecting_room_data = False
+            self._fire_deferred_skill()
 
             # Survival hook — fountain fill and buy-food walk progression
             self._survival_on_room_entered(self.current_room_hash)
@@ -3286,13 +3297,16 @@ class MUDClient:
                     if self.expecting_room_data:
                         plain = ' '.join(t for t, _ in msg_data)
                         if self.mud_parser.detect_move_fail(plain):
+                            self._refused_direction = self.last_movement_direction
                             self.expecting_room_data = False
                             self.last_movement_direction = None
+                            self._fire_deferred_skill()
                         elif self.mud_parser.detect_darkness(plain):
                             # Dark room — we moved here but can't parse it.
                             # Clear expecting flag and let AI know we're stuck.
                             self.expecting_room_data = False
                             self.last_movement_direction = None
+                            self._fire_deferred_skill()
                             if self.ai_agent and self.ai_agent.is_running:
                                 self.ai_agent.on_text_received(plain)
 
@@ -3730,6 +3744,13 @@ class MUDClient:
             return None
         return steps
 
+    def _fire_deferred_skill(self):
+        """Fire a skill turn that was deferred while expecting room data."""
+        if self._skill_trigger_pending:
+            self._skill_trigger_pending = False
+            if self.skill_engine and self.skill_engine.is_active():
+                self.master.after(0, self._trigger_skill)
+
     def _trigger_skill(self):
         """Feed the current skill engine one turn of context."""
         engine = self.skill_engine
@@ -3741,6 +3762,14 @@ class MUDClient:
         # the stale human command doesn't linger between turns.
         self._response_buffer = []
         self._pending_command = None
+        # If a direction was refused since the last turn, inject a harness hint
+        # so the LLM knows exactly which direction to markblocked.
+        if self._refused_direction:
+            mud_lines.insert(0,
+                f"[Harness: '{self._refused_direction}' was refused by MUD"
+                f" — use markblocked:{self._refused_direction} if this exit"
+                f" is permanently blocked]")
+            self._refused_direction = None
         # Annotate goto: navigation state so the LLM knows whether it's
         # still in transit or has arrived.
         if self._active_goto:
@@ -3890,23 +3919,35 @@ class MUDClient:
                         m = _EXIT_DIR_RE.search(exits_str)
                         raw_dirs = m.group(1).split() if m and m.group(1) != 'none' else []
                         listed = {self.direction_map.get(d.lower(), d.lower()) for d in raw_dirs}
+                        cur_name = rooms_d.get(self.current_room_hash, {}).get('name', self.current_room_hash)
                         if full_dir not in listed:
                             self.append_text(
                                 f"[Harness: markblocked:{full_dir} ignored — not a listed exit]\n",
                                 "error")
                         else:
-                            room_links_prof = prof.setdefault('room_links', {})
-                            existing = room_links_prof.setdefault(self.current_room_hash, {}).get(full_dir)
-                            if isinstance(existing, dict):
-                                existing['blocked'] = True
+                            # Refuse if this is the only non-blocked exit — would strand pathfinding.
+                            room_links_chk = prof.get('room_links', {}).get(self.current_room_hash, {})
+                            non_blocked = [d for d in listed
+                                           if not (isinstance(room_links_chk.get(d), dict)
+                                                   and room_links_chk[d].get('blocked'))]
+                            if non_blocked == [full_dir]:
+                                self.append_text(
+                                    f"[Harness: markblocked:{full_dir} refused — it is the only"
+                                    f" non-blocked exit from {cur_name};"
+                                    f" marking it would strand pathfinding]\n",
+                                    "error")
                             else:
-                                room_links_prof[self.current_room_hash][full_dir] = {'blocked': True}
-                            self.save_profiles()
-                            cur_name = rooms_d.get(self.current_room_hash, {}).get('name', self.current_room_hash)
-                            self.append_text(
-                                f"[Harness: marked {full_dir} from {cur_name} as blocked]\n",
-                                "system")
-                            self._update_nav_panel()
+                                room_links_prof = prof.setdefault('room_links', {})
+                                existing = room_links_prof.setdefault(self.current_room_hash, {}).get(full_dir)
+                                if isinstance(existing, dict):
+                                    existing['blocked'] = True
+                                else:
+                                    room_links_prof[self.current_room_hash][full_dir] = {'blocked': True}
+                                self.save_profiles()
+                                self.append_text(
+                                    f"[Harness: marked {full_dir} from {cur_name} as blocked]\n",
+                                    "system")
+                                self._update_nav_panel()
                 else:
                     expanded = self._expand_speedwalk(c)
                     if expanded is not None:
