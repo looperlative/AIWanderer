@@ -122,7 +122,9 @@ class MUDClient:
         self.last_movement_direction = None  # Track the direction of movement
         self.expecting_room_data = False
         self._skill_trigger_pending = False   # defer skill turn until room data lands
+        self._room_wait_timeout_id = None     # after() handle for the room-wait safety timer
         self._refused_direction: str | None = None  # set when a move direction is rejected
+        self._explore_arrived_info: dict | None = None  # persists arrive msg until exit walked
         self.room_color = None  # Will store the detected room name color
         # Rolling buffer of raw decoded text (ANSI codes intact) for the
         # color calibration UI — lets the dialog show actual MUD colors.
@@ -1466,6 +1468,9 @@ class MUDClient:
                             # LLM sees the correct room annotation, not the
                             # stale one from before the move.
                             self._skill_trigger_pending = True
+                            if self._room_wait_timeout_id is None:
+                                self._room_wait_timeout_id = self.master.after(
+                                    3000, self._room_wait_timeout)
                         else:
                             self.master.after(0, self._trigger_skill)
 
@@ -3746,10 +3751,29 @@ class MUDClient:
 
     def _fire_deferred_skill(self):
         """Fire a skill turn that was deferred while expecting room data."""
+        if self._room_wait_timeout_id is not None:
+            self.master.after_cancel(self._room_wait_timeout_id)
+            self._room_wait_timeout_id = None
         if self._skill_trigger_pending:
             self._skill_trigger_pending = False
             if self.skill_engine and self.skill_engine.is_active():
                 self.master.after(0, self._trigger_skill)
+
+    def _room_wait_timeout(self):
+        """Safety valve: room data never arrived after a movement command.
+
+        Clear the expectation flag and fire the deferred skill turn so the
+        LLM isn't silently stuck waiting for a room description that will
+        never come (e.g. MUD rejected the move with an unrecognised message).
+        """
+        self._room_wait_timeout_id = None
+        if self._skill_trigger_pending:
+            self.expecting_room_data = False
+            self.last_movement_direction = None
+            self.append_text(
+                "[Harness: room-wait timeout — move response unrecognised, "
+                "resuming skill turn]\n", "system")
+            self._fire_deferred_skill()
 
     def _trigger_skill(self):
         """Feed the current skill engine one turn of context."""
@@ -3804,15 +3828,21 @@ class MUDClient:
             if self._active_explore:
                 edest = self._active_explore["dest"]
                 if self.current_room_hash == edest:
-                    # Refresh exit info for the destination (now the current room)
-                    ei2 = self._classify_room_exits(edest)
                     edest_name = rooms.get(edest, {}).get('name', edest)
-                    mud_lines.insert(0, f"[Harness: explore: arrived at {edest_name} — {exit_summary}]")
+                    arrival_msg = f"[Harness: explore: arrived at {edest_name} — {exit_summary}]"
+                    mud_lines.insert(0, arrival_msg)
                     self._active_explore = None
+                    self._explore_arrived_info = {"message": arrival_msg}
+                    if "walk_exit" in (engine._plan_steps or []):
+                        engine._plan_step = "walk_exit"
                     self._update_nav_panel()
                 else:
                     edest_name = rooms.get(edest, {}).get('name', edest)
                     mud_lines.insert(0, f"[Harness: explore: navigating to {edest_name}]")
+            elif self._explore_arrived_info:
+                # LLM hasn't walked an exit yet — re-inject the arrival message
+                # so it has context on every re-triggered turn until it acts.
+                mud_lines.insert(0, self._explore_arrived_info["message"])
         stats = dict(self.char_stats)
         # Overlay with the freshest prompt line in the buffer so hp/mp/mv/tank/opp
         # are current even before the message_queue stats update reaches the main thread.
@@ -3872,6 +3902,7 @@ class MUDClient:
                         self._active_goto = None
                         self.append_text(f"[Skill] goto: no path found for '{tgt}'\n", "error")
                 elif cl_c in ('explore:', 'explore'):
+                    self._explore_arrived_info = None  # starting a new cycle
                     result_ex = self._find_nearest_explore_target()
                     if result_ex is None:
                         self._active_explore = None
@@ -3882,6 +3913,10 @@ class MUDClient:
                         self._active_explore = {"dest": ex_dest, "exit_info": ex_ei}
                         self._update_nav_panel()
                         dispatch.extend(ex_path)
+                        if not ex_path:
+                            # Already in the target room — fire _trigger_skill so it
+                            # detects arrival without waiting for an ambient MUD event.
+                            self.master.after(50, self._trigger_skill)
                 elif cl_c.startswith('setlandmark:'):
                     lm_name = c[len('setlandmark:'):].strip().lower()
                     if lm_name and self.current_room_hash and self.current_profile:
@@ -3954,6 +3989,10 @@ class MUDClient:
                         dispatch.extend(expanded)
                     else:
                         dispatch.append(c)
+            # Clear arrived context once a movement command is actually dispatched.
+            if self._explore_arrived_info and any(
+                    d.lower() in self.movement_commands for d in dispatch):
+                self._explore_arrived_info = None
             # Send sequentially with a small stagger so the MUD has time to
             # respond between steps.
             def send_at(idx):

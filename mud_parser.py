@@ -722,7 +722,10 @@ class MUDTextParser:
         r'|you bump into|the door is closed|it is closed'
         r'|the guard humiliates you.*blocks your way'
         r'|you can\'t find it'
-        r'|sorry,?\s+but you cannot do that here)',
+        r'|sorry,?\s+but you cannot do that here'
+        r'|you need a boat'
+        r'|you need to be flying'
+        r'|you must be.*to enter)',
         re.IGNORECASE
     )
 
