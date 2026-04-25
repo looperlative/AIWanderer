@@ -561,7 +561,7 @@ class LLMAdvisor:
         payload = {
             "model": model,
             "messages": [{"role": "system", "content": system_prompt}] + messages,
-            "temperature": 0.5,
+            "temperature": 0.7,
             "max_tokens": max_tokens,
             "stream": on_token is not None,
             "options": {"num_ctx": 131072},

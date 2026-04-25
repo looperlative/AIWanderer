@@ -120,10 +120,16 @@ Landmark commands:
 Danger commands:
   markdangerous:      Mark the last direction taken as a death-trap link; it will be
                       avoided by all future goto: and explore: pathfinding.
+  markblocked:<dir>   Mark an exit from the CURRENT room as blocked (locked door,
+                      insufficient key/level, etc.). Use immediately after the MUD
+                      refuses a movement attempt. <dir> is the direction word you tried
+                      (north/south/east/west/up/down or abbreviation). Blocked exits are
+                      shown as "blocked:" in [Room: ...] and skipped by pathfinding.
+                      Example: markblocked:north
 
 Per-turn room annotation (always present):
   Each turn begins with:
-    [Room: <name> (<key>) — known: dir→dest, ...; assumed: dir→dest; unknown: dir, ...]
+    [Room: <name> (<key>) — known: dir→dest, ...; assumed: dir→dest; unknown: dir, ...; blocked: dir, ...]
   Use this to decide which exits are safe to traverse and which are unexplored.
 
 Command ledger:
@@ -132,6 +138,13 @@ Command ledger:
     AUTHORITATIVE record of what has been dispatched — trust it over your
     own memory when deciding whether something was already done (buff sent,
     speedwalk already fired, etc.).
+
+Loop detection: If the last 3 or more commands in your ledger are all "explore:", you
+are stuck in an explore loop — the harness keeps returning you to the same room. Break
+out by reading the [Room: ...] line and sending ONE direction word for an unknown or
+assumed exit directly. Do NOT send explore: again until you have successfully moved.
+More generally, if the last 8 commands are drawn from only 2-3 distinct values cycling
+repeatedly, you are stuck — choose a fundamentally different action to break the pattern.
 """
 
 

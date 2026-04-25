@@ -26,9 +26,15 @@ def _link_dest(val):
         return val.get('dest'), val.get('assumed', False)
     return val, False  # legacy plain-string → treat as confirmed
 
-def _death_trap_key(from_room, direction):
-    """Canonical key for a death-trap link stored in profile['death_trap_links']."""
-    return f"{from_room}:{direction}"
+def _mark_death_trap(profile, from_room, direction):
+    """Record a death-trap flag on the room_links entry for from_room→direction."""
+    room_links = profile.setdefault('room_links', {})
+    existing = room_links.setdefault(from_room, {}).get(direction)
+    if isinstance(existing, dict):
+        existing['death_trap'] = True
+    else:
+        room_links[from_room][direction] = {'death_trap': True}
+
 
 _EXIT_DIR_RE = re.compile(r'\[ Exits: (.*?) \]')
 
@@ -993,10 +999,32 @@ class MUDClient:
         self._nav_exits_frame = tk.Frame(parent, bg=BG)
         self._nav_exits_frame.pack(fill=tk.BOTH, expand=True, padx=4)
 
+        tk.Frame(parent, bg="#3a3a3a", height=1).pack(fill=tk.X, pady=(4, 2))
+        tk.Label(parent, text="─ EXPLORE ─", bg=BG, fg=HDR_FG,
+                 font=self._font_status_hdr, anchor='w').pack(fill=tk.X, padx=4, pady=(2, 1))
+
+        self._nav_explore_status_var = tk.StringVar(value="Idle")
+        self._nav_explore_status_lbl = tk.Label(parent, textvariable=self._nav_explore_status_var,
+                                                bg=BG, fg="#666666", font=self._font_status, anchor='w')
+        self._nav_explore_status_lbl.pack(fill=tk.X, padx=6)
+
+        self._nav_explore_target_var = tk.StringVar(value="")
+        self._nav_explore_target_lbl = tk.Label(parent, textvariable=self._nav_explore_target_var,
+                                                bg=BG, fg="#888888", font=self._font_status, anchor='w',
+                                                wraplength=140, justify=tk.LEFT)
+        self._nav_explore_target_lbl.pack(fill=tk.X, padx=6)
+
+        self._nav_explore_zone_var = tk.StringVar(value="")
+        tk.Label(parent, textvariable=self._nav_explore_zone_var,
+                 bg=BG, fg="#666666", font=self._font_status, anchor='w').pack(fill=tk.X, padx=6)
+
         self._update_nav_panel()
 
     def _on_nav_resize(self, event):
-        self._nav_room_label.config(wraplength=event.width - 12)
+        wrap = event.width - 12
+        self._nav_room_label.config(wraplength=wrap)
+        if hasattr(self, '_nav_explore_target_lbl'):
+            self._nav_explore_target_lbl.config(wraplength=wrap)
 
     def _init_nav_sash(self):
         """Set the initial sash for the bottom horizontal pane after the window is drawn."""
@@ -1010,11 +1038,12 @@ class MUDClient:
 
     def _update_nav_panel(self):
         """Refresh the navigation panel with current room name and exits."""
-        BG         = "#1a1a1a"
-        DIR_FG     = "#9cdcfe"
-        ROOM_FG    = "#d4d4d4"
-        UNK_FG     = "#666666"
-        ASSUMED_FG = "#888888"
+        BG          = "#1a1a1a"
+        DIR_FG      = "#9cdcfe"
+        ROOM_FG     = "#d4d4d4"
+        UNK_FG      = "#666666"
+        ASSUMED_FG  = "#888888"
+        BLOCKED_FG  = "#c07060"
         F       = self._font_status
 
         if not hasattr(self, '_nav_room_var'):
@@ -1055,6 +1084,10 @@ class MUDClient:
             tk.Label(row, text=direction.capitalize(), bg=BG, fg=DIR_FG, font=F,
                      anchor='w', width=6).pack(side=tk.LEFT)
             link_val = links.get(direction)
+            if isinstance(link_val, dict) and link_val.get('blocked'):
+                tk.Label(row, text="(blocked)", bg=BG, fg=BLOCKED_FG, font=F,
+                         anchor='w').pack(side=tk.LEFT, fill=tk.X, expand=True)
+                continue
             neighbor_hash, is_assumed = _link_dest(link_val)
             if neighbor_hash and neighbor_hash in rooms:
                 dest_name = rooms[neighbor_hash].get('name', neighbor_hash[:8])
@@ -1073,6 +1106,40 @@ class MUDClient:
         if not full_dirs:
             tk.Label(self._nav_exits_frame, text="No exits", bg=BG, fg=UNK_FG,
                      font=F, anchor='w').pack(fill=tk.X)
+
+        if not hasattr(self, '_nav_explore_status_var'):
+            return
+
+        ACTIVE_FG = "#4ec9b0"
+        # Explore status
+        if self._active_explore:
+            dest_key  = self._active_explore["dest"]
+            dest_name = rooms.get(dest_key, {}).get('name', dest_key[:12])
+            self._nav_explore_status_var.set("Active")
+            self._nav_explore_status_lbl.config(fg=ACTIVE_FG)
+            self._nav_explore_target_var.set(f"→ {dest_name}")
+            self._nav_explore_target_lbl.config(fg="#d4d4d4")
+        else:
+            self._nav_explore_status_var.set("Idle")
+            self._nav_explore_status_lbl.config(fg=UNK_FG)
+            self._nav_explore_target_var.set("")
+
+        # Zone explore stats
+        if room_hash and room_hash in rooms:
+            current_zone = rooms[room_hash].get('zone', '')
+            zone_total = zone_unexplored = 0
+            for rk, rd in rooms.items():
+                if rd.get('zone', '') == current_zone:
+                    zone_total += 1
+                    ei = self._classify_room_exits(rk)
+                    if ei["unknown"] or ei["assumed"]:
+                        zone_unexplored += 1
+            zone_label = current_zone or "(unknown zone)"
+            self._nav_explore_zone_var.set(
+                f"{zone_label}: {zone_unexplored}/{zone_total} unexplored"
+            )
+        else:
+            self._nav_explore_zone_var.set("")
 
     def update_profile_list(self):
         """Update the profile list and rebuild the profile menu"""
@@ -2008,23 +2075,21 @@ class MUDClient:
 
     # ── Pathfinding ───────────────────────────────────────────────────
 
-    def _survival_find_path(self, from_hash, to_hash, death_traps=None):
+    def _survival_find_path(self, from_hash, to_hash):
         """BFS through room_links; returns list of short direction strings or None.
 
-        death_traps is profile['death_trap_links'] (optional); matching links are skipped.
+        Links marked death_trap or blocked are skipped.
         """
         if from_hash == to_hash:
             return []
         profile = self.profiles.get(self.current_profile, {})
         links = profile.get('room_links', {})
-        if death_traps is None:
-            death_traps = profile.get('death_trap_links', {})
         queue = deque([(from_hash, [])])
         visited = {from_hash}
         while queue:
             room, path = queue.popleft()
             for direction, link_val in links.get(room, {}).items():
-                if _death_trap_key(room, direction) in death_traps:
+                if isinstance(link_val, dict) and (link_val.get('death_trap') or link_val.get('blocked')):
                     continue
                 neighbor, _ = _link_dest(link_val)
                 if neighbor is None:
@@ -2039,20 +2104,24 @@ class MUDClient:
         return None   # no path found
 
     def _classify_room_exits(self, room_key):
-        """Return {"known": {dir: dest}, "assumed": {dir: dest}, "unknown": [dir]} for a room."""
+        """Return {"known": {dir: dest}, "assumed": {dir: dest}, "unknown": [dir], "blocked": [dir]} for a room."""
         profile = self.profiles.get(self.current_profile, {})
-        rooms    = profile.get('rooms', {})
-        links    = profile.get('room_links', {})
-        room     = rooms.get(room_key, {})
+        rooms  = profile.get('rooms', {})
+        links  = profile.get('room_links', {})
+        room      = rooms.get(room_key, {})
         exits_str = room.get('exits', '')
         m = _EXIT_DIR_RE.search(exits_str)
-        listed_dirs = m.group(1).split() if m and m.group(1) != 'none' else []
+        raw_dirs = m.group(1).split() if m and m.group(1) != 'none' else []
+        # Exits are stored as MUD abbreviations (n/e/s/w/u/d); room_links uses full names.
+        listed_dirs = [self.direction_map.get(d.lower(), d.lower()) for d in raw_dirs]
         room_links = links.get(room_key, {})
-        result = {"known": {}, "assumed": {}, "unknown": []}
+        result = {"known": {}, "assumed": {}, "unknown": [], "blocked": []}
         for d in listed_dirs:
             link_val = room_links.get(d)
             if link_val is None:
                 result["unknown"].append(d)
+            elif isinstance(link_val, dict) and link_val.get('blocked'):
+                result["blocked"].append(d)
             else:
                 dest, assumed = _link_dest(link_val)
                 dest_name = rooms.get(dest, {}).get('name', dest) if dest else '?'
@@ -2063,34 +2132,66 @@ class MUDClient:
         return result
 
     def _find_nearest_explore_target(self):
-        """BFS to find the nearest room with unknown (unlisted) exits.
+        """Find a room with unknown or assumed exits to explore next.
 
-        Returns (path, room_key, exit_info) or None if all mapped exits are confirmed.
+        Prefers any room in the current zone; falls back to any room in the map.
+        Returns (path, room_key, exit_info) or None if all exits are confirmed/unreachable.
         exit_info is {"known": {dir: name}, "assumed": {dir: name}, "unknown": [dir]}.
         """
         if not self.current_room_hash or not self.current_profile:
             return None
-        profile     = self.profiles.get(self.current_profile, {})
-        rooms       = profile.get('rooms', {})
-        links       = profile.get('room_links', {})
-        death_traps = profile.get('death_trap_links', {})
+        profile = self.profiles.get(self.current_profile, {})
+        rooms   = profile.get('rooms', {})
+        links   = profile.get('room_links', {})
 
+        current_zone = rooms.get(self.current_room_hash, {}).get('zone', '')
+
+        def _candidate_ei(room_key):
+            ei = self._classify_room_exits(room_key)
+            return ei if (ei["unknown"] or ei["assumed"]) else None
+
+        # Pick a target: prefer current zone, fall back to any room.
+        target_key = None
+        target_ei  = None
+        for room_key, room_data in rooms.items():
+            if room_data.get('zone', '') == current_zone:
+                ei = _candidate_ei(room_key)
+                if ei is not None:
+                    target_key = room_key
+                    target_ei  = ei
+                    break
+        if target_key is None:
+            for room_key in rooms:
+                ei = _candidate_ei(room_key)
+                if ei is not None:
+                    target_key = room_key
+                    target_ei  = ei
+                    break
+        if target_key is None:
+            return None
+
+        # Already here — no navigation needed.
+        if target_key == self.current_room_hash:
+            return [], target_key, target_ei
+
+        # BFS to find a path to the chosen target; stops on first hit.
         bfs = deque([(self.current_room_hash, [])])
         visited = {self.current_room_hash}
         while bfs:
             room_key, path = bfs.popleft()
-            ei = self._classify_room_exits(room_key)
-            if ei["unknown"]:
-                return path, room_key, ei
             for direction, link_val in links.get(room_key, {}).items():
-                if _death_trap_key(room_key, direction) in death_traps:
+                if isinstance(link_val, dict) and (link_val.get('death_trap') or link_val.get('blocked')):
                     continue
                 neighbor, _ = _link_dest(link_val)
                 if neighbor and neighbor not in visited and neighbor in rooms:
+                    new_path = path + [self._DIR_ABBREV.get(direction, direction)]
+                    if neighbor == target_key:
+                        return new_path, target_key, target_ei
                     visited.add(neighbor)
-                    abbrev = self._DIR_ABBREV.get(direction, direction)
-                    bfs.append((neighbor, path + [abbrev]))
-        return None
+                    bfs.append((neighbor, new_path))
+
+        # Target unreachable from current position; return empty path.
+        return [], target_key, target_ei
 
     def _resolve_goto(self, target: str):
         """Resolve a goto:<target> string to a direction list via BFS, or None."""
@@ -2168,8 +2269,7 @@ class MUDClient:
         profile = self.profiles.get(self.current_profile, {})
         rooms   = profile.get('rooms', {})
         if self.previous_room_hash and self.last_movement_direction:
-            key = _death_trap_key(self.previous_room_hash, self.last_movement_direction)
-            profile.setdefault('death_trap_links', {})[key] = True
+            _mark_death_trap(profile, self.previous_room_hash, self.last_movement_direction)
             self.save_profiles()
             prev_name = rooms.get(self.previous_room_hash, {}).get('name', self.previous_room_hash)
             self.append_text(
@@ -2177,6 +2277,7 @@ class MUDClient:
                 "system")
         self._active_goto    = None
         self._active_explore = None
+        self._update_nav_panel()
 
     # ── Core survival commands ────────────────────────────────────────
 
@@ -2871,7 +2972,7 @@ class MUDClient:
             updates.setdefault('opp', None)
 
         # Death detection — queue separate event so main thread can record the trap
-        if re.search(r'\byou are dead\b', text, re.IGNORECASE):
+        if re.search(r'\byou are dead\b|good-bye cruel world', text, re.IGNORECASE):
             self.message_queue.put(("player_died", None))
 
         if updates:
@@ -3666,6 +3767,8 @@ class MUDClient:
                 parts.append("assumed: " + ", ".join(f"{d}→{n}" for d, n in ei["assumed"].items()))
             if ei["unknown"]:
                 parts.append("unknown: " + ", ".join(ei["unknown"]))
+            if ei["blocked"]:
+                parts.append("blocked: " + ", ".join(ei["blocked"]))
             exit_summary = "; ".join(parts) if parts else "none"
             mud_lines.insert(0, f"[Room: {room_name} ({self.current_room_hash}) — {exit_summary}]")
 
@@ -3677,6 +3780,7 @@ class MUDClient:
                     edest_name = rooms.get(edest, {}).get('name', edest)
                     mud_lines.insert(0, f"[Harness: explore: arrived at {edest_name} — {exit_summary}]")
                     self._active_explore = None
+                    self._update_nav_panel()
                 else:
                     edest_name = rooms.get(edest, {}).get('name', edest)
                     mud_lines.insert(0, f"[Harness: explore: navigating to {edest_name}]")
@@ -3725,6 +3829,7 @@ class MUDClient:
                 self._active_goto = None
             if not any(x in ('explore:', 'explore') for x in cl):
                 self._active_explore = None
+                self._update_nav_panel()
             for c in commands:
                 cl_c = c.lower().strip()
                 if cl_c.startswith('goto:'):
@@ -3742,9 +3847,11 @@ class MUDClient:
                     if result_ex is None:
                         self._active_explore = None
                         self.append_text("[Harness: explore: map appears complete — no unmapped exits found]\n", "system")
+                        self._update_nav_panel()
                     else:
                         ex_path, ex_dest, ex_ei = result_ex
                         self._active_explore = {"dest": ex_dest, "exit_info": ex_ei}
+                        self._update_nav_panel()
                         dispatch.extend(ex_path)
                 elif cl_c.startswith('setlandmark:'):
                     lm_name = c[len('setlandmark:'):].strip().lower()
@@ -3765,14 +3872,41 @@ class MUDClient:
                 elif cl_c in ('markdangerous:', 'markdangerous'):
                     if self.previous_room_hash and self.last_movement_direction and self.current_profile:
                         prof = self.profiles.get(self.current_profile, {})
-                        key  = _death_trap_key(self.previous_room_hash, self.last_movement_direction)
-                        prof.setdefault('death_trap_links', {})[key] = True
+                        _mark_death_trap(prof, self.previous_room_hash, self.last_movement_direction)
                         self.save_profiles()
                         rooms_d = prof.get('rooms', {})
                         prev_n  = rooms_d.get(self.previous_room_hash, {}).get('name', self.previous_room_hash)
                         self.append_text(
                             f"[Harness: marked {self.last_movement_direction} from {prev_n} as dangerous]\n",
                             "system")
+                elif cl_c.startswith('markblocked:'):
+                    dir_arg = c[len('markblocked:'):].strip().lower()
+                    full_dir = self.direction_map.get(dir_arg, dir_arg)
+                    if full_dir and self.current_room_hash and self.current_profile:
+                        prof    = self.profiles.get(self.current_profile, {})
+                        rooms_d = prof.get('rooms', {})
+                        room    = rooms_d.get(self.current_room_hash, {})
+                        exits_str = room.get('exits', '')
+                        m = _EXIT_DIR_RE.search(exits_str)
+                        raw_dirs = m.group(1).split() if m and m.group(1) != 'none' else []
+                        listed = {self.direction_map.get(d.lower(), d.lower()) for d in raw_dirs}
+                        if full_dir not in listed:
+                            self.append_text(
+                                f"[Harness: markblocked:{full_dir} ignored — not a listed exit]\n",
+                                "error")
+                        else:
+                            room_links_prof = prof.setdefault('room_links', {})
+                            existing = room_links_prof.setdefault(self.current_room_hash, {}).get(full_dir)
+                            if isinstance(existing, dict):
+                                existing['blocked'] = True
+                            else:
+                                room_links_prof[self.current_room_hash][full_dir] = {'blocked': True}
+                            self.save_profiles()
+                            cur_name = rooms_d.get(self.current_room_hash, {}).get('name', self.current_room_hash)
+                            self.append_text(
+                                f"[Harness: marked {full_dir} from {cur_name} as blocked]\n",
+                                "system")
+                            self._update_nav_panel()
                 else:
                     expanded = self._expand_speedwalk(c)
                     if expanded is not None:
