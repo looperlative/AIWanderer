@@ -550,6 +550,17 @@ class SkillEngine:
             parts.append(f"Current step: {self._plan_step}")
             parts.append(f"Valid plan_step values (use EXACTLY one): {', '.join(self._plan_steps)}")
             parts.append("")
+        current_room = getattr(self.client, 'current_room_hash', None)
+        current_profile = getattr(self.client, 'current_profile', None)
+        if current_room and current_profile:
+            room_data = (self.client.profiles
+                         .get(current_profile, {})
+                         .get('rooms', {})
+                         .get(current_room, {}))
+            room_desc = room_data.get('description', '').strip()
+            if room_desc:
+                parts.append(f"Current room description: {room_desc}")
+                parts.append("")
         parts.append("MUD output since last command:")
         self._scan_battle_targets(mud_lines)
         lines = self._compress_combat(mud_lines, combat_mob) if combat_mob else list(mud_lines)

@@ -121,6 +121,8 @@ class MUDClient:
         self.last_command = ""
         self.last_movement_direction = None  # Track the direction of movement
         self.expecting_room_data = False
+        self._expecting_room_description = False  # set by GMCP after identity is known; cleared by text parser
+        self._pending_desc_segments = []          # accumulates text chunks while waiting for description
         self._skill_trigger_pending = False   # defer skill turn until room data lands
         self._room_wait_timeout_id = None     # after() handle for the room-wait safety timer
         self._refused_direction: str | None = None  # set when a move direction is rejected
@@ -3137,6 +3139,8 @@ class MUDClient:
                 self.append_text(
                     f"[GMCP] New room: {name} ({vnum_key}, Total: {len(rooms)})\n", "system")
 
+        self._pending_desc_segments = []
+        self._expecting_room_description = True
         self.expecting_room_data = False
         self._fire_deferred_skill()
 
@@ -3153,11 +3157,34 @@ class MUDClient:
 
     def process_room_data(self, segments):
         """Process and store room data"""
-        if not self.room_tracking_enabled or not self.expecting_room_data:
+        if not self.room_tracking_enabled:
             return
         if self.gmcp_active:
-            return  # GMCP Room.Info is the primary source; skip text parsing
+            # GMCP has already updated current_room_hash; just grab the description
+            # from the text and write it directly to the current room.
+            if not self._expecting_room_description:
+                return
+            if not self.current_room_hash or not self.current_profile:
+                return
+            # Accumulate segments across multiple recv() chunks (GMCP and text can
+            # arrive in separate TCP packets, so the first call may have empty data).
+            self._pending_desc_segments.extend(segments)
+            room_data = self.parse_room_data(self._pending_desc_segments)
+            if not room_data or not room_data.get('name'):
+                return
+            # Got a full parse — commit and clear
+            self._expecting_room_description = False
+            self._pending_desc_segments = []
+            desc = room_data.get('description', '')
+            rooms = self.profiles[self.current_profile].get('rooms', {})
+            stored = rooms.get(self.current_room_hash)
+            stored_name = stored.get('name', '') if stored else None
+            if stored and stored_name == room_data.get('name', '') and desc:
+                stored['description'] = desc
+            return
 
+        if not self.expecting_room_data:
+            return
         if not self.current_profile or self.current_profile not in self.profiles:
             return
 
@@ -3214,6 +3241,11 @@ class MUDClient:
                     'description': room_data['description'],
                     'exits': room_data['exits']
                 }
+
+            # Always update description so rooms mapped before description capture
+            # was added get backfilled as the character re-enters them.
+            if room_data.get('description'):
+                rooms[room_hash]['description'] = room_data['description']
 
             # Always update volatile fields (mob presence and objects change each visit)
             if room_data.get('mob_lines'):
@@ -3371,8 +3403,8 @@ class MUDClient:
                             if self.ai_agent and self.ai_agent.is_running:
                                 self.ai_agent.on_text_received(plain)
 
-                    # Process room data if we're expecting it
-                    if self.room_tracking_enabled and self.expecting_room_data:
+                    # Process room data if we're expecting it (or expecting description via GMCP)
+                    if self.room_tracking_enabled and (self.expecting_room_data or self._expecting_room_description):
                         self.process_room_data(msg_data)
 
                     filtered = self._filter_display_segments(msg_data)
