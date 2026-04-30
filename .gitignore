@@ -13,3 +13,4 @@ mud_sessions/
 .DS_Store
 *.swp
 *~
+.aider*
