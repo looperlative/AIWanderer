@@ -8,6 +8,7 @@ A simple GUI-based MUD client that connects via SSL and displays received text.
 
 import socket
 import ssl
+import sys
 import threading
 import tkinter as tk
 from tkinter import scrolledtext, messagebox, ttk, simpledialog, font as tkfont
@@ -622,8 +623,13 @@ class MUDClient:
                         data['_settings'] = {}
                     return data
             except Exception as e:
-                print(f"Error loading profiles: {e}")
-                return {'_settings': {}}
+                messagebox.showerror(
+                    "Profile Load Error",
+                    f"Could not load profiles from:\n{self.profiles_file}\n\n"
+                    f"Error: {e}\n\n"
+                    "Fix or remove the file and restart the application."
+                )
+                sys.exit(1)
         return {'_settings': {}}
 
     def save_profiles(self):
@@ -1397,13 +1403,13 @@ class MUDClient:
         if self.ssl_socket:
             try:
                 self.ssl_socket.close()
-            except:
+            except OSError:
                 pass
             self.ssl_socket = None
         if self.socket:
             try:
                 self.socket.close()
-            except:
+            except OSError:
                 pass
             self.socket = None
 
@@ -1412,7 +1418,10 @@ class MUDClient:
         buffer = []
         while self.connected:
             try:
-                data = self.ssl_socket.recv(4096)
+                sock = self.ssl_socket
+                if sock is None:
+                    break
+                data = sock.recv(4096)
                 if not data:
                     self.message_queue.put(("disconnect", "Connection closed by server\n"))
                     break

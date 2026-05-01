@@ -241,6 +241,8 @@ class SkillEngine:
         self._messages = []       # rolling conversation for this skill session
         self._busy = False
         self._pending = False     # a turn arrived while busy; fire one more when idle
+        self._pending_payload = None
+        self._pending_on_result = None
         self._cmd_history = []    # every command the engine has dispatched this session
         self._plan_step = None    # current plan step identifier (tracked each turn)
         self._plan_steps = []     # ordered step IDs parsed from plan markdown
@@ -288,6 +290,8 @@ class SkillEngine:
         self._messages = []
         self._busy = False
         self._pending = False
+        self._pending_payload = None
+        self._pending_on_result = None
         self._cmd_history = []
         self._plan_step = None
         self._plan_steps = []

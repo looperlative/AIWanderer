@@ -267,8 +267,8 @@ class LLMAdvisor:
             if summary:
                 summary = summary.strip()[:8000]
             logger.log_llm_response(summary or "")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.log_error(f"Session summary failed: {e}")
         self.client.master.after(0, lambda: on_result(summary))
 
     def _build_system_prompt(self):
