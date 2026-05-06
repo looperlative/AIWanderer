@@ -2,8 +2,42 @@
 # SPDX-License-Identifier: MIT
 """Dialog windows for the AIWanderer MUD client."""
 
+import json
+import os
 import tkinter as tk
 from tkinter import messagebox, ttk
+
+
+def _ui_local_path():
+    return os.path.join(os.path.expanduser("~"), ".mud_client_ui_local.json")
+
+
+def _load_ui_local():
+    try:
+        with open(_ui_local_path(), 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_ui_local(data):
+    with open(_ui_local_path(), 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def _restore_geometry(dialog, key):
+    geom = _load_ui_local().get(key)
+    if geom:
+        dialog.geometry(geom)
+
+
+def _persist_geometry(dialog, key):
+    try:
+        data = _load_ui_local()
+        data[key] = dialog.geometry()
+        _save_ui_local(data)
+    except Exception:
+        pass
 
 
 class RunOnceDialog:
@@ -366,8 +400,10 @@ class SkillsDialog:
         self._reload_skills()
         self._reload_templates()
         self._reload_targets()
+        _restore_geometry(self.dialog, 'skills_dialog_geometry')
 
     def _close(self):
+        _persist_geometry(self.dialog, 'skills_dialog_geometry')
         self.dialog.destroy()
         self.client.master.after(0, self.client.input_entry.focus_set)
 
@@ -612,12 +648,17 @@ class SkillEditDialog:
         btns = ttk.Frame(self.dialog)
         btns.grid(row=5, column=0, columnspan=2, pady=12)
         ttk.Button(btns, text="Save", command=self._save).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Cancel", command=self.dialog.destroy).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side=tk.LEFT, padx=4)
 
         self.dialog.columnconfigure(1, weight=1)
         self.dialog.rowconfigure(1, weight=1)
         self.dialog.rowconfigure(2, weight=1)
+        _restore_geometry(self.dialog, 'skill_edit_dialog_geometry')
         self.dialog.wait_window()
+
+    def _cancel(self):
+        _persist_geometry(self.dialog, 'skill_edit_dialog_geometry')
+        self.dialog.destroy()
 
     def _save(self):
         name = self.name_entry.get().strip()
@@ -640,6 +681,7 @@ class SkillEditDialog:
         elif "rescue_restart_step" in cfg:
             del cfg["rescue_restart_step"]
         self.result = (name, cfg)
+        _persist_geometry(self.dialog, 'skill_edit_dialog_geometry')
         self.dialog.destroy()
 
 
@@ -713,12 +755,17 @@ class TemplateEditDialog:
         btns = ttk.Frame(self.dialog)
         btns.grid(row=6, column=0, columnspan=2, pady=12)
         ttk.Button(btns, text="Save", command=self._save).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Cancel", command=self.dialog.destroy).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side=tk.LEFT, padx=4)
 
         self.dialog.columnconfigure(1, weight=1)
         self.dialog.rowconfigure(2, weight=1)
         self.dialog.rowconfigure(3, weight=1)
+        _restore_geometry(self.dialog, 'template_edit_dialog_geometry')
         self.dialog.wait_window()
+
+    def _cancel(self):
+        _persist_geometry(self.dialog, 'template_edit_dialog_geometry')
+        self.dialog.destroy()
 
     def _save(self):
         name = self.name_entry.get().strip()
@@ -746,6 +793,7 @@ class TemplateEditDialog:
         else:
             cfg.pop("reminders", None)
         self.result = (name, cfg)
+        _persist_geometry(self.dialog, 'template_edit_dialog_geometry')
         self.dialog.destroy()
 
 
@@ -790,13 +838,18 @@ class TargetEditDialog:
         btns = ttk.Frame(self.dialog)
         btns.grid(row=3, column=0, columnspan=2, pady=12)
         ttk.Button(btns, text="Save", command=self._save).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Cancel", command=self.dialog.destroy).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side=tk.LEFT, padx=4)
 
         self.dialog.columnconfigure(1, weight=1)
         self.dialog.rowconfigure(2, weight=1)
 
         self._rebuild_params()
+        _restore_geometry(self.dialog, 'target_edit_dialog_geometry')
         self.dialog.wait_window()
+
+    def _cancel(self):
+        _persist_geometry(self.dialog, 'target_edit_dialog_geometry')
+        self.dialog.destroy()
 
     def _rebuild_params(self):
         for child in self.params_frame.winfo_children():
@@ -831,4 +884,5 @@ class TargetEditDialog:
         params = {ph: w.get("1.0", tk.END).strip()
                   for ph, w in self._param_widgets.items()}
         self.result = (name, {"template": tmpl_name, "params": params})
+        _persist_geometry(self.dialog, 'target_edit_dialog_geometry')
         self.dialog.destroy()

@@ -787,6 +787,7 @@ class MUDClient:
 
         nav_frame = tk.Frame(bottom_paned, bg="#1a1a1a")
         bottom_paned.add(nav_frame, stretch="always", minsize=80)
+        self._bottom_paned = bottom_paned
         self._build_nav_panel(nav_frame)
 
         # Set initial sash positions after window draws
@@ -1038,8 +1039,9 @@ class MUDClient:
         try:
             w = self.advisor_area.winfo_width() + self._nav_parent.winfo_width()
             if w > 10:
-                half = w // 2
-                self.advisor_area.master.sash_place(0, half, 0)
+                frac = self._load_ui_local().get('nav_sash_fraction')
+                x = int(frac * w) if frac is not None else w // 2
+                self._bottom_paned.sash_place(0, x, 0)
         except Exception:
             pass
 
@@ -4645,9 +4647,16 @@ class MUDClient:
         # Flush AI agent state before saving profiles
         if self.ai_agent:
             self.ai_agent.save_state()
-        # Save window geometry for next session (host-local, not shared)
+        # Save window geometry and pane sizes for next session (host-local, not shared)
         ui_local = self._load_ui_local()
         ui_local['window_geometry'] = self.master.geometry()
+        try:
+            x, _ = self._bottom_paned.sash_coord(0)
+            w = self._bottom_paned.winfo_width()
+            if w > 0:
+                ui_local['nav_sash_fraction'] = x / w
+        except Exception:
+            pass
         self._save_ui_local(ui_local)
         self.save_profiles()
         self.master.destroy()
