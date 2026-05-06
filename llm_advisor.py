@@ -23,6 +23,8 @@ import http.client
 import json
 import os
 import re
+
+_MAX_TOKENS = 2048
 import threading
 import urllib.parse
 
@@ -191,8 +193,8 @@ class LLMAdvisor:
 
         advice = None
         try:
-            advice = self._call_backend(system_prompt, msgs,
-                                        max_tokens=1024, on_token=on_token)
+            advice = self.call_backend(system_prompt, msgs,
+                                        max_tokens=_MAX_TOKENS, on_token=on_token)
             logger.log_llm_response(advice)
             master.after(0, self.client.end_advisor_stream)
         except Exception as e:
@@ -221,8 +223,8 @@ class LLMAdvisor:
         try:
             with self._messages_lock:
                 msgs_snapshot = list(self._messages)
-            reply = self._call_backend(system_prompt, msgs_snapshot,
-                                       max_tokens=1024, on_token=on_token)
+            reply = self.call_backend(system_prompt, msgs_snapshot,
+                                       max_tokens=_MAX_TOKENS, on_token=on_token)
             logger.log_llm_response(reply)
             if reply:
                 with self._messages_lock:
@@ -262,8 +264,8 @@ class LLMAdvisor:
         logger.log_llm_prompt(f"[summary]\n[system]\n{system}\n[user]\n{user}")
         summary = None
         try:
-            summary = self._call_backend(
-                system, [{"role": "user", "content": user}], max_tokens=1000)
+            summary = self.call_backend(
+                system, [{"role": "user", "content": user}], max_tokens=_MAX_TOKENS)
             if summary:
                 summary = summary.strip()[:8000]
             logger.log_llm_response(summary or "")
@@ -397,7 +399,7 @@ class LLMAdvisor:
         try:
             with self._messages_lock:
                 msgs_snapshot = list(self._messages)
-            reply = self._call_backend(system_prompt, msgs_snapshot, max_tokens=256)
+            reply = self.call_backend(system_prompt, msgs_snapshot, max_tokens=_MAX_TOKENS)
             if reply:
                 logger.log_llm_response(reply)
                 with self._messages_lock:
@@ -523,7 +525,7 @@ class LLMAdvisor:
 
         return "\n".join(parts)
 
-    def _call_backend(self, system_prompt, messages, max_tokens=2048, on_token=None):
+    def call_backend(self, system_prompt, messages, max_tokens=_MAX_TOKENS, on_token=None):
         """
         Dispatch to the configured backend.
 
@@ -546,7 +548,7 @@ class LLMAdvisor:
     # Ollama backend  (OpenAI-compatible chat completions)
     # ------------------------------------------------------------------
 
-    def _call_ollama(self, cfg, system_prompt, messages, max_tokens=2048, on_token=None):
+    def _call_ollama(self, cfg, system_prompt, messages, max_tokens=_MAX_TOKENS, on_token=None):
         endpoint = cfg.get('llm_endpoint', 'http://localhost:11434')
         model = cfg.get('llm_model', 'llama3.1:8b')
 
@@ -616,7 +618,7 @@ class LLMAdvisor:
     # Claude backend
     # ------------------------------------------------------------------
 
-    def _call_claude(self, cfg, system_prompt, messages, max_tokens=1024, on_token=None):
+    def _call_claude(self, cfg, system_prompt, messages, max_tokens=_MAX_TOKENS, on_token=None):
         api_key = cfg.get('claude_api_key', '')
         if not api_key:
             raise RuntimeError("claude_api_key is not set in profile ai_config.")

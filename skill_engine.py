@@ -32,6 +32,7 @@ from llm_advisor import LLMAdvisor
 # Bounds recency drift: the system prompt stays a constant fraction of
 # context instead of shrinking as the session runs.
 HISTORY_TURN_PAIRS = 3
+_MAX_TOKENS = 2048
 
 # Emit a group-combat snapshot into the LLM context every N turns.
 BATTLE_SNAPSHOT_TURNS = 5
@@ -395,7 +396,7 @@ class SkillEngine:
         raw = None
         error = None
         try:
-            raw = self._call_llm(system_prompt, msgs, max_tokens=2048)
+            raw = self._call_llm(system_prompt, msgs, max_tokens=_MAX_TOKENS)
             logger.log_llm_response(raw or "")
             result = self._parse(raw)
         except Exception as e:
@@ -812,8 +813,8 @@ class SkillEngine:
     # LLM backend (reuses the advisor's HTTP code)
     # ------------------------------------------------------------------
 
-    def _call_llm(self, system_prompt, messages, max_tokens=1024):
+    def _call_llm(self, system_prompt, messages, max_tokens=_MAX_TOKENS):
         advisor = self.client.llm_advisor
         if advisor is None:
             advisor = LLMAdvisor(self.client)
-        return advisor._call_backend(system_prompt, messages, max_tokens=max_tokens)
+        return advisor.call_backend(system_prompt, messages, max_tokens=max_tokens)
