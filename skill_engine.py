@@ -264,29 +264,8 @@ class SkillEngine:
     def active_name(self):
         return self._skill_name
 
-    def start(self, name, cfg):
-        """Begin a new skill session. Discards any prior in-flight state."""
-        self._skill_name = name
-        self._skill_cfg = dict(cfg or {})
-        self._messages = []
-        self._busy = False
-        self._pending = False
-        self._cmd_history = []
-        plan = self._skill_cfg.get("plan", "")
-        self._plan_steps = _parse_plan_steps(plan) if isinstance(plan, str) else []
-        self._plan_step = self._plan_steps[0] if self._plan_steps else None
-        self._deferred_rescue = False
-        self._battle_attacked_mobs = set()
-        self._battle_attacked_pcs  = set()
-        self._battle_turns_since_snap = 0
-        self._battle_snapshot_inflight = False
-        self._injected_user_message = None
-        self._idle_since = None
-
-    def stop(self):
-        """Cancel the active skill. In-flight LLM replies are discarded."""
-        self._skill_name = None
-        self._skill_cfg = None
+    def _reset_state(self):
+        """Reset all per-session state to idle defaults."""
         self._messages = []
         self._busy = False
         self._pending = False
@@ -302,6 +281,21 @@ class SkillEngine:
         self._battle_snapshot_inflight = False
         self._injected_user_message = None
         self._idle_since = None
+
+    def start(self, name, cfg):
+        """Begin a new skill session. Discards any prior in-flight state."""
+        self._reset_state()
+        self._skill_name = name
+        self._skill_cfg = dict(cfg or {})
+        plan = self._skill_cfg.get("plan", "")
+        self._plan_steps = _parse_plan_steps(plan) if isinstance(plan, str) else []
+        self._plan_step = self._plan_steps[0] if self._plan_steps else None
+
+    def stop(self):
+        """Cancel the active skill. In-flight LLM replies are discarded."""
+        self._reset_state()
+        self._skill_name = None
+        self._skill_cfg = None
 
     def inject_user_message(self, text: str):
         """Queue a freeform user instruction to prepend to the next skill turn."""

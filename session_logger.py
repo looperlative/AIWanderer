@@ -51,6 +51,7 @@ class SessionLogger:
     def __init__(self):
         self._file = None
         self._path = None
+        self._open_error = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -68,7 +69,7 @@ class SessionLogger:
         except OSError as e:
             self._file = None
             self._path = None
-            print(f"Warning: session logging disabled — {e}")
+            self._open_error = str(e)
 
     def close(self):
         """Close the log file."""

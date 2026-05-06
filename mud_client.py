@@ -19,6 +19,7 @@ import os
 import time
 import hashlib
 from collections import deque
+from ai_agent import DIRECTION_ABBREVS
 
 
 def _link_dest(val):
@@ -139,16 +140,9 @@ class MUDClient:
         self._telnet_recv_buf = bytearray()  # incomplete telnet sequences carried across recv() calls
         self.movement_commands = ['n', 'north', 's', 'south', 'e', 'east',
                                    'w', 'west', 'u', 'up', 'd', 'down', 'l', 'look']
-        # Map short commands to directions
-        self.direction_map = {
-            'n': 'north', 'north': 'north',
-            's': 'south', 'south': 'south',
-            'e': 'east', 'east': 'east',
-            'w': 'west', 'west': 'west',
-            'u': 'up', 'up': 'up',
-            'd': 'down', 'down': 'down',
-            'l': 'look', 'look': 'look'
-        }
+        # Map short commands to directions (canonical names from ai_agent)
+        self.direction_map = dict(DIRECTION_ABBREVS)
+        self.direction_map.update({'l': 'look', 'look': 'look'})
 
         # AI agent state
         self.ai_agent = None
@@ -1326,9 +1320,15 @@ class MUDClient:
 
             self.append_text(f"Connected successfully!\n", "system")
             self.session_logger.open()
-            self._status_log_label.config(
-                text=f"Log: {os.path.basename(self.session_logger.path)}",
-                foreground="green")
+            if self.session_logger.path:
+                self._status_log_label.config(
+                    text=f"Log: {os.path.basename(self.session_logger.path)}",
+                    foreground="green")
+            else:
+                self._status_log_label.config(text="Log: disabled", foreground="red")
+                self.append_text(
+                    f"[Warning: session logging disabled — {self.session_logger._open_error}]\n",
+                    "system")
 
             # Initialize AI agent (for room collection) and LLM advisor
             from ai_agent import ExplorationAgent
