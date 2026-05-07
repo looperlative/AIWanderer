@@ -4050,15 +4050,17 @@ class MUDClient:
                         if removed:
                             self.save_profiles()
                             self.append_text(f"[Harness: landmark '{lm_name}' removed]\n", "system")
-                elif cl_c in ('markdangerous:', 'markdangerous'):
-                    if self.previous_room_hash and self.last_movement_direction and self.current_profile:
+                elif cl_c.startswith('markdangerous:'):
+                    dir_arg = c[len('markdangerous:'):].strip().lower()
+                    full_dir = self.direction_map.get(dir_arg, dir_arg)
+                    if full_dir and self.current_room_hash and self.current_profile:
                         prof = self.profiles.get(self.current_profile, {})
-                        _mark_death_trap(prof, self.previous_room_hash, self.last_movement_direction)
+                        _mark_death_trap(prof, self.current_room_hash, full_dir)
                         self.save_profiles()
                         rooms_d = prof.get('rooms', {})
-                        prev_n  = rooms_d.get(self.previous_room_hash, {}).get('name', self.previous_room_hash)
+                        cur_n = rooms_d.get(self.current_room_hash, {}).get('name', self.current_room_hash)
                         self.append_text(
-                            f"[Harness: marked {self.last_movement_direction} from {prev_n} as dangerous]\n",
+                            f"[Harness: marked {full_dir} from {cur_n} as dangerous]\n",
                             "system")
                 elif cl_c.startswith('markblocked:'):
                     dir_arg = c[len('markblocked:'):].strip().lower()

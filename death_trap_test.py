@@ -110,7 +110,7 @@ Landmark commands:
                       Example: unsetlandmark:bank
 
 Danger commands:
-  markdangerous:      Mark the last direction taken as a death-trap link; it will be
+  markdangerous:<dir>  Mark an exit from the CURRENT room as a death-trap link; it will be
                       avoided by all future goto: and explore: pathfinding.
   markblocked:<dir>   Mark an exit from the CURRENT room as blocked (locked door,
                       insufficient key/level, etc.). Use immediately after the MUD
