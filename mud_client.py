@@ -4010,30 +4010,43 @@ class MUDClient:
                 cl_c = c.lower().strip()
                 if cl_c.startswith('goto:'):
                     tgt = c[5:].strip()
-                    goto_result = self._resolve_goto(tgt)
-                    if goto_result is not None:
-                        path, dest_room = goto_result
-                        self._active_goto = {"target": tgt, "dest": dest_room}
-                        dispatch.extend(path)
-                    else:
+                    if self._combat_mob:
                         self._active_goto = None
-                        self.append_text(f"[Skill] goto: no path found for '{tgt}'\n", "error")
+                        self.append_text(
+                            f"[Harness: goto:{tgt} skipped — currently in combat]\n",
+                            "system")
+                    else:
+                        goto_result = self._resolve_goto(tgt)
+                        if goto_result is not None:
+                            path, dest_room = goto_result
+                            self._active_goto = {"target": tgt, "dest": dest_room}
+                            dispatch.extend(path)
+                        else:
+                            self._active_goto = None
+                            self.append_text(f"[Skill] goto: no path found for '{tgt}'\n", "error")
                 elif cl_c in ('explore:', 'explore'):
                     self._explore_arrived_info = None  # starting a new cycle
-                    result_ex = self._find_nearest_explore_target()
-                    if result_ex is None:
+                    if self._combat_mob:
                         self._active_explore = None
-                        self.append_text("[Harness: explore: map appears complete — no unmapped exits found]\n", "system")
+                        self.append_text(
+                            "[Harness: explore: skipped — currently in combat]\n",
+                            "system")
                         self._update_nav_panel()
                     else:
-                        ex_path, ex_dest, ex_ei = result_ex
-                        self._active_explore = {"dest": ex_dest, "exit_info": ex_ei}
-                        self._update_nav_panel()
-                        dispatch.extend(ex_path)
-                        if not ex_path:
-                            # Already in the target room — fire _trigger_skill so it
-                            # detects arrival without waiting for an ambient MUD event.
-                            self.master.after(50, self._trigger_skill)
+                        result_ex = self._find_nearest_explore_target()
+                        if result_ex is None:
+                            self._active_explore = None
+                            self.append_text("[Harness: explore: map appears complete — no unmapped exits found]\n", "system")
+                            self._update_nav_panel()
+                        else:
+                            ex_path, ex_dest, ex_ei = result_ex
+                            self._active_explore = {"dest": ex_dest, "exit_info": ex_ei}
+                            self._update_nav_panel()
+                            dispatch.extend(ex_path)
+                            if not ex_path:
+                                # Already in the target room — fire _trigger_skill so it
+                                # detects arrival without waiting for an ambient MUD event.
+                                self.master.after(50, self._trigger_skill)
                 elif cl_c.startswith('setlandmark:'):
                     lm_name = c[len('setlandmark:'):].strip().lower()
                     if lm_name and self.current_room_hash and self.current_profile:
@@ -4119,7 +4132,17 @@ class MUDClient:
                     return
                 if idx >= len(dispatch):
                     return
-                self.send_ai_command(dispatch[idx])
+                cmd = dispatch[idx]
+                # If this is a movement command and combat has started, stop navigating.
+                if cmd.lower() in self.movement_commands and self._combat_mob:
+                    self.append_text(
+                        "[Harness: navigation stopped — combat detected]\n",
+                        "system")
+                    self._active_goto = None
+                    self._active_explore = None
+                    self._update_nav_panel()
+                    return
+                self.send_ai_command(cmd)
                 self.master.after(300, lambda: send_at(idx + 1))
             send_at(0)
         switch_to = result.get("switch_skill")
