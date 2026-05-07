@@ -788,6 +788,8 @@ class MUDClient:
         nav_frame = tk.Frame(bottom_paned, bg="#1a1a1a")
         bottom_paned.add(nav_frame, stretch="always", minsize=80)
         self._bottom_paned = bottom_paned
+        self._nav_sash_save_timer = None
+        bottom_paned.bind('<ButtonRelease-1>', self._on_nav_sash_released)
         self._build_nav_panel(nav_frame)
 
         # Set initial sash positions after window draws
@@ -1034,16 +1036,46 @@ class MUDClient:
         if hasattr(self, '_nav_explore_target_lbl'):
             self._nav_explore_target_lbl.config(wraplength=wrap)
 
-    def _init_nav_sash(self):
-        """Set the initial sash for the bottom horizontal pane after the window is drawn."""
+    def _on_nav_sash_released(self, event=None):
+        """Save the nav pane sash position after the user drags the divider."""
+        if self._nav_sash_save_timer is not None:
+            self.master.after_cancel(self._nav_sash_save_timer)
+        self._nav_sash_save_timer = self.master.after(
+            500, self._save_nav_sash_now
+        )
+
+    def _save_nav_sash_now(self):
+        """Persist the current nav sash X position to the UI-local settings file."""
+        self._nav_sash_save_timer = None
         try:
-            w = self.advisor_area.winfo_width() + self._nav_parent.winfo_width()
-            if w > 10:
-                frac = self._load_ui_local().get('nav_sash_fraction')
-                x = int(frac * w) if frac is not None else w // 2
-                self._bottom_paned.sash_place(0, x, 0)
+            x, _ = self._bottom_paned.sash_coord(0)
+            ui_local = self._load_ui_local()
+            ui_local['nav_sash_x'] = x
+            self._save_ui_local(ui_local)
         except Exception:
             pass
+
+    def _init_nav_sash(self):
+        """Set the initial sash for the bottom horizontal pane after the window is drawn."""
+        self._nav_sash_retries = 0
+        self._nav_sash_settle()  # initial attempt
+
+    def _nav_sash_settle(self):
+        """Attempt to restore the nav sash X position, retrying a few times until layout is ready."""
+        self._nav_sash_retries += 1
+        try:
+            w = self._bottom_paned.winfo_width()
+            if w > 10:
+                saved_x = self._load_ui_local().get('nav_sash_x')
+                # Clamp to valid range; fall back to centre if value is out of bounds
+                if saved_x is not None and 0 <= saved_x < w:
+                    self._bottom_paned.sash_place(0, saved_x, 0)
+                else:
+                    self._bottom_paned.sash_place(0, w // 2, 0)
+        except Exception:
+            pass
+        if self._nav_sash_retries < 10:
+            self.master.after(100, self._nav_sash_settle)
 
     def _update_nav_panel(self):
         """Refresh the navigation panel with current room name and exits."""
@@ -4677,9 +4709,7 @@ class MUDClient:
         ui_local['window_geometry'] = self.master.geometry()
         try:
             x, _ = self._bottom_paned.sash_coord(0)
-            w = self._bottom_paned.winfo_width()
-            if w > 0:
-                ui_local['nav_sash_fraction'] = x / w
+            ui_local['nav_sash_x'] = x
         except Exception:
             pass
         self._save_ui_local(ui_local)
