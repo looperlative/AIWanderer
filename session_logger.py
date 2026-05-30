@@ -46,12 +46,18 @@ def _strip_ansi(text):
 class SessionLogger:
     """Writes a session log file for one MUD connection."""
 
-    LOG_DIR = os.path.join(os.path.expanduser("~"), "mud_sessions")
-
     def __init__(self):
         self._file = None
         self._path = None
         self._open_error = None
+
+    def _get_log_dir(self):
+        """Determine which mud_sessions directory to use."""
+        local_dir = "mud_sessions"
+        home_dir = os.path.join(os.path.expanduser("~"), "mud_sessions")
+        if os.path.isdir(local_dir):
+            return local_dir
+        return home_dir
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -60,10 +66,11 @@ class SessionLogger:
     def open(self):
         """Open a new log file for this session."""
         try:
-            if not os.path.isdir(self.LOG_DIR) and not os.path.islink(self.LOG_DIR):
-                os.makedirs(self.LOG_DIR, exist_ok=True)
+            log_dir = self._get_log_dir()
+            if not os.path.isdir(log_dir) and not os.path.islink(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
             stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            self._path = os.path.join(self.LOG_DIR, f"session_{stamp}.log")
+            self._path = os.path.join(log_dir, f"session_{stamp}.log")
             self._file = open(self._path, 'w', encoding='utf-8', buffering=1)
             self._write("SYSTEM", f"Session started — log: {self._path}")
         except OSError as e:
