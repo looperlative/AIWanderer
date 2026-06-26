@@ -40,6 +40,12 @@ def _mark_death_trap(profile, from_room, direction):
 
 _EXIT_DIR_RE = re.compile(r'\[ Exits: (.*?) \]')
 
+# CircleMUD message when drinking from an empty container
+_DRINK_EMPTY_RE = re.compile(
+    r'(?:it seems to be empty|there\'s nothing to drink|nothing left to drink)',
+    re.IGNORECASE,
+)
+
 _REVERSE_DIR = {
     'north': 'south', 'south': 'north',
     'east':  'west',  'west':  'east',
@@ -548,13 +554,13 @@ class MUDClient:
             if "hungry" in data:
                 try:
                     v = int(data["hungry"])
-                    updates["hunger"] = 'OK' if v >= 8 else ('starving' if v == 0 else 'hungry')
+                    updates["hunger"] = 'OK' if v >= 2 else ('starving' if v == 0 else 'hungry')
                 except (TypeError, ValueError):
                     pass
             if "thirsty" in data:
                 try:
                     v = int(data["thirsty"])
-                    updates["thirst"] = 'OK' if v >= 8 else ('parched' if v == 0 else 'thirsty')
+                    updates["thirst"] = 'OK' if v >= 2 else ('parched' if v == 0 else 'thirsty')
                 except (TypeError, ValueError):
                     pass
             if updates:
@@ -1548,8 +1554,9 @@ class MUDClient:
                 # Group membership tracking (used by skill engine PC detection)
                 self._update_group_members(clean_text)
 
-                # Survival automation (inventory collection)
+                # Survival automation (inventory collection + empty-container detection)
                 self._survival_handle_text(clean_text)
+                self._survival_check_drink_empty(clean_text)
 
                 # Tick synchronisation
                 if self.mud_parser.detect_tick_event(clean_text):
@@ -2424,6 +2431,11 @@ class MUDClient:
             msg_type = 'survival_inv' if self._survival_state == 'inv_wait' else 'eat_inv'
             self.message_queue.put((msg_type, full_text))
 
+    def _survival_check_drink_empty(self, text):
+        """Detect empty drink-container message and queue a canteen refill."""
+        if _DRINK_EMPTY_RE.search(text):
+            self.message_queue.put(('survival_refill_canteen', None))
+
     # ── Auto-eat / auto-drink ─────────────────────────────────────────
 
     def _check_hunger_thirst_transitions(self):
@@ -2451,6 +2463,8 @@ class MUDClient:
             container = cfg.get('drink_container')
             if container:
                 self._survival_send_cmd(f"drink {container}")
+                thirst = False
+                self.char_stats['thirst'] = 'OK'
 
         self._prev_hunger = hunger
         self._prev_thirst = thirst
@@ -3498,6 +3512,18 @@ class MUDClient:
                         self.char_stats['spells'] = spells
                     self._update_status_panel()
                     self._check_hunger_thirst_transitions()
+                elif msg_type == "survival_refill_canteen":
+                    # Drink container was empty — refill at fountain if configured
+                    cfg = self._fd_config()
+                    container = cfg.get('drink_container')
+                    fountain  = cfg.get('fountain_room')
+                    if container and fountain and self.current_room_hash == fountain:
+                        self.master.after(200, lambda: self._survival_send_cmd(
+                            f"fill {container} fountain"))
+                    elif container:
+                        self.append_text(
+                            f"[Survival] {container} is empty — "
+                            "return to the fountain room to refill.\n", "system")
                 elif msg_type == "survival_inv":
                     # Inventory text collected after arriving at food store
                     food_item = self._fd_config().get('food_item', '').strip()
